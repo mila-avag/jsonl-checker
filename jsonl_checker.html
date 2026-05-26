@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JSONL Justification Checker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;padding:24px;line-height:1.5}
+h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
+.subtitle{color:#8b949e;margin-bottom:20px;font-size:.9rem}
+.drop-zone{border:2px dashed #30363d;border-radius:12px;padding:48px;text-align:center;cursor:pointer;transition:all .2s;margin-bottom:24px;background:#161b22}
+.drop-zone:hover,.drop-zone.drag-over{border-color:#58a6ff;background:#1c2333}
+.drop-zone input{display:none}
+.drop-zone p{color:#8b949e;font-size:1rem}
+.drop-zone .icon{font-size:2.5rem;margin-bottom:12px}
+.stats-bar{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.stat{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 20px;flex:1;min-width:140px;text-align:center}
+.stat .num{font-size:1.8rem;font-weight:700}
+.stat .label{font-size:.75rem;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
+.stat.green .num{color:#3fb950}
+.stat.yellow .num{color:#d29922}
+.stat.orange .num{color:#db6d28}
+.stat.red .num{color:#f85149}
+.stat.blue .num{color:#58a6ff}
+.group{background:#161b22;border:1px solid #30363d;border-radius:10px;margin-bottom:16px;overflow:hidden}
+.group-header{padding:14px 20px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none}
+.group-header:hover{background:#1c2333}
+.group-header h2{font-size:1rem;font-weight:600;display:flex;align-items:center;gap:8px}
+.group-header .count{background:#30363d;color:#c9d1d9;padding:2px 10px;border-radius:12px;font-size:.8rem;font-weight:600}
+.group-header .arrow{transition:transform .2s;color:#8b949e}
+.group-header.open .arrow{transform:rotate(90deg)}
+.group-body{display:none;border-top:1px solid #30363d}
+.group-body.open{display:block}
+.task-row{padding:10px 20px;border-bottom:1px solid #21262d;font-family:'SF Mono',Monaco,monospace;font-size:.82rem;cursor:pointer}
+.task-row:last-child{border-bottom:none}
+.task-row:hover{background:#1c2333}
+.task-row-header{display:flex;justify-content:space-between;align-items:center}
+.task-id{color:#58a6ff;cursor:pointer}
+.task-id:hover{text-decoration:underline}
+.task-detail{color:#8b949e;font-size:.78rem}
+.task-expand{display:none;margin-top:8px;padding:8px 0 4px 0}
+.task-expand.open{display:block}
+.item-row{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:.78rem}
+.item-row .item-id{color:#c9d1d9;min-width:80px}
+.item-row .item-criterion{color:#8b949e;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.68rem;font-weight:600;flex-shrink:0}
+.badge.missing{background:#490202;color:#ff7b72}
+.badge.partial{background:#3d2800;color:#d29922}
+.badge.complete{background:#0d3117;color:#3fb950}
+.badge.low{background:#1c1c5e;color:#a5b4fc}
+.badge.high{background:#4c1d95;color:#c4b5fd}
+.field-list{color:#8b949e;font-size:.72rem;margin-left:4px}
+.field-present{color:#3fb950}
+.field-missing{color:#f85149}
+.copy-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:.75rem;transition:all .15s}
+.copy-btn:hover{background:#30363d;border-color:#58a6ff}
+.copy-btn.copied{background:#238636;border-color:#2ea043;color:#fff}
+.claim-link{background:#1f6feb;color:#fff;padding:1px 8px;border-radius:10px;font-size:.68rem;font-weight:600;text-decoration:none;margin-left:6px;flex-shrink:0}
+.claim-link:hover{background:#388bfd}
+.done-cb{width:16px;height:16px;cursor:pointer;accent-color:#238636;flex-shrink:0;margin-right:6px}
+.task-row.done{opacity:.5;background:#0d1117}
+.task-row.done .task-id{text-decoration:line-through;color:#484f58}
+.done-ts{color:#3fb950;font-size:.68rem;margin-left:8px;font-family:-apple-system,sans-serif}
+.status-bar{display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap}
+.status-bar button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:.8rem;transition:all .15s}
+.status-bar button:hover{background:#30363d;border-color:#58a6ff}
+.status-bar .progress-text{color:#8b949e;font-size:.85rem;margin-left:auto}
+.status-bar .progress-text span{color:#3fb950;font-weight:700}
+.redash-section{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:16px}
+.redash-section h3{font-size:.95rem;margin-bottom:12px;color:#f0f6fc}
+.redash-btn{background:#238636;border:none;color:#fff;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;font-weight:500;transition:all .15s}
+.redash-btn:hover{background:#2ea043}
+.redash-btn:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
+.redash-status{margin-top:12px;font-size:.85rem;color:#8b949e}
+.redash-results{margin-top:12px}
+.redash-results table{width:100%;border-collapse:collapse;font-size:.8rem}
+.redash-results th{text-align:left;padding:8px 12px;background:#21262d;color:#8b949e;font-weight:600;text-transform:uppercase;font-size:.7rem;letter-spacing:.5px}
+.redash-results td{padding:8px 12px;border-bottom:1px solid #21262d}
+.redash-results tr:hover{background:#1c2333}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.7rem;font-weight:600}
+.tag.found{background:#0d419d;color:#a5d6ff}
+.tag.not-found{background:#490202;color:#ff7b72}
+.query-box{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:'SF Mono',Monaco,monospace;font-size:.75rem;color:#8b949e;margin-top:8px;max-height:120px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.hidden{display:none}
+#results{display:none}
+</style>
+</head>
+<body>
+
+<h1>JSONL Justification Checker</h1>
+<p class="subtitle">Drop a delivery JSONL to categorize tasks by pass@k and justification status</p>
+
+<div class="drop-zone" id="dropZone">
+  <div class="icon">📄</div>
+  <p>Drop JSONL file here or click to browse</p>
+  <input type="file" id="fileInput" accept=".jsonl">
+</div>
+
+<div id="results">
+  <div class="stats-bar" id="statsBar"></div>
+  <div class="status-bar" id="statusBar" style="display:none">
+    <button onclick="copyDoneIds(this)">Copy Done IDs</button>
+    <button onclick="exportStatus()">Export Status</button>
+    <button onclick="exportMissingJustifications()">Export Missing Justifications CSV</button>
+    <button onclick="document.getElementById('importFile').click()">Import Status</button>
+    <button onclick="clearAllStatus()">Clear All</button>
+    <input type="file" id="importFile" accept=".json" style="display:none" onchange="importStatus(event)">
+    <div class="progress-text">Done: <span id="doneCount">0</span> / <span id="totalActionable">0</span></div>
+  </div>
+  <div id="groups"></div>
+  <div class="redash-section" id="redashSection">
+    <h3>Redash Pass@k Lookup</h3>
+    <p style="font-size:.85rem;color:#8b949e;margin-bottom:12px">
+      For tasks missing pass@k, query Redash to check if <code>passAtKResults</code> exists in task metadata.
+    </p>
+    <button class="redash-btn" id="redashBtn" onclick="runRedash()">Query Redash for Missing Pass@k</button>
+    <div id="redashQuery" class="hidden">
+      <div class="query-box" id="queryBox"></div>
+    </div>
+    <div class="redash-status" id="redashStatus"></div>
+    <div class="redash-results" id="redashResults"></div>
+  </div>
+</div>
+
+<script>
+window.onerror = function(msg, url, line, col, err) {
+  document.body.insertAdjacentHTML('afterbegin',
+    '<div style="background:#490202;color:#ff7b72;padding:12px;border-radius:8px;margin-bottom:16px;font-family:monospace;font-size:.85rem">'
+    + '<b>JS Error:</b> ' + msg + ' (line ' + line + ')' + '</div>');
+  return false;
+};
+const ANNOTATION_KEYS = [
+  "why_rubric_is_correct","incorrect_rubric_justification","incorrect_unit_test_justification",
+  "what_model_did_wrong","model_mistake_justification_rubric","model_mistake_justification_unit_test",
+  "why_rubric_is_present","correct_answer_justification_rubric","correct_answer_justification_unit_test"
+];
+const REDASH_API_KEY = "rgvIZ0kqxlsnul1vmwCeysw9wn98OIdrIoNPfZw3";
+const REDASH_BASE = "https://redash.scale.com";
+const DATA_SOURCE_ID = 22;
+const QUERY_ID = 301965;
+
+let analysisResult = null;
+let taskStatus = {}; // { taskId: { done: true, timestamp: "2026-05-11T19:30:00Z" } }
+let currentFileName = '';
+const STORAGE_KEY = 'jsonl_checker_status'; // stores { fileName: { taskId: {...}, ... }, ... }
+
+function loadStatus() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        taskStatus = (currentFileName && parsed[currentFileName]) ? parsed[currentFileName] : {};
+      }
+    }
+  } catch(e) {}
+}
+function saveStatus() {
+  try {
+    const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    all[currentFileName] = taskStatus;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+  } catch(e) {}
+  updateProgress();
+}
+function toggleDone(taskId, checkbox) {
+  if (checkbox.checked) {
+    taskStatus[taskId] = { done: true, timestamp: new Date().toISOString() };
+  } else {
+    delete taskStatus[taskId];
+  }
+  saveStatus();
+  const row = checkbox.closest('.task-row');
+  if (row) {
+    row.classList.toggle('done', checkbox.checked);
+    const tsEl = row.querySelector('.done-ts');
+    if (tsEl) tsEl.textContent = checkbox.checked ? fmtTs(taskStatus[taskId].timestamp) : '';
+  }
+}
+function fmtTs(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US', {month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString('en-US', {hour:'numeric',minute:'2-digit'});
+}
+function exportStatus() {
+  const exportData = { fileName: currentFileName, tasks: taskStatus };
+  const blob = new Blob([JSON.stringify(exportData, null, 2)], {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `checker_status_${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+}
+function csvCell(value) {
+  const s = value === null || value === undefined ? '' : String(value);
+  return `"${s.replace(/"/g, '""')}"`;
+}
+function addMissingRows(rows, taskId, rubricItems, testItems) {
+  (rubricItems || []).forEach(item => rows.push([taskId, item.criterion || item.name || '', '']));
+  (testItems || []).forEach(item => rows.push([taskId, '', item.criterion || item.name || '']));
+}
+function exportMissingJustifications() {
+  if (!analysisResult) return;
+  const rows = [];
+  const groups = analysisResult.groups || {};
+
+  (groups.missingPK || []).forEach(t => addMissingRows(rows, t.id, t.rubricItems, t.testItems));
+  (groups.onlyRubrics || []).forEach(t => addMissingRows(rows, t.id, t.items, []));
+  (groups.onlyTests || []).forEach(t => addMissingRows(rows, t.id, [], t.items));
+  (groups.both || []).forEach(t => addMissingRows(rows, t.id, t.rubricItems, t.testItems));
+
+  if (rows.length === 0) {
+    alert('No missing justifications to export.');
+    return;
+  }
+
+  const csv = [
+    ['task id', 'missing rubric', 'missing test'],
+    ...rows
+  ].map(row => row.map(csvCell).join(',')).join('\n');
+  const blob = new Blob([csv], {type: 'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const baseName = currentFileName ? currentFileName.replace(/\.[^.]+$/, '') : 'jsonl_checker';
+  a.download = `${baseName}_missing_justifications_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+}
+function importStatus(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const imported = JSON.parse(e.target.result);
+      const tasks = imported.tasks || imported;
+      Object.assign(taskStatus, tasks);
+      saveStatus();
+      if (analysisResult) renderResults(analysisResult);
+    } catch(err) { alert('Invalid status file'); }
+  };
+  reader.readAsText(file);
+  event.target.value = '';
+}
+function clearAllStatus() {
+  if (!confirm('Clear all done statuses for this file?')) return;
+  taskStatus = {};
+  saveStatus();
+  if (analysisResult) renderResults(analysisResult);
+}
+function copyDoneIds(btn) {
+  const ids = Object.keys(taskStatus).filter(id => taskStatus[id] && taskStatus[id].done);
+  if (ids.length === 0) { btn.textContent = 'No done tasks'; setTimeout(() => { btn.textContent = 'Copy Done IDs'; }, 1500); return; }
+  navigator.clipboard.writeText(ids.join('\n'));
+  btn.textContent = `Copied ${ids.length}!`;
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'Copy Done IDs'; btn.classList.remove('copied'); }, 1500);
+}
+function updateProgress() {
+  const doneEl = document.getElementById('doneCount');
+  const totalEl = document.getElementById('totalActionable');
+  if (!doneEl || !analysisResult) return;
+  const actionable = (analysisResult.groups.onlyTests || []).length
+    + (analysisResult.groups.onlyRubrics || []).length
+    + (analysisResult.groups.both || []).length
+    + (analysisResult.groups.missingPK || []).length;
+  const actionableIds = [
+    ...(analysisResult.groups.onlyTests || []),
+    ...(analysisResult.groups.onlyRubrics || []),
+    ...(analysisResult.groups.both || []),
+    ...(analysisResult.groups.missingPK || [])
+  ].map(t => t.id);
+  const doneCount = actionableIds.filter(id => taskStatus[id] && taskStatus[id].done).length;
+  doneEl.textContent = doneCount;
+  totalEl.textContent = actionable;
+}
+loadStatus();
+
+function toItems(obj) {
+  if (!obj) return [];
+  if (Array.isArray(obj)) return obj.filter(i => typeof i === 'object' && i !== null).map(i => [i.id || i.test_name || '?', i]);
+  if (typeof obj === 'object') return Object.entries(obj).filter(([,v]) => typeof v === 'object' && v !== null);
+  return [];
+}
+
+function hasPassRate(item) {
+  return Object.keys(item).some(k => k.toLowerCase().includes('pass_rate') && item[k] !== null && item[k] !== undefined);
+}
+
+function getPassRateValues(item) {
+  if (!item || typeof item !== 'object') return [];
+  return Object.keys(item)
+    .filter(k => k.toLowerCase().includes('pass_rate'))
+    .map(k => parseFloat(item[k]))
+    .filter(v => !isNaN(v))
+    .map(v => v > 1 ? v / 100 : v);
+}
+
+function averagePassRates(items) {
+  const values = items.flatMap(([,item]) => getPassRateValues(item));
+  if (values.length === 0) return null;
+  const avg = values.reduce((s,v) => s + v, 0) / values.length;
+  return { avg, count: values.length };
+}
+
+function isPass0(item) {
+  const po = item.pass_rate_opus;
+  const pg = item.pass_rate_gemini31;
+  if (po === null || po === undefined) return false;
+  const poF = parseFloat(po);
+  if (isNaN(poF)) return false;
+  if (pg !== null && pg !== undefined) {
+    const pgF = parseFloat(pg);
+    if (!isNaN(pgF)) return poF === 0 && pgF === 0;
+  }
+  return poF === 0;
+}
+
+function isPass0OrMissing(item) {
+  const po = item.pass_rate_opus;
+  const pg = item.pass_rate_gemini31;
+  const poF = (po === null || po === undefined) ? 0 : parseFloat(po);
+  const pgF = (pg === null || pg === undefined) ? 0 : parseFloat(pg);
+  if (isNaN(poF) || isNaN(pgF)) return false;
+  return poF === 0 && pgF === 0;
+}
+
+const JUST_FIELDS = ["why_rubric_is_correct", "why_rubric_is_important", "what_model_did_wrong"];
+
+function checkJustification(item) {
+  const sources = [item];
+  if (item.annotations && typeof item.annotations === 'object') sources.push(item.annotations);
+
+  const present = [];
+  const missing = [];
+  for (const fld of JUST_FIELDS) {
+    const found = sources.some(s => s[fld] && String(s[fld]).trim());
+    (found ? present : missing).push(fld);
+  }
+  // Also check alternate key names from ANNOTATION_KEYS
+  if (missing.length > 0) {
+    const altMap = {
+      "why_rubric_is_correct": ["incorrect_rubric_justification","incorrect_unit_test_justification"],
+      "what_model_did_wrong": ["model_mistake_justification_rubric","model_mistake_justification_unit_test"],
+      "why_rubric_is_important": ["why_rubric_is_present","correct_answer_justification_rubric","correct_answer_justification_unit_test"]
+    };
+    for (const fld of [...missing]) {
+      const alts = altMap[fld] || [];
+      const altFound = sources.some(s => alts.some(a => s[a] && String(s[a]).trim()));
+      if (altFound) { missing.splice(missing.indexOf(fld), 1); present.push(fld); }
+    }
+  }
+  const status = missing.length === 0 ? 'complete' : present.length === 0 ? 'missing' : 'partial';
+  return { status, present, missing };
+}
+
+function hasJustification(item) {
+  return checkJustification(item).status === 'complete';
+}
+
+function analyzeJSONL(lines) {
+  const tasks = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const groups = { missingPK: [], noMissing: [], onlyTests: [], onlyRubrics: [], both: [], outlierRubrics: [], highAvgPassK: [], noUnitTests: [] };
+
+  // First pass: collect counts for stats
+  const rubricCounts = [];
+  const testCounts = [];
+  const taskCounts = []; // Store {id, rubrics, tests} for outlier detection
+
+  for (const task of tasks) {
+    const tid = task.task_id || '';
+    const ri = toItems(task.rubrics);
+    const ti = toItems(task.unit_tests);
+    rubricCounts.push(ri.length);
+    testCounts.push(ti.length);
+    taskCounts.push({ id: tid, rubrics: ri.length, tests: ti.length });
+  }
+
+  // Calculate stats
+  const avgRubrics = rubricCounts.length > 0 ? (rubricCounts.reduce((a,b) => a+b, 0) / rubricCounts.length) : 0;
+  const avgTests = testCounts.length > 0 ? (testCounts.reduce((a,b) => a+b, 0) / testCounts.length) : 0;
+
+  // Identify outlier tasks (fewer than 10 rubrics)
+  const minRubrics = 10;
+  for (const tc of taskCounts) {
+    if (tc.rubrics < minRubrics) {
+      groups.outlierRubrics.push({ id: tc.id, rubricCount: tc.rubrics, testCount: tc.tests, minRubrics });
+    }
+  }
+
+  // Store stats for rendering
+  groups.stats = { avgRubrics, avgTests, minRubrics };
+
+  for (const task of tasks) {
+    const tid = task.task_id || '';
+    const ri = toItems(task.rubrics);
+    const ti = toItems(task.unit_tests);
+
+    if (ti.length === 0) {
+      groups.noUnitTests.push({ id: tid, rubricCount: ri.length });
+    }
+
+    const avgPassK = averagePassRates([...ri, ...ti]);
+    if (avgPassK && avgPassK.avg > 0.8) {
+      groups.highAvgPassK.push({ id: tid, avg: avgPassK.avg, count: avgPassK.count, rubricCount: ri.length, testCount: ti.length });
+    }
+
+    const rNoPK = ri.filter(([,r]) => !hasPassRate(r)).length;
+    const tNoPK = ti.filter(([,t]) => !hasPassRate(t)).length;
+
+    // Only flag as "Missing Pass@k" if rubrics lack pass@k.
+    // If rubrics have pass@k but tests don't, that's not missing — tests just weren't scored.
+    if (rNoPK > 0) {
+      const p0rPK = ri.filter(([,r]) => isPass0OrMissing(r));
+      const p0tPK = ti.filter(([,t]) => isPass0OrMissing(t));
+      const rubricDetailsPK = p0rPK.map(([name, r]) => {
+        const jc = checkJustification(r);
+        return { name, criterion: r.criterion || r.title || r.name || name, status: jc.status, present: jc.present, missing: jc.missing };
+      }).filter(d => d.status !== 'complete');
+      const testDetailsPK = p0tPK.map(([name, t]) => {
+        const jc = checkJustification(t);
+        return { name, criterion: t.test_name || t.title || t.name || name, status: jc.status, present: jc.present, missing: jc.missing };
+      }).filter(d => d.status !== 'complete');
+
+      groups.missingPK.push({
+        id: tid, missingR: rNoPK, totalR: ri.length, missingT: tNoPK, totalT: ti.length,
+        justMissR: rubricDetailsPK.length, justMissT: testDetailsPK.length,
+        rubricItems: rubricDetailsPK, testItems: testDetailsPK
+      });
+      continue;
+    }
+
+    const p0r = ri.filter(([,r]) => isPass0(r));
+    const p0t = ti.filter(([,t]) => isPass0(t));
+
+    const rubricDetails = p0r.map(([name, r]) => {
+      const jc = checkJustification(r);
+      return { name, criterion: r.criterion || r.title || r.name || name, status: jc.status, present: jc.present, missing: jc.missing };
+    }).filter(d => d.status !== 'complete');
+
+    const testDetails = p0t.map(([name, t]) => {
+      const jc = checkJustification(t);
+      return { name, criterion: t.test_name || t.title || t.name || name, status: jc.status, present: jc.present, missing: jc.missing };
+    }).filter(d => d.status !== 'complete');
+
+    const mr = rubricDetails.length;
+    const mt = testDetails.length;
+    const mrPartial = rubricDetails.filter(d => d.status === 'partial').length;
+    const mtPartial = testDetails.filter(d => d.status === 'partial').length;
+
+    if (mr === 0 && mt === 0) groups.noMissing.push({ id: tid });
+    else if (mr === 0 && mt > 0) groups.onlyTests.push({ id: tid, count: mt, partial: mtPartial, items: testDetails });
+    else if (mr > 0 && mt === 0) groups.onlyRubrics.push({ id: tid, count: mr, partial: mrPartial, items: rubricDetails });
+    else groups.both.push({ id: tid, rubrics: mr, tests: mt, rPartial: mrPartial, tPartial: mtPartial, rubricItems: rubricDetails, testItems: testDetails });
+  }
+
+  groups.highAvgPassK.sort((a,b) => b.avg - a.avg);
+
+  return { total: tasks.length, groups };
+}
+
+function renderResults(result) {
+  analysisResult = result;
+  document.getElementById('results').style.display = 'block';
+  const { total, groups } = result;
+
+  const statsBar = document.getElementById('statsBar');
+  const totalMissR = groups.onlyRubrics.reduce((s,t) => s+t.count, 0)
+    + groups.both.reduce((s,t) => s+t.rubrics, 0);
+  const totalMissT = groups.onlyTests.reduce((s,t) => s+t.count, 0)
+    + groups.both.reduce((s,t) => s+t.tests, 0);
+
+  const stats = groups.stats || {};
+  const avgR = stats.avgRubrics !== undefined ? stats.avgRubrics.toFixed(1) : '—';
+  const avgT = stats.avgTests !== undefined ? stats.avgTests.toFixed(1) : '—';
+
+  statsBar.innerHTML = `
+    <div class="stat blue"><div class="num">${total}</div><div class="label">Total Tasks</div></div>
+    <div class="stat green"><div class="num">${groups.noMissing.length}</div><div class="label">No Missing</div></div>
+    <div class="stat red"><div class="num">${groups.missingPK.length}</div><div class="label">Missing Pass@k</div></div>
+    <div class="stat yellow"><div class="num">${groups.onlyTests.length}</div><div class="label">Missing Tests Only</div></div>
+    <div class="stat orange"><div class="num">${groups.onlyRubrics.length}</div><div class="label">Missing Rubrics Only</div></div>
+    <div class="stat red"><div class="num">${groups.both.length}</div><div class="label">Missing Both</div></div>
+    <div class="stat orange"><div class="num">${totalMissR}</div><div class="label">Total Missing Rubric Just.</div></div>
+    <div class="stat yellow"><div class="num">${totalMissT}</div><div class="label">Total Missing Test Just.</div></div>
+    <div class="stat blue"><div class="num">${avgR}</div><div class="label">Avg Rubrics/Task</div></div>
+    <div class="stat blue"><div class="num">${avgT}</div><div class="label">Avg Unit Tests/Task</div></div>
+    <div class="stat green"><div class="num">${groups.highAvgPassK.length}</div><div class="label">Avg Pass@k &gt;80%</div></div>
+    <div class="stat red"><div class="num">${groups.noUnitTests.length}</div><div class="label">No Unit Tests</div></div>
+    <div class="stat" style="${groups.outlierRubrics.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#a371f7">${groups.outlierRubrics.length}</div><div class="label">Low Rubric (&lt;10)</div></div>
+  `;
+
+  const groupsDiv = document.getElementById('groups');
+  groupsDiv.innerHTML = '';
+
+  const configs = [
+    { key: 'missingPK', title: 'Missing Pass@k', color: '#f85149',
+      detail: t => {
+        let s = `pass@k missing: ${t.missingR}R/${t.missingT}T`;
+        if (t.justMissR > 0 || t.justMissT > 0) s += ` · justifications missing: ${t.justMissR} rubrics, ${t.justMissT} tests`;
+        return s;
+      },
+      expandable: true, getItems: t => {
+        const sections = [];
+        if (t.rubricItems && t.rubricItems.length) sections.push({label:'Rubrics missing justifications', items: t.rubricItems});
+        if (t.testItems && t.testItems.length) sections.push({label:'Tests missing justifications', items: t.testItems});
+        return sections;
+      }
+    },
+    { key: 'noMissing', title: 'No Missing Justifications', color: '#3fb950', detail: () => '',
+      expandable: false },
+    { key: 'onlyTests', title: 'Only Missing Test Justifications', color: '#d29922',
+      detail: t => { let s = `${t.count} tests`; if (t.partial) s += ` (${t.partial} partial)`; return s; },
+      expandable: true, getItems: t => t.items ? [{label:'Tests',items:t.items}] : [] },
+    { key: 'onlyRubrics', title: 'Only Missing Rubric Justifications', color: '#db6d28',
+      detail: t => { let s = `${t.count} rubrics`; if (t.partial) s += ` (${t.partial} partial)`; return s; },
+      expandable: true, getItems: t => t.items ? [{label:'Rubrics',items:t.items}] : [] },
+    { key: 'both', title: 'Missing Rubrics + Tests', color: '#f85149',
+      detail: t => {
+        let s = `${t.rubrics} rubrics`;
+        if (t.rPartial) s += ` (${t.rPartial} partial)`;
+        s += `, ${t.tests} tests`;
+        if (t.tPartial) s += ` (${t.tPartial} partial)`;
+        return s;
+      },
+      expandable: true, getItems: t => {
+        const sections = [];
+        if (t.rubricItems) sections.push({label:'Rubrics',items:t.rubricItems});
+        if (t.testItems) sections.push({label:'Tests',items:t.testItems});
+        return sections;
+      }
+    },
+    { key: 'outlierRubrics', title: 'Low Rubric Count (<10)', color: '#a371f7',
+      detail: t => {
+        return `<span class="badge low">LOW</span> ${t.rubricCount} rubrics, ${t.testCount} tests`;
+      },
+      expandable: false
+    },
+    { key: 'highAvgPassK', title: 'High Avg Pass@k (>80%)', color: '#3fb950',
+      detail: t => {
+        return `<span class="badge complete">${(t.avg * 100).toFixed(1)}%</span> avg across ${t.count} pass@k scores (${t.rubricCount} rubrics, ${t.testCount} tests)`;
+      },
+      expandable: false
+    },
+    { key: 'noUnitTests', title: 'No Unit Tests', color: '#f85149',
+      detail: t => {
+        return `<span class="badge missing">NO TESTS</span> ${t.rubricCount} rubrics`;
+      },
+      expandable: false
+    }
+  ];
+
+  for (const cfg of configs) {
+    const items = groups[cfg.key];
+    const group = document.createElement('div');
+    group.className = 'group';
+    
+    // Add threshold info for outlier section
+    let headerExtra = '';
+    if (cfg.key === 'outlierRubrics') {
+      headerExtra = `<span style="font-size:.75rem;color:#8b949e;font-weight:400;margin-left:8px">(tasks with fewer than ${stats.minRubrics || 10} rubrics)</span>`;
+    }
+    
+    group.innerHTML = `
+      <div class="group-header" onclick="toggleGroup(this)">
+        <h2><span style="color:${cfg.color}">●</span> ${cfg.title} <span class="count">${items.length}</span>${headerExtra}</h2>
+        <span class="arrow">▶</span>
+      </div>
+      <div class="group-body">
+        ${items.length === 0 ? '<div class="task-row" style="color:#484f58;cursor:default">No tasks</div>' :
+          items.map((t, idx) => {
+            const expandId = `expand_${cfg.key}_${idx}`;
+            const expandContent = cfg.expandable ? renderExpandContent(cfg.getItems(t)) : '';
+            const isDone = taskStatus[t.id] && taskStatus[t.id].done;
+            const ts = isDone ? fmtTs(taskStatus[t.id].timestamp) : '';
+            return `
+            <div class="task-row${isDone ? ' done' : ''}" ${cfg.expandable ? `onclick="toggleExpand('${expandId}', event)"` : 'style="cursor:default"'}>
+              <div class="task-row-header">
+                <div style="display:flex;align-items:center">
+                  <input type="checkbox" class="done-cb" ${isDone ? 'checked' : ''} onclick="event.stopPropagation();toggleDone('${t.id}', this)" title="Mark as done">
+                  ${cfg.expandable ? '<span style="color:#484f58;margin-right:6px;font-size:.7rem">▶</span>' : ''}
+                  <span class="task-id" onclick="event.stopPropagation();copyId('${t.id}')">${t.id}</span>
+                  <a href="https://app.outlier.ai/en/expert/tasks?forceClaim=1&amp;taskId=${t.id}" target="_blank" class="claim-link" onclick="event.stopPropagation()">claim</a>
+                  <span class="done-ts">${ts}</span>
+                  ${cfg.detail(t) ? `<span class="task-detail"> — ${cfg.detail(t)}</span>` : ''}
+                </div>
+              </div>
+              ${expandContent ? `<div class="task-expand" id="${expandId}">${expandContent}</div>` : ''}
+            </div>`;
+          }).join('')}
+        ${items.length > 0 ? `<div class="task-row" style="justify-content:flex-end;cursor:default">
+          <button class="copy-btn" onclick="event.stopPropagation();copyAll('${cfg.key}')">Copy all IDs</button>
+        </div>` : ''}
+      </div>
+    `;
+    groupsDiv.appendChild(group);
+  }
+
+  document.getElementById('redashSection').classList.toggle('hidden', groups.missingPK.length === 0);
+  document.getElementById('statusBar').style.display = 'flex';
+  updateProgress();
+}
+
+function renderExpandContent(sections) {
+  if (!sections || sections.length === 0) return '';
+  return sections.map(sec => {
+    const rows = sec.items.map(d => {
+      const badgeClass = d.status === 'partial' ? 'partial' : 'missing';
+      const badgeLabel = d.status === 'partial' ? 'PARTIAL' : 'MISSING';
+      const fieldInfo = d.status === 'partial'
+        ? ` <span class="field-list">(has: ${d.present.map(f => `<span class="field-present">${shortField(f)}</span>`).join(', ')} — missing: ${d.missing.map(f => `<span class="field-missing">${shortField(f)}</span>`).join(', ')})</span>`
+        : '';
+      return `<div class="item-row">
+        <span class="badge ${badgeClass}">${badgeLabel}</span>
+        <span class="item-id">${escHtml(d.name)}</span>
+        <span class="item-criterion">${escHtml(d.criterion)}</span>
+        ${fieldInfo}
+      </div>`;
+    }).join('');
+    return `<div style="margin-bottom:6px"><div style="font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">${sec.label}</div>${rows}</div>`;
+  }).join('');
+}
+
+function shortField(f) {
+  const map = { 'why_rubric_is_correct': 'correct', 'why_rubric_is_important': 'important', 'what_model_did_wrong': 'model_wrong' };
+  return map[f] || f;
+}
+
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function toggleExpand(id, event) {
+  if (event.target.classList.contains('task-id') || event.target.classList.contains('copy-btn')) return;
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('open');
+  const arrow = el.parentElement.querySelector('.task-row-header span:first-child');
+  if (arrow && arrow.style.color === 'rgb(72, 79, 88)') {
+    arrow.textContent = el.classList.contains('open') ? '▼' : '▶';
+  }
+}
+
+function toggleGroup(header) {
+  header.classList.toggle('open');
+  header.nextElementSibling.classList.toggle('open');
+}
+
+function copyId(id) {
+  navigator.clipboard.writeText(id);
+}
+
+function copyAll(key) {
+  const ids = analysisResult.groups[key].map(t => t.id).join('\n');
+  navigator.clipboard.writeText(ids);
+  const btn = event.target;
+  btn.textContent = 'Copied!';
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'Copy all IDs'; btn.classList.remove('copied'); }, 1500);
+}
+
+async function runRedash() {
+  const btn = document.getElementById('redashBtn');
+  const status = document.getElementById('redashStatus');
+  const resultsDiv = document.getElementById('redashResults');
+  const queryDiv = document.getElementById('redashQuery');
+  const queryBox = document.getElementById('queryBox');
+
+  if (!analysisResult || analysisResult.groups.missingPK.length === 0) return;
+
+  const taskIds = analysisResult.groups.missingPK.map(t => t.id);
+  const valuesClause = taskIds.map(id => `    ('${id}')`).join(',\n');
+
+  const sql = `WITH task_list AS (
+  SELECT column1 AS task_id
+  FROM VALUES
+${valuesClause}
+)
+SELECT
+  t._id AS task_id,
+  CASE WHEN t.metadata:passAtKResults:runs IS NOT NULL THEN 'YES' ELSE 'NO' END AS has_runs,
+  OBJECT_KEYS(t.metadata:passAtKResults:runs) AS run_keys,
+  ARRAY_SIZE(COALESCE(OBJECT_KEYS(t.metadata:passAtKResults:runs), ARRAY_CONSTRUCT())) AS num_runs,
+  t.metadata:passAtKResults:runs AS runs_data
+FROM tasks t
+JOIN task_list tl ON tl.task_id = t._id
+WHERE t.project = '698318a45989d90bf44b9b53'
+ORDER BY task_id;`;
+
+  queryBox.textContent = sql;
+  queryDiv.classList.remove('hidden');
+
+  btn.disabled = true;
+  btn.textContent = 'Running via local script...';
+  status.textContent = 'Executing query via curl (runs locally)...';
+  resultsDiv.innerHTML = '';
+
+  // Write the SQL to a temp file and run via local script
+  const scriptContent = `#!/bin/bash
+API_KEY="${REDASH_API_KEY}"
+BASE="${REDASH_BASE}"
+QUERY_ID=${QUERY_ID}
+SQL=$(cat <<'ENDSQL'
+${sql}
+ENDSQL
+)
+
+# Update query
+curl -s -X POST "$BASE/api/queries/$QUERY_ID" \\
+  -H "Authorization: Key $API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d "$(python3 -c "import json; print(json.dumps({'query': '''$SQL'''}))")" > /dev/null 2>&1
+
+# Execute
+EXEC=$(curl -s -X POST "$BASE/api/queries/$QUERY_ID/results" \\
+  -H "Authorization: Key $API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"max_age": 0}')
+
+JOB_ID=$(echo "$EXEC" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('job',{}).get('id',''))" 2>/dev/null)
+
+if [ -n "$JOB_ID" ]; then
+  for i in $(seq 1 30); do
+    sleep 2
+    JOB=$(curl -s "$BASE/api/jobs/$JOB_ID" -H "Authorization: Key $API_KEY")
+    STATUS=$(echo "$JOB" | python3 -c "import json,sys; print(json.load(sys.stdin)['job']['status'])" 2>/dev/null)
+    if [ "$STATUS" = "3" ]; then
+      RESULT_ID=$(echo "$JOB" | python3 -c "import json,sys; print(json.load(sys.stdin)['job']['query_result_id'])" 2>/dev/null)
+      curl -s "$BASE/api/query_results/$RESULT_ID" -H "Authorization: Key $API_KEY" | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+rows = d['query_result']['data']['rows']
+print(json.dumps(rows))
+"
+      exit 0
+    fi
+    if [ "$STATUS" = "4" ]; then
+      echo "ERROR"
+      exit 1
+    fi
+  done
+fi
+`;
+
+  // Can't run shell from browser — use copy-to-clipboard approach instead
+  // Generate a python one-liner the user can paste in terminal
+  const pythonScript = generatePythonScript(sql, taskIds);
+  
+  status.innerHTML = `<span style="color:#d29922">⚠ Browser can't reach Redash directly (CORS). Use one of these options:</span>`;
+  
+  resultsDiv.innerHTML = `
+    <div style="margin-top:12px">
+      <p style="margin-bottom:8px;font-size:.85rem"><strong>Option 1:</strong> Open in Redash (query already formatted)</p>
+      <a href="${REDASH_BASE}/queries/${QUERY_ID}/source" target="_blank" class="redash-btn" style="text-decoration:none;display:inline-block;margin-bottom:16px">Open Query ${QUERY_ID} in Redash ↗</a>
+      <button class="copy-btn" style="margin-left:8px" onclick="copySQL()">Copy SQL to Clipboard</button>
+      
+      <p style="margin-top:16px;margin-bottom:8px;font-size:.85rem"><strong>Option 2:</strong> Run in terminal (paste this command)</p>
+      <div style="position:relative">
+        <pre class="query-box" id="terminalCmd" style="max-height:80px;cursor:pointer" onclick="copyTerminal()">${escapeHtml(pythonScript)}</pre>
+        <button class="copy-btn" style="position:absolute;top:8px;right:8px" onclick="copyTerminal()">Copy</button>
+      </div>
+      <p style="margin-top:8px;font-size:.8rem;color:#8b949e">Then paste the JSON output below:</p>
+      <textarea id="jsonPaste" rows="4" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:8px;font-family:monospace;font-size:.8rem;margin-top:4px" placeholder="Paste JSON results here..."></textarea>
+      <button class="redash-btn" style="margin-top:8px" onclick="parseManualResults()">Parse Results</button>
+    </div>
+  `;
+
+  btn.disabled = false;
+  btn.textContent = 'Query Redash for Missing Pass@k';
+}
+
+function generatePythonScript(sql, taskIds) {
+  return `python3 -c "
+import requests, json, time
+API_KEY='${REDASH_API_KEY}'
+BASE='${REDASH_BASE}'
+H={'Authorization': f'Key {API_KEY}', 'Content-Type': 'application/json'}
+sql='''${sql.replace(/'/g, "\\'")}'''
+requests.post(f'{BASE}/api/queries/${QUERY_ID}', headers=H, json={'query': sql})
+r=requests.post(f'{BASE}/api/queries/${QUERY_ID}/results', headers=H, json={'max_age':0}).json()
+if 'job' in r:
+    jid=r['job']['id']
+    for _ in range(30):
+        time.sleep(2)
+        j=requests.get(f'{BASE}/api/jobs/{jid}', headers=H).json()
+        if j['job']['status']==3:
+            rid=j['job']['query_result_id']
+            rows=requests.get(f'{BASE}/api/query_results/{rid}', headers=H).json()['query_result']['data']['rows']
+            print(json.dumps(rows, indent=2))
+            break
+elif 'query_result' in r:
+    print(json.dumps(r['query_result']['data']['rows'], indent=2))
+"`;
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function copySQL() {
+  const sql = document.getElementById('queryBox').textContent;
+  navigator.clipboard.writeText(sql);
+  event.target.textContent = 'Copied!';
+  event.target.classList.add('copied');
+  setTimeout(() => { event.target.textContent = 'Copy SQL to Clipboard'; event.target.classList.remove('copied'); }, 1500);
+}
+
+function copyTerminal() {
+  const cmd = document.getElementById('terminalCmd').textContent;
+  navigator.clipboard.writeText(cmd);
+}
+
+function parseManualResults() {
+  const textarea = document.getElementById('jsonPaste');
+  const resultsDiv = document.getElementById('redashResults');
+  const statusDiv = document.getElementById('redashStatus');
+  try {
+    const rows = JSON.parse(textarea.value);
+    const taskIds = analysisResult.groups.missingPK.map(t => t.id);
+    
+    // Clear the input UI and show results table
+    const tableHtml = buildRedashTable(rows, taskIds);
+    resultsDiv.innerHTML = tableHtml;
+    statusDiv.innerHTML = `<span style="color:#3fb950">✓ Parsed ${rows.length} results</span>`;
+  } catch(e) {
+    statusDiv.innerHTML = `<span style="color:#f85149">Invalid JSON: ${e.message}</span>`;
+  }
+}
+
+function isPassResult(r) {
+  if (r === true || r === 1) return true;
+  if (typeof r === 'string') { const l = r.toLowerCase().trim(); return l === 'pass' || l === 'passed' || l === 'yes'; }
+  return false;
+}
+
+function analyzeRuns(runsData) {
+  const empty = { numRuns: 0, issues: [], status: 'none', criteriaPass0: 0, totalCriteria: 0, rubricsPass0: 0, totalRubrics: 0 };
+  if (!runsData) return { ...empty, issues: ['No runs data'] };
+  let runs = runsData;
+  if (typeof runs === 'string') { try { runs = JSON.parse(runs); } catch { return { ...empty, issues: ['Invalid JSON'] }; } }
+  
+  const runKeys = Object.keys(runs);
+  const numRuns = runKeys.length;
+  const issues = [];
+  
+  if (numRuns < 16) issues.push(`Only ${numRuns}/16 runs`);
+  
+  let totalMissingRubrics = 0;
+  let totalMissingTests = 0;
+  let runsWithNoRubricResults = 0;
+  let runsWithNoTestResults = 0;
+  let rubricCounts = new Set();
+  let testCounts = new Set();
+  
+  const criterionPasses = {};
+  const testCasePasses = {};
+  
+  for (const key of runKeys) {
+    const run = runs[key];
+    const rr = run.rubric_results;
+    const tr = run.test_results;
+    
+    if (!rr || !rr.criteria || rr.criteria.length === 0) {
+      runsWithNoRubricResults++;
+    } else {
+      rubricCounts.add(rr.criteria.length);
+      rr.criteria.forEach((c, idx) => {
+        const cKey = c.name || c.criterion_id || c.id || `c_${idx}`;
+        if (!(cKey in criterionPasses)) criterionPasses[cKey] = 0;
+        if (c.result) {
+          if (isPassResult(c.result)) criterionPasses[cKey]++;
+        } else {
+          totalMissingRubrics++;
+        }
+      });
+    }
+    
+    if (!tr || (!tr.cases && tr.tests_run === undefined)) {
+      runsWithNoTestResults++;
+    } else {
+      const cases = tr.cases || [];
+      const tc2 = cases.length || (tr.tests_run || 0);
+      testCounts.add(tc2);
+      cases.forEach((tc, idx) => {
+        const tKey = tc.name || tc.test_name || `t_${idx}`;
+        if (!(tKey in testCasePasses)) testCasePasses[tKey] = 0;
+        if (tc.passed === true || isPassResult(tc.status) || isPassResult(tc.result) || tc.success === true) {
+          testCasePasses[tKey]++;
+        }
+      });
+    }
+  }
+  
+  if (runsWithNoRubricResults > 0) issues.push(`${runsWithNoRubricResults} runs missing rubric results`);
+  if (runsWithNoTestResults > 0) issues.push(`${runsWithNoTestResults} runs missing test results`);
+  if (totalMissingRubrics > 0) issues.push(`${totalMissingRubrics} rubric scores missing across runs`);
+  if (rubricCounts.size > 1) issues.push(`Inconsistent rubric counts: ${[...rubricCounts].join(', ')}`);
+  if (testCounts.size > 1) issues.push(`Inconsistent test counts: ${[...testCounts].join(', ')}`);
+  
+  const rubricCount = rubricCounts.size > 0 ? Math.max(...rubricCounts) : 0;
+  const testCount = testCounts.size > 0 ? Math.max(...testCounts) : 0;
+  
+  const criteriaPass0 = Object.values(testCasePasses).filter(v => v === 0).length;
+  const totalCriteria = Object.keys(testCasePasses).length;
+  const rubricsPass0 = Object.values(criterionPasses).filter(v => v === 0).length;
+  const totalRubrics = Object.keys(criterionPasses).length;
+  
+  let status = 'complete';
+  if (numRuns === 0) status = 'none';
+  else if (issues.length > 0) status = 'partial';
+  
+  return { numRuns, rubricCount, testCount, issues, status, criteriaPass0, totalCriteria, rubricsPass0, totalRubrics };
+}
+
+function fmtPass0(count, total) {
+  if (total === 0) return '<span style="color:#484f58">—</span>';
+  if (count === 0) return `<span style="color:#3fb950">0</span><span style="color:#484f58">/${total}</span>`;
+  return `<span style="color:#f85149;font-weight:600">${count}</span><span style="color:#484f58">/${total}</span>`;
+}
+
+function buildRedashTable(rows, taskIds) {
+  let html = `<table><thead><tr>
+    <th>Task ID</th><th>Runs</th><th>Rubrics</th><th>Tests</th><th>Criteria @0</th><th>Rubrics @0</th><th>Status</th><th>Issues</th>
+  </tr></thead><tbody>`;
+  
+  for (const id of taskIds) {
+    const row = rows.find(r => (r.TASK_ID || r.task_id) === id);
+    if (row) {
+      const hasRuns = (row.HAS_RUNS || row.has_runs) === 'YES';
+      if (!hasRuns) {
+        html += `<tr>
+          <td style="font-family:monospace;color:#58a6ff">${id}</td>
+          <td>0</td><td>—</td><td>—</td><td>—</td><td>—</td>
+          <td><span class="tag not-found">NO RUNS</span></td>
+          <td style="color:#8b949e;font-size:.75rem">No passAtKResults in metadata</td>
+        </tr>`;
+        continue;
+      }
+      
+      const runsData = row.RUNS_DATA || row.runs_data;
+      const analysis = analyzeRuns(runsData);
+      
+      const statusTag = analysis.status === 'complete'
+        ? '<span class="tag found">COMPLETE</span>'
+        : analysis.status === 'partial'
+          ? `<span class="tag" style="background:#3d2800;color:#d29922">PARTIAL</span>`
+          : '<span class="tag not-found">NONE</span>';
+      
+      html += `<tr>
+        <td style="font-family:monospace;color:#58a6ff">${id}</td>
+        <td>${analysis.numRuns}/16</td>
+        <td>${analysis.rubricCount || '—'}</td>
+        <td>${analysis.testCount || '—'}</td>
+        <td>${fmtPass0(analysis.criteriaPass0, analysis.totalCriteria)}</td>
+        <td>${fmtPass0(analysis.rubricsPass0, analysis.totalRubrics)}</td>
+        <td>${statusTag}</td>
+        <td style="color:#8b949e;font-size:.75rem">${analysis.issues.join('; ') || '—'}</td>
+      </tr>`;
+    } else {
+      html += `<tr>
+        <td style="font-family:monospace;color:#58a6ff">${id}</td>
+        <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+        <td><span class="tag not-found">NOT IN DB</span></td>
+        <td style="color:#8b949e;font-size:.75rem">Task not found in project</td>
+      </tr>`;
+    }
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderRedashResults(rows, taskIds) {
+  const resultsDiv = document.getElementById('redashResults');
+  resultsDiv.innerHTML = buildRedashTable(rows, taskIds);
+}
+
+// File handling
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => { if (e.target.files.length) processFile(e.target.files[0]); });
+
+function processFile(file) {
+  dropZone.querySelector('p').textContent = `Processing: ${file.name} (${(file.size/1024).toFixed(0)} KB)`;
+  currentFileName = file.name;
+  loadStatus();
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const raw = e.target.result;
+      const lines = raw.split('\n').filter(l => l.trim());
+      dropZone.querySelector('p').textContent = `Loaded: ${file.name} — ${lines.length} lines parsed`;
+      const result = analyzeJSONL(lines);
+      renderResults(result);
+    } catch(err) {
+      console.error('JSONL Checker Error:', err);
+      document.getElementById('results').style.display = 'block';
+      document.getElementById('statsBar').innerHTML = `<div class="stat red"><div class="num">ERROR</div><div class="label">${escHtml(err.message)}</div></div>`;
+    }
+  };
+  reader.readAsText(file);
+}
+</script>
+</body>
+</html>
