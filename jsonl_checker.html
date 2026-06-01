@@ -82,6 +82,19 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
 .tag.found{background:#0d419d;color:#a5d6ff}
 .tag.not-found{background:#490202;color:#ff7b72}
 .query-box{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:'SF Mono',Monaco,monospace;font-size:.75rem;color:#8b949e;margin-top:8px;max-height:120px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.tabs{display:none;gap:8px;margin-bottom:16px}
+.tab-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:8px 14px;border-radius:8px;cursor:pointer;font-size:.85rem}
+.tab-btn:hover{background:#30363d;border-color:#58a6ff}
+.tab-btn.active{background:#1f6feb;border-color:#388bfd;color:#fff}
+.validation-section{display:none;background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:16px}
+.validation-section.active{display:block}
+.validation-section h2{font-size:1.05rem;margin-bottom:8px;color:#f0f6fc}
+.validation-section p{font-size:.85rem;color:#8b949e;margin-bottom:12px}
+.validation-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.validation-actions input{width:80px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:7px;border-radius:6px}
+.validation-output{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;font-family:'SF Mono',Monaco,monospace;font-size:.76rem;white-space:pre-wrap;max-height:420px;overflow:auto;color:#c9d1d9}
+.validation-output.error{border-color:#f85149;color:#ff7b72}
+.validation-output.success{border-color:#3fb950}
 .hidden{display:none}
 #results{display:none}
 </style>
@@ -95,6 +108,11 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <div class="icon">📄</div>
   <p>Drop JSONL file here or click to browse</p>
   <input type="file" id="fileInput" accept=".jsonl">
+</div>
+
+<div class="tabs" id="tabs">
+  <button class="tab-btn active" id="checkerTab" onclick="showTab('checker')">Justification Checker</button>
+  <button class="tab-btn" id="validationTab" onclick="showTab('validation')">Run Delivery Validation</button>
 </div>
 
 <div id="results">
@@ -123,6 +141,24 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   </div>
 </div>
 
+<div class="validation-section" id="deliveryValidation">
+  <h2>Run Delivery Validation</h2>
+  <p>
+    Runs <code>validation/validate_delivery.py</code> against the uploaded JSONL via the hosted validation API.
+    Set the API URL after deploying the backend service.
+  </p>
+  <div class="validation-actions">
+    <label style="font-size:.8rem;color:#8b949e;flex:1;min-width:280px">
+      API URL
+      <input type="url" id="validationApiBase" style="width:100%;margin-top:4px" placeholder="https://your-validation-api.onrender.com">
+    </label>
+    <button class="redash-btn" id="validationBtn" onclick="runDeliveryValidation()">Run validation for uploaded JSONL</button>
+    <label style="font-size:.8rem;color:#8b949e">Workers <input type="number" id="validationWorkers" value="10" min="1" max="32"></label>
+  </div>
+  <div class="redash-status" id="validationStatus">Upload a JSONL file first.</div>
+  <div class="validation-output" id="validationOutput">No validation run yet.</div>
+</div>
+
 <script>
 window.onerror = function(msg, url, line, col, err) {
   document.body.insertAdjacentHTML('afterbegin',
@@ -139,11 +175,127 @@ const REDASH_API_KEY = "rgvIZ0kqxlsnul1vmwCeysw9wn98OIdrIoNPfZw3";
 const REDASH_BASE = "https://redash.scale.com";
 const DATA_SOURCE_ID = 22;
 const QUERY_ID = 301965;
+const DEFAULT_VALIDATION_API_BASE = "https://jsonl-checker-validation.onrender.com";
+const VALIDATION_API_STORAGE_KEY = "jsonl_checker_validation_api_base";
 
 let analysisResult = null;
 let taskStatus = {}; // { taskId: { done: true, timestamp: "2026-05-11T19:30:00Z" } }
 let currentFileName = '';
+let currentFileText = '';
 const STORAGE_KEY = 'jsonl_checker_status'; // stores { fileName: { taskId: {...}, ... }, ... }
+
+function getValidationApiBase() {
+  const input = document.getElementById('validationApiBase');
+  const value = (input && input.value.trim()) || localStorage.getItem(VALIDATION_API_STORAGE_KEY) || DEFAULT_VALIDATION_API_BASE;
+  return value.replace(/\/+$/, '');
+}
+
+function initValidationApiInput() {
+  const input = document.getElementById('validationApiBase');
+  if (!input) return;
+  input.value = localStorage.getItem(VALIDATION_API_STORAGE_KEY) || DEFAULT_VALIDATION_API_BASE;
+  input.addEventListener('change', () => {
+    localStorage.setItem(VALIDATION_API_STORAGE_KEY, input.value.trim());
+  });
+}
+
+function showTab(tab) {
+  const isValidation = tab === 'validation';
+  document.getElementById('checkerTab').classList.toggle('active', !isValidation);
+  document.getElementById('validationTab').classList.toggle('active', isValidation);
+  document.getElementById('results').style.display = isValidation ? 'none' : (analysisResult ? 'block' : 'none');
+  document.getElementById('deliveryValidation').classList.toggle('active', isValidation);
+}
+
+async function runDeliveryValidation() {
+  const btn = document.getElementById('validationBtn');
+  const status = document.getElementById('validationStatus');
+  const output = document.getElementById('validationOutput');
+  const workers = parseInt(document.getElementById('validationWorkers').value || '10', 10);
+  const apiBase = getValidationApiBase();
+
+  if (!currentFileText || !currentFileName) {
+    status.innerHTML = '<span style="color:#f85149">Upload a JSONL file first.</span>';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Starting validation...';
+  status.textContent = 'Uploading JSONL to validation API...';
+  output.className = 'validation-output';
+  output.textContent = `API: ${apiBase}`;
+
+  try {
+    localStorage.setItem(VALIDATION_API_STORAGE_KEY, apiBase);
+    const response = await fetch(`${apiBase}/api/validations`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ fileName: currentFileName, content: currentFileText, workers })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+
+    btn.textContent = 'Validation running...';
+    status.textContent = `Job ${result.job_id} started. Polling for status...`;
+    output.textContent = `Job ${result.job_id} queued.`;
+
+    const finalResult = await pollValidationJob(apiBase, result.job_id, output, status);
+    renderValidationResult(apiBase, finalResult, output, status);
+  } catch (err) {
+    output.className = 'validation-output error';
+    output.textContent = String(err.message || err);
+    status.innerHTML = '<span style="color:#f85149">Could not run validation. Check the API URL/deployment.</span>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run validation for uploaded JSONL';
+  }
+}
+
+async function pollValidationJob(apiBase, jobId, output, status) {
+  for (;;) {
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    const response = await fetch(`${apiBase}/api/validations/${encodeURIComponent(jobId)}`);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+
+    const elapsed = result.started_at ? Math.round((Date.now() / 1000) - result.started_at) : 0;
+    status.textContent = `Job ${jobId}: ${result.status}${elapsed ? ` (${elapsed}s)` : ''}`;
+    output.textContent = [
+      `Status: ${result.status}`,
+      result.summary ? `Tasks: ${result.summary.passing}/${result.summary.total} passing, ${result.summary.affected_tasks} affected, ${result.summary.total_issues} issues` : '',
+      result.stdout_tail || ''
+    ].filter(Boolean).join('\n\n');
+
+    if (result.status === 'done' || result.status === 'error') return result;
+  }
+}
+
+function renderValidationResult(apiBase, result, output, status) {
+  const passed = result.status === 'done' && result.exit_code === 0;
+  const reportUrl = `${apiBase}/api/validations/${encodeURIComponent(result.job_id)}/report`;
+  const issueBuckets = result.summary && result.summary.issue_buckets
+    ? Object.entries(result.summary.issue_buckets).map(([k,v]) => `  ${k}: ${v}`).join('\n')
+    : '';
+
+  const summary = result.summary ? [
+    `Status: ${result.status}`,
+    `Exit code: ${result.exit_code}`,
+    `Tasks: ${result.summary.passing}/${result.summary.total} passing`,
+    `Affected tasks: ${result.summary.affected_tasks}`,
+    `Total issues: ${result.summary.total_issues}`,
+    issueBuckets ? `Issue buckets:\n${issueBuckets}` : '',
+    `Report: ${reportUrl}`,
+    '',
+    result.stdout || '',
+    result.stderr ? `\nSTDERR:\n${result.stderr}` : ''
+  ].filter(Boolean).join('\n') : JSON.stringify(result, null, 2);
+
+  output.className = `validation-output ${passed ? 'success' : 'error'}`;
+  output.textContent = summary;
+  status.innerHTML = passed
+    ? `<span style="color:#3fb950">Validation passed with no issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`
+    : `<span style="color:#d29922">Validation completed with issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`;
+}
 
 function loadStatus() {
   try {
@@ -274,6 +426,7 @@ function updateProgress() {
   totalEl.textContent = actionable;
 }
 loadStatus();
+initValidationApiInput();
 
 function toItems(obj) {
   if (!obj) return [];
@@ -460,7 +613,11 @@ function analyzeJSONL(lines) {
 
 function renderResults(result) {
   analysisResult = result;
+  document.getElementById('tabs').style.display = 'flex';
   document.getElementById('results').style.display = 'block';
+  document.getElementById('deliveryValidation').classList.remove('active');
+  document.getElementById('checkerTab').classList.add('active');
+  document.getElementById('validationTab').classList.remove('active');
   const { total, groups } = result;
 
   const statsBar = document.getElementById('statsBar');
@@ -996,6 +1153,7 @@ function processFile(file) {
   reader.onload = e => {
     try {
       const raw = e.target.result;
+      currentFileText = raw;
       const lines = raw.split('\n').filter(l => l.trim());
       dropZone.querySelector('p').textContent = `Loaded: ${file.name} — ${lines.length} lines parsed`;
       const result = analyzeJSONL(lines);

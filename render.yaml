@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: jsonl-checker-validation
+    env: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: VALIDATION_ALLOWED_ORIGINS
+        value: https://mila-avag.github.io,http://localhost:8000,http://127.0.0.1:8000,null
+      - key: VALIDATION_API_MAX_JOBS
+        value: "2"
+      - key: VALIDATION_WORKERS
+        value: "10"
+      - key: VALIDATION_TIMEOUT_SECONDS
+        value: "3600"
