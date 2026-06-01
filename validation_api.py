@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -215,6 +216,18 @@ def run_validation_job(job_id: str) -> None:
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz() -> dict[str, Any]:
+    deps = {name: shutil.which(name) for name in ("curl", "unzip")}
+    missing = [name for name, path in deps.items() if not path]
+    return {
+        "status": "ok" if not missing else "missing_dependencies",
+        "dependencies": deps,
+        "missing": missing,
+        "validator_exists": VALIDATOR.exists(),
+    }
 
 
 @app.post("/api/validations")
