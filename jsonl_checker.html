@@ -179,6 +179,10 @@ const DATA_SOURCE_ID = 22;
 const QUERY_ID = 301965;
 const REDASH_API_KEY_STORAGE_KEY = "jsonl_checker_redash_api_key";
 const DEFAULT_VALIDATION_API_BASE = "https://jsonl-checker.onrender.com";
+const FALLBACK_VALIDATION_API_BASES = [
+  "https://jsonl-checker.onrender.com",
+  "https://jsonl-checker-validation.onrender.com"
+];
 const VALIDATION_API_STORAGE_KEY = "jsonl_checker_validation_api_base";
 
 let analysisResult = null;
@@ -247,7 +251,7 @@ async function runDeliveryValidation() {
   const status = document.getElementById('validationStatus');
   const output = document.getElementById('validationOutput');
   const workers = parseInt(document.getElementById('validationWorkers').value || '10', 10);
-  const apiBase = getValidationApiBase();
+  let apiBase = getValidationApiBase();
 
   if (!currentFileText || !currentFileName) {
     status.innerHTML = '<span style="color:#f85149">Upload a JSONL file first.</span>';
@@ -265,15 +269,19 @@ async function runDeliveryValidation() {
   appendValidationLog('Step 1/3: sending JSONL to API...');
 
   try {
-    localStorage.setItem(VALIDATION_API_STORAGE_KEY, apiBase);
-    const createUrl = `${apiBase}/api/validations`;
-    const { response, payload: result, elapsedMs } = await fetchJsonWithTimeout(createUrl, {
+    const createOptions = {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ fileName: currentFileName, content: currentFileText, workers })
-    }, 60000);
+    };
+    const create = await createValidationJobWithFallback(apiBase, createOptions);
+    apiBase = create.apiBase;
+    const { response, payload: result, elapsedMs, createUrl } = create;
     appendValidationLog(`POST ${createUrl} -> HTTP ${response.status} in ${(elapsedMs / 1000).toFixed(1)}s`);
     if (!response.ok) throw new Error(result.detail || result.error || result.raw || `HTTP ${response.status}`);
+    localStorage.setItem(VALIDATION_API_STORAGE_KEY, apiBase);
+    const input = document.getElementById('validationApiBase');
+    if (input) input.value = apiBase;
 
     btn.textContent = 'Validation running...';
     status.textContent = `Job ${result.job_id} started. Polling for status...`;
@@ -291,6 +299,29 @@ async function runDeliveryValidation() {
     btn.disabled = false;
     btn.textContent = 'Run validation for uploaded JSONL';
   }
+}
+
+async function createValidationJobWithFallback(preferredApiBase, createOptions) {
+  const apiBases = [preferredApiBase, ...FALLBACK_VALIDATION_API_BASES]
+    .map(v => (v || '').replace(/\/+$/, ''))
+    .filter((v, idx, arr) => v && arr.indexOf(v) === idx);
+  let lastError = null;
+
+  for (const candidateBase of apiBases) {
+    const createUrl = `${candidateBase}/api/validations`;
+    try {
+      appendValidationLog(`Trying ${createUrl}`);
+      const result = await fetchJsonWithTimeout(createUrl, createOptions, 60000);
+      if (result.response.ok) return { ...result, apiBase: candidateBase, createUrl };
+      appendValidationLog(`Endpoint returned HTTP ${result.response.status}; trying next API URL if available.`);
+      lastError = new Error(result.payload.detail || result.payload.error || result.payload.raw || `HTTP ${result.response.status}`);
+    } catch (err) {
+      appendValidationLog(`${candidateBase} failed: ${err.name === 'AbortError' ? 'request timed out' : String(err.message || err)}`);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('No validation API URL could be reached.');
 }
 
 async function pollValidationJob(apiBase, jobId, output, status) {
