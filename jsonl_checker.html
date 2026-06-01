@@ -219,6 +219,29 @@ function showTab(tab) {
   document.getElementById('deliveryValidation').classList.toggle('active', isValidation);
 }
 
+function appendValidationLog(message) {
+  const output = document.getElementById('validationOutput');
+  const ts = new Date().toLocaleTimeString();
+  output.textContent += `${output.textContent ? '\n' : ''}[${ts}] ${message}`;
+  output.scrollTop = output.scrollHeight;
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = performance.now();
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const elapsedMs = Math.round(performance.now() - started);
+    let payload = null;
+    const text = await response.text();
+    try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text }; }
+    return { response, payload, elapsedMs };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runDeliveryValidation() {
   const btn = document.getElementById('validationBtn');
   const status = document.getElementById('validationStatus');
@@ -235,27 +258,34 @@ async function runDeliveryValidation() {
   btn.textContent = 'Starting validation...';
   status.textContent = 'Uploading JSONL to validation API...';
   output.className = 'validation-output';
-  output.textContent = `API: ${apiBase}`;
+  output.textContent = '';
+  appendValidationLog(`API URL: ${apiBase}`);
+  appendValidationLog(`File: ${currentFileName}`);
+  appendValidationLog(`Payload size: ${(new Blob([currentFileText]).size / 1024 / 1024).toFixed(2)} MB`);
+  appendValidationLog('Step 1/3: sending JSONL to API...');
 
   try {
     localStorage.setItem(VALIDATION_API_STORAGE_KEY, apiBase);
-    const response = await fetch(`${apiBase}/api/validations`, {
+    const createUrl = `${apiBase}/api/validations`;
+    const { response, payload: result, elapsedMs } = await fetchJsonWithTimeout(createUrl, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ fileName: currentFileName, content: currentFileText, workers })
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    }, 60000);
+    appendValidationLog(`POST ${createUrl} -> HTTP ${response.status} in ${(elapsedMs / 1000).toFixed(1)}s`);
+    if (!response.ok) throw new Error(result.detail || result.error || result.raw || `HTTP ${response.status}`);
 
     btn.textContent = 'Validation running...';
     status.textContent = `Job ${result.job_id} started. Polling for status...`;
-    output.textContent = `Job ${result.job_id} queued.`;
+    appendValidationLog(`Step 2/3: job ${result.job_id} queued. Polling status...`);
 
     const finalResult = await pollValidationJob(apiBase, result.job_id, output, status);
+    appendValidationLog('Step 3/3: validation finished. Rendering report summary...');
     renderValidationResult(apiBase, finalResult, output, status);
   } catch (err) {
     output.className = 'validation-output error';
-    output.textContent = String(err.message || err);
+    appendValidationLog(`ERROR: ${err.name === 'AbortError' ? 'Request timed out while contacting the validation API.' : String(err.message || err)}`);
+    appendValidationLog('Debug checklist: verify API URL, hard refresh GitHub Pages, and check Render logs for this request.');
     status.innerHTML = '<span style="color:#f85149">Could not run validation. Check the API URL/deployment.</span>';
   } finally {
     btn.disabled = false;
@@ -264,19 +294,20 @@ async function runDeliveryValidation() {
 }
 
 async function pollValidationJob(apiBase, jobId, output, status) {
+  let attempt = 0;
   for (;;) {
     await new Promise(resolve => setTimeout(resolve, 2500));
-    const response = await fetch(`${apiBase}/api/validations/${encodeURIComponent(jobId)}`);
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    attempt += 1;
+    const statusUrl = `${apiBase}/api/validations/${encodeURIComponent(jobId)}`;
+    const { response, payload: result, elapsedMs } = await fetchJsonWithTimeout(statusUrl, {}, 30000);
+    if (!response.ok) throw new Error(result.detail || result.error || result.raw || `HTTP ${response.status}`);
 
     const elapsed = result.started_at ? Math.round((Date.now() / 1000) - result.started_at) : 0;
-    status.textContent = `Job ${jobId}: ${result.status}${elapsed ? ` (${elapsed}s)` : ''}`;
-    output.textContent = [
-      `Status: ${result.status}`,
-      result.summary ? `Tasks: ${result.summary.passing}/${result.summary.total} passing, ${result.summary.affected_tasks} affected, ${result.summary.total_issues} issues` : '',
-      result.stdout_tail || ''
-    ].filter(Boolean).join('\n\n');
+    status.textContent = `Job ${jobId}: ${result.status}${elapsed ? ` (${elapsed}s)` : ''} · poll #${attempt}`;
+    appendValidationLog(`Poll #${attempt}: ${result.status} (${(elapsedMs / 1000).toFixed(1)}s response${elapsed ? `, ${elapsed}s running` : ''})`);
+    if (result.summary) {
+      appendValidationLog(`Current summary: ${result.summary.passing}/${result.summary.total} passing, ${result.summary.affected_tasks} affected, ${result.summary.total_issues} issues`);
+    }
 
     if (result.status === 'done' || result.status === 'error') return result;
   }
@@ -303,7 +334,7 @@ function renderValidationResult(apiBase, result, output, status) {
   ].filter(Boolean).join('\n') : JSON.stringify(result, null, 2);
 
   output.className = `validation-output ${passed ? 'success' : 'error'}`;
-  output.textContent = summary;
+  output.textContent = `${output.textContent}\n\n${summary}`.trim();
   status.innerHTML = passed
     ? `<span style="color:#3fb950">Validation passed with no issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`
     : `<span style="color:#d29922">Validation completed with issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`;
