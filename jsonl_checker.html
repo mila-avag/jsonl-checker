@@ -250,14 +250,14 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 30000) {
   }
 }
 
-function postJsonWithUploadProgress(url, body, timeoutMs = 180000) {
+function postWithUploadProgress(url, body, headers = {}, timeoutMs = 180000) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const started = performance.now();
     let lastProgressLog = 0;
 
     xhr.open('POST', url, true);
-    xhr.setRequestHeader('Content-Type', 'application/json');
+    Object.entries(headers).forEach(([key, value]) => xhr.setRequestHeader(key, value));
     xhr.timeout = timeoutMs;
 
     xhr.upload.onprogress = event => {
@@ -285,6 +285,33 @@ function postJsonWithUploadProgress(url, body, timeoutMs = 180000) {
   });
 }
 
+async function buildValidationCreateOptions(workers) {
+  if ('CompressionStream' in window) {
+    appendValidationLog('Compressing JSONL before upload...');
+    const rawBlob = new Blob([currentFileText], {type: 'text/plain'});
+    const compressedStream = rawBlob.stream().pipeThrough(new CompressionStream('gzip'));
+    const compressedBlob = await new Response(compressedStream).blob();
+    appendValidationLog(`Compressed payload: ${(compressedBlob.size / 1024 / 1024).toFixed(2)} MB (${((compressedBlob.size / rawBlob.size) * 100).toFixed(1)}% of original)`);
+    return {
+      path: '/api/validations/upload',
+      body: compressedBlob,
+      headers: {
+        'Content-Type': 'application/gzip',
+        'Content-Encoding': 'gzip',
+        'X-File-Name': encodeURIComponent(currentFileName),
+        'X-Workers': String(workers)
+      }
+    };
+  }
+
+  appendValidationLog('Browser does not support CompressionStream; falling back to uncompressed JSON upload.');
+  return {
+    path: '/api/validations',
+    body: JSON.stringify({ fileName: currentFileName, content: currentFileText, workers }),
+    headers: {'Content-Type': 'application/json'}
+  };
+}
+
 async function runDeliveryValidation() {
   const btn = document.getElementById('validationBtn');
   const status = document.getElementById('validationStatus');
@@ -308,11 +335,7 @@ async function runDeliveryValidation() {
   appendValidationLog('Step 1/3: sending JSONL to API...');
 
   try {
-    const createOptions = {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ fileName: currentFileName, content: currentFileText, workers })
-    };
+    const createOptions = await buildValidationCreateOptions(workers);
     const create = await createValidationJobWithFallback(apiBase, createOptions);
     apiBase = create.apiBase;
     const { response, payload: result, elapsedMs, createUrl } = create;
@@ -347,10 +370,10 @@ async function createValidationJobWithFallback(preferredApiBase, createOptions) 
   let lastError = null;
 
   for (const candidateBase of apiBases) {
-    const createUrl = `${candidateBase}/api/validations`;
+    const createUrl = `${candidateBase}${createOptions.path || '/api/validations'}`;
     try {
       appendValidationLog(`Trying ${createUrl}`);
-      const result = await postJsonWithUploadProgress(createUrl, createOptions.body, 180000);
+      const result = await postWithUploadProgress(createUrl, createOptions.body, createOptions.headers || {}, 180000);
       if (result.response.ok) return { ...result, apiBase: candidateBase, createUrl };
       appendValidationLog(`Endpoint returned HTTP ${result.response.status}; trying next API URL if available.`);
       lastError = new Error(result.payload.detail || result.payload.error || result.payload.raw || `HTTP ${result.response.status}`);

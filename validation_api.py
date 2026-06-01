@@ -7,12 +7,14 @@ GitHub Pages app can run validations without needing local shell access.
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +22,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -100,6 +102,46 @@ def update_job(job_id: str, **updates: Any) -> None:
         jobs[job_id].update(updates)
 
 
+def enqueue_validation(file_name: str, content: str, workers: int) -> dict[str, Any]:
+    if not VALIDATOR.exists():
+        raise HTTPException(status_code=500, detail=f"Validator not found: {VALIDATOR}")
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="JSONL content is empty")
+
+    JOB_ROOT.mkdir(parents=True, exist_ok=True)
+    job_id = uuid.uuid4().hex
+    stem = safe_stem(file_name)
+    job_dir = JOB_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    delivery_path = job_dir / f"{stem}.jsonl"
+    report_path = job_dir / f"validation_report_{stem}.json"
+    work_dir = job_dir / "work"
+    delivery_path.write_text(content, encoding="utf-8")
+
+    with jobs_lock:
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "file_name": file_name,
+            "delivery_path": str(delivery_path),
+            "work_dir": str(work_dir),
+            "report_path": str(report_path),
+            "workers": workers,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "summary": None,
+        }
+
+    executor.submit(run_validation_job, job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
 def run_validation_job(job_id: str) -> None:
     with jobs_lock:
         job = jobs[job_id]
@@ -177,43 +219,29 @@ def healthz() -> dict[str, str]:
 
 @app.post("/api/validations")
 def create_validation(req: ValidationRequest) -> dict[str, Any]:
-    if not VALIDATOR.exists():
-        raise HTTPException(status_code=500, detail=f"Validator not found: {VALIDATOR}")
-    if not req.content.strip():
-        raise HTTPException(status_code=400, detail="JSONL content is empty")
+    return enqueue_validation(req.fileName, req.content, req.workers)
 
-    JOB_ROOT.mkdir(parents=True, exist_ok=True)
-    job_id = uuid.uuid4().hex
-    stem = safe_stem(req.fileName)
-    job_dir = JOB_ROOT / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    delivery_path = job_dir / f"{stem}.jsonl"
-    report_path = job_dir / f"validation_report_{stem}.json"
-    work_dir = job_dir / "work"
-    delivery_path.write_text(req.content, encoding="utf-8")
 
-    with jobs_lock:
-        jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "created_at": time.time(),
-            "started_at": None,
-            "finished_at": None,
-            "file_name": req.fileName,
-            "delivery_path": str(delivery_path),
-            "work_dir": str(work_dir),
-            "report_path": str(report_path),
-            "workers": req.workers,
-            "exit_code": None,
-            "stdout": "",
-            "stderr": "",
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "summary": None,
-        }
-
-    executor.submit(run_validation_job, job_id)
-    return {"job_id": job_id, "status": "queued"}
+@app.post("/api/validations/upload")
+async def create_validation_upload(
+    request: Request,
+    x_file_name: str = Header(default="delivery.jsonl"),
+    x_workers: int = Header(default=DEFAULT_VALIDATION_WORKERS),
+    content_encoding: str | None = Header(default=None),
+) -> dict[str, Any]:
+    body = await request.body()
+    if content_encoding == "gzip" or request.headers.get("content-type") == "application/gzip":
+        try:
+            body = gzip.decompress(body)
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid gzip payload: {exc}") from exc
+    try:
+        content = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Payload is not UTF-8: {exc}") from exc
+    file_name = urllib.parse.unquote(x_file_name or "delivery.jsonl")
+    workers = max(1, min(int(x_workers or DEFAULT_VALIDATION_WORKERS), 32))
+    return enqueue_validation(file_name, content, workers)
 
 
 @app.get("/api/validations/{job_id}")
