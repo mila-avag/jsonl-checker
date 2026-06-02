@@ -224,6 +224,56 @@ def run_validation_job(job_id: str) -> None:
         )
 
 
+def run_chunked_validation_job(job_id: str) -> None:
+    with jobs_lock:
+        job = jobs[job_id]
+        upload_directory = Path(job["upload_dir"])
+        delivery_path = Path(job["delivery_path"])
+
+    update_job(job_id, status="preparing", started_at=time.time())
+    try:
+        meta = json.loads((upload_directory / "meta.json").read_text())
+        total_chunks = int(meta["total_chunks"])
+        delivery_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if meta.get("encoding") == "gzip":
+            compressed_path = delivery_path.with_suffix(delivery_path.suffix + ".gz")
+            with compressed_path.open("wb") as compressed_f:
+                for idx in range(total_chunks):
+                    chunk_path = upload_directory / f"chunk_{idx:05d}.bin"
+                    if not chunk_path.exists():
+                        raise FileNotFoundError(f"Missing chunk {idx}")
+                    with chunk_path.open("rb") as in_f:
+                        shutil.copyfileobj(in_f, compressed_f, length=1024 * 1024)
+            with delivery_path.open("wb") as out_f:
+                with gzip.open(compressed_path, "rb") as gz_f:
+                    shutil.copyfileobj(gz_f, out_f, length=1024 * 1024)
+            compressed_path.unlink(missing_ok=True)
+        else:
+            with delivery_path.open("wb") as out_f:
+                for idx in range(total_chunks):
+                    chunk_path = upload_directory / f"chunk_{idx:05d}.bin"
+                    if not chunk_path.exists():
+                        raise FileNotFoundError(f"Missing chunk {idx}")
+                    with chunk_path.open("rb") as in_f:
+                        shutil.copyfileobj(in_f, out_f, length=1024 * 1024)
+
+        shutil.rmtree(upload_directory, ignore_errors=True)
+        run_validation_job(job_id)
+    except Exception as exc:
+        update_job(
+            job_id,
+            status="error",
+            exit_code=None,
+            stdout="",
+            stderr=str(exc),
+            stdout_tail="",
+            stderr_tail=str(exc),
+            summary=None,
+            finished_at=time.time(),
+        )
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -312,25 +362,45 @@ def complete_chunked_validation(upload_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Upload not found")
     meta = json.loads(meta_path.read_text())
     total_chunks = int(meta["total_chunks"])
-    chunks = []
     for idx in range(total_chunks):
         chunk_path = directory / f"chunk_{idx:05d}.bin"
         if not chunk_path.exists():
             raise HTTPException(status_code=400, detail=f"Missing chunk {idx}")
-        chunks.append(chunk_path.read_bytes())
-    payload = b"".join(chunks)
-    if meta.get("encoding") == "gzip":
-        try:
-            payload = gzip.decompress(payload)
-        except OSError as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid gzip payload: {exc}") from exc
-    try:
-        content = payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Payload is not UTF-8: {exc}") from exc
-    result = enqueue_validation(meta["file_name"], content, int(meta["workers"]))
-    shutil.rmtree(directory, ignore_errors=True)
-    return result
+
+    if not VALIDATOR.exists():
+        raise HTTPException(status_code=500, detail=f"Validator not found: {VALIDATOR}")
+
+    job_id = uuid.uuid4().hex
+    stem = safe_stem(meta["file_name"])
+    job_dir = JOB_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    delivery_path = job_dir / f"{stem}.jsonl"
+    report_path = job_dir / f"validation_report_{stem}.json"
+    work_dir = job_dir / "work"
+
+    with jobs_lock:
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "file_name": meta["file_name"],
+            "delivery_path": str(delivery_path),
+            "work_dir": str(work_dir),
+            "report_path": str(report_path),
+            "workers": int(meta["workers"]),
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "summary": None,
+            "upload_dir": str(directory),
+        }
+
+    executor.submit(run_chunked_validation_job, job_id)
+    return {"job_id": job_id, "status": "queued"}
 
 
 @app.get("/api/validations/{job_id}")
