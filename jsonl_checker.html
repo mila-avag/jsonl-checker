@@ -159,6 +159,7 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
     <label style="font-size:.8rem;color:#8b949e">Workers <input type="number" id="validationWorkers" value="10" min="1" max="32"></label>
   </div>
   <div class="redash-status" id="validationStatus">Upload a JSONL file first.</div>
+  <button class="copy-btn hidden" id="validationReadinessExportBtn" onclick="exportValidationReadinessCsv()">Export validation readiness CSV</button>
   <div class="validation-output" id="validationOutput">No validation run yet.</div>
 </div>
 
@@ -189,6 +190,8 @@ let analysisResult = null;
 let taskStatus = {}; // { taskId: { done: true, timestamp: "2026-05-11T19:30:00Z" } }
 let currentFileName = '';
 let currentFileText = '';
+let lastValidationResult = null;
+let lastValidationApiBase = '';
 const STORAGE_KEY = 'jsonl_checker_status'; // stores { fileName: { taskId: {...}, ... }, ... }
 
 function getValidationApiBase() {
@@ -428,9 +431,120 @@ function renderValidationResult(apiBase, result, output, status) {
 
   output.className = `validation-output ${passed ? 'success' : 'error'}`;
   output.textContent = `${output.textContent}\n\n${summary}`.trim();
+  lastValidationResult = result;
+  lastValidationApiBase = apiBase;
+  const exportBtn = document.getElementById('validationReadinessExportBtn');
+  if (exportBtn) exportBtn.classList.toggle('hidden', result.status !== 'done');
   status.innerHTML = passed
     ? `<span style="color:#3fb950">Validation passed with no issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`
     : `<span style="color:#d29922">Validation completed with issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`;
+}
+
+function parseUploadedDeliveryRows() {
+  return currentFileText
+    .split('\n')
+    .filter(line => line.trim())
+    .map(line => JSON.parse(line));
+}
+
+function issuePair(issue) {
+  return issue.pair || issue.category || '';
+}
+
+function issueCat(issue) {
+  return issue.cat || issue.type || '';
+}
+
+function hasAnyValue(obj, keys) {
+  return keys.some(key => {
+    const value = obj && obj[key];
+    return value !== null && value !== undefined && String(value).trim() !== '';
+  });
+}
+
+function hasUnitTestBlockingIssue(issues) {
+  return issues.some(issue => {
+    const pair = issuePair(issue);
+    const cat = issueCat(issue);
+    const detail = issue.detail || '';
+    return pair === 'TestPy'
+      || cat.startsWith('test_')
+      || cat.includes('test')
+      || detail.includes('test_weights.json')
+      || detail.includes('test_outputs.py')
+      || detail.includes('test.sh');
+  });
+}
+
+function buildReadinessRows(reportIssues) {
+  const issuesByTask = {};
+  for (const issue of reportIssues || []) {
+    const tid = issue.task_id || '';
+    if (!tid) continue;
+    if (!issuesByTask[tid]) issuesByTask[tid] = [];
+    issuesByTask[tid].push(issue);
+  }
+
+  return parseUploadedDeliveryRows().map(task => {
+    const taskId = task.task_id || '';
+    const issues = issuesByTask[taskId] || [];
+    const justificationsOk = !issues.some(issue => issuePair(issue) === 'Justification');
+    const passkOk = !issues.some(issue => issuePair(issue) === 'PassK');
+    const deliveryHasUnitTests = toItems(task.unit_tests).length > 0;
+    const hasUnitTests = deliveryHasUnitTests && !hasUnitTestBlockingIssue(issues);
+    const readyForBundling = justificationsOk && passkOk && hasUnitTests;
+    const hasEnvLink = hasAnyValue(task, ['environment_docker_file', 'delivery_url']);
+    const hasTrajectoryLink = hasAnyValue(task, ['trajectories_url', 'trajectory_url', 'trajectory_folder_url']);
+    const bundlingDone = hasEnvLink && hasTrajectoryLink;
+    const passedValidations = issues.length === 0;
+
+    return {
+      'Task ID': taskId,
+      'Justifications': justificationsOk,
+      'Pass@k': passkOk,
+      'Has Unit tests': hasUnitTests,
+      'Ready For bundling?': readyForBundling,
+      'Bundling done': bundlingDone,
+      'Passed Validations - ready to send': passedValidations
+    };
+  });
+}
+
+async function exportValidationReadinessCsv() {
+  if (!lastValidationResult || !lastValidationApiBase) {
+    alert('Run validation first.');
+    return;
+  }
+
+  const reportUrl = `${lastValidationApiBase}/api/validations/${encodeURIComponent(lastValidationResult.job_id)}/report`;
+  const { response, payload } = await fetchJsonWithTimeout(reportUrl, {}, 60000);
+  if (!response.ok) {
+    alert(`Could not fetch validation report: HTTP ${response.status}`);
+    return;
+  }
+
+  const rows = buildReadinessRows(Array.isArray(payload) ? payload : []);
+  const headers = [
+    'Task ID',
+    'Justifications',
+    'Pass@k',
+    'Has Unit tests',
+    'Ready For bundling?',
+    'Bundling done',
+    'Passed Validations - ready to send'
+  ];
+  const csv = [
+    headers.map(csvCell).join(','),
+    ...rows.map(row => headers.map(header => (
+      header === 'Task ID' ? csvCell(row[header]) : csvCell(row[header] ? 'TRUE' : 'FALSE')
+    )).join(','))
+  ].join('\n');
+  const blob = new Blob([csv], {type: 'text/csv'});
+  const a = document.createElement('a');
+  const baseName = currentFileName ? currentFileName.replace(/\.[^.]+$/, '') : 'delivery_validation';
+  a.href = URL.createObjectURL(blob);
+  a.download = `${baseName}_validation_readiness_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
 }
 
 function loadStatus() {
