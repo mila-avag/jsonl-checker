@@ -63,6 +63,13 @@ class ValidationRequest(BaseModel):
     workers: int = Field(default=DEFAULT_VALIDATION_WORKERS, ge=1, le=32)
 
 
+class UploadInitRequest(BaseModel):
+    fileName: str = Field(default="delivery.jsonl")
+    workers: int = Field(default=DEFAULT_VALIDATION_WORKERS, ge=1, le=32)
+    totalChunks: int = Field(ge=1, le=200)
+    encoding: str = Field(default="gzip")
+
+
 def safe_stem(name: str) -> str:
     stem = Path(name or "delivery").stem
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", stem)[:120] or "delivery"
@@ -141,6 +148,10 @@ def enqueue_validation(file_name: str, content: str, workers: int) -> dict[str, 
 
     executor.submit(run_validation_job, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+def upload_dir(upload_id: str) -> Path:
+    return JOB_ROOT / "uploads" / upload_id
 
 
 def run_validation_job(job_id: str) -> None:
@@ -255,6 +266,71 @@ async def create_validation_upload(
     file_name = urllib.parse.unquote(x_file_name or "delivery.jsonl")
     workers = max(1, min(int(x_workers or DEFAULT_VALIDATION_WORKERS), 32))
     return enqueue_validation(file_name, content, workers)
+
+
+@app.post("/api/validations/chunked/init")
+def init_chunked_validation(req: UploadInitRequest) -> dict[str, Any]:
+    JOB_ROOT.mkdir(parents=True, exist_ok=True)
+    upload_id = uuid.uuid4().hex
+    directory = upload_dir(upload_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "meta.json").write_text(
+        json.dumps(
+            {
+                "file_name": req.fileName,
+                "workers": max(1, min(req.workers, 32)),
+                "total_chunks": req.totalChunks,
+                "encoding": req.encoding,
+                "created_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {"upload_id": upload_id, "total_chunks": req.totalChunks}
+
+
+@app.post("/api/validations/chunked/{upload_id}/{chunk_index:int}")
+async def upload_validation_chunk(upload_id: str, chunk_index: int, request: Request) -> dict[str, Any]:
+    directory = upload_dir(upload_id)
+    meta_path = directory / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Upload not found")
+    meta = json.loads(meta_path.read_text())
+    total_chunks = int(meta["total_chunks"])
+    if chunk_index < 0 or chunk_index >= total_chunks:
+        raise HTTPException(status_code=400, detail="Chunk index out of range")
+    body = await request.body()
+    (directory / f"chunk_{chunk_index:05d}.bin").write_bytes(body)
+    return {"upload_id": upload_id, "chunk_index": chunk_index, "received_bytes": len(body)}
+
+
+@app.post("/api/validations/chunked/{upload_id}/complete")
+def complete_chunked_validation(upload_id: str) -> dict[str, Any]:
+    directory = upload_dir(upload_id)
+    meta_path = directory / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Upload not found")
+    meta = json.loads(meta_path.read_text())
+    total_chunks = int(meta["total_chunks"])
+    chunks = []
+    for idx in range(total_chunks):
+        chunk_path = directory / f"chunk_{idx:05d}.bin"
+        if not chunk_path.exists():
+            raise HTTPException(status_code=400, detail=f"Missing chunk {idx}")
+        chunks.append(chunk_path.read_bytes())
+    payload = b"".join(chunks)
+    if meta.get("encoding") == "gzip":
+        try:
+            payload = gzip.decompress(payload)
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid gzip payload: {exc}") from exc
+    try:
+        content = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Payload is not UTF-8: {exc}") from exc
+    result = enqueue_validation(meta["file_name"], content, int(meta["workers"]))
+    shutil.rmtree(directory, ignore_errors=True)
+    return result
 
 
 @app.get("/api/validations/{job_id}")

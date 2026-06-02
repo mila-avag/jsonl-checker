@@ -184,6 +184,7 @@ const FALLBACK_VALIDATION_API_BASES = [
   "https://jsonl-checker.onrender.com",
   "https://jsonl-checker-validation.onrender.com"
 ];
+const VALIDATION_CHUNK_SIZE = 5 * 1024 * 1024;
 const VALIDATION_API_STORAGE_KEY = "jsonl_checker_validation_api_base";
 
 let analysisResult = null;
@@ -295,7 +296,18 @@ async function buildValidationCreateOptions(workers) {
     const compressedStream = rawBlob.stream().pipeThrough(new CompressionStream('gzip'));
     const compressedBlob = await new Response(compressedStream).blob();
     appendValidationLog(`Compressed payload: ${(compressedBlob.size / 1024 / 1024).toFixed(2)} MB (${((compressedBlob.size / rawBlob.size) * 100).toFixed(1)}% of original)`);
+    if (compressedBlob.size > VALIDATION_CHUNK_SIZE) {
+      appendValidationLog(`Using chunked upload with ${Math.ceil(compressedBlob.size / VALIDATION_CHUNK_SIZE)} chunks.`);
+      return {
+        mode: 'chunked',
+        body: compressedBlob,
+        fileName: currentFileName,
+        workers,
+        encoding: 'gzip'
+      };
+    }
     return {
+      mode: 'single',
       path: '/api/validations/upload',
       body: compressedBlob,
       headers: {
@@ -309,6 +321,7 @@ async function buildValidationCreateOptions(workers) {
 
   appendValidationLog('Browser does not support CompressionStream; falling back to uncompressed JSON upload.');
   return {
+    mode: 'single',
     path: '/api/validations',
     body: JSON.stringify({ fileName: currentFileName, content: currentFileText, workers }),
     headers: {'Content-Type': 'application/json'}
@@ -373,10 +386,14 @@ async function createValidationJobWithFallback(preferredApiBase, createOptions) 
   let lastError = null;
 
   for (const candidateBase of apiBases) {
-    const createUrl = `${candidateBase}${createOptions.path || '/api/validations'}`;
+    const createUrl = createOptions.mode === 'chunked'
+      ? `${candidateBase}/api/validations/chunked`
+      : `${candidateBase}${createOptions.path || '/api/validations'}`;
     try {
       appendValidationLog(`Trying ${createUrl}`);
-      const result = await postWithUploadProgress(createUrl, createOptions.body, createOptions.headers || {}, 180000);
+      const result = createOptions.mode === 'chunked'
+        ? await createChunkedValidationJob(candidateBase, createOptions)
+        : await postWithUploadProgress(createUrl, createOptions.body, createOptions.headers || {}, 180000);
       if (result.response.ok) return { ...result, apiBase: candidateBase, createUrl };
       appendValidationLog(`Endpoint returned HTTP ${result.response.status}; trying next API URL if available.`);
       lastError = new Error(result.payload.detail || result.payload.error || result.payload.raw || `HTTP ${result.response.status}`);
@@ -387,6 +404,47 @@ async function createValidationJobWithFallback(preferredApiBase, createOptions) 
   }
 
   throw lastError || new Error('No validation API URL could be reached.');
+}
+
+async function createChunkedValidationJob(apiBase, createOptions) {
+  const totalChunks = Math.ceil(createOptions.body.size / VALIDATION_CHUNK_SIZE);
+  const initBody = JSON.stringify({
+    fileName: createOptions.fileName,
+    workers: createOptions.workers,
+    totalChunks,
+    encoding: createOptions.encoding
+  });
+  const init = await postWithUploadProgress(
+    `${apiBase}/api/validations/chunked/init`,
+    initBody,
+    {'Content-Type': 'application/json'},
+    60000
+  );
+  if (!init.response.ok) return init;
+  const uploadId = init.payload.upload_id;
+  appendValidationLog(`Chunked upload initialized: ${uploadId}`);
+
+  for (let idx = 0; idx < totalChunks; idx++) {
+    const start = idx * VALIDATION_CHUNK_SIZE;
+    const end = Math.min(start + VALIDATION_CHUNK_SIZE, createOptions.body.size);
+    const chunk = createOptions.body.slice(start, end);
+    appendValidationLog(`Uploading chunk ${idx + 1}/${totalChunks} (${(chunk.size / 1024 / 1024).toFixed(2)} MB)`);
+    const uploaded = await postWithUploadProgress(
+      `${apiBase}/api/validations/chunked/${encodeURIComponent(uploadId)}/${idx}`,
+      chunk,
+      {'Content-Type': 'application/octet-stream'},
+      60000
+    );
+    if (!uploaded.response.ok) return uploaded;
+  }
+
+  appendValidationLog('Completing chunked upload...');
+  return postWithUploadProgress(
+    `${apiBase}/api/validations/chunked/${encodeURIComponent(uploadId)}/complete`,
+    '',
+    {'Content-Type': 'text/plain'},
+    60000
+  );
 }
 
 async function pollValidationJob(apiBase, jobId, output, status) {
