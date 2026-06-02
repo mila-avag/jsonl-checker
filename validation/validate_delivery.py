@@ -107,6 +107,46 @@ def safe_get_cases(run):
     return tr.get("cases")
 
 
+def get_passk_runs(task, pak):
+    if pak and isinstance(pak, dict) and pak.get("runs"):
+        return pak["runs"]
+    if task.get("passk_runs"):
+        return task["passk_runs"]
+    return None
+
+
+def has_delivery_pass_rate(items):
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "pass_rate_opus" in item or "pass_rate_gemini31" in item:
+            return True
+    return False
+
+
+def has_any_passk_result(task, pak, dl_rubrics, dl_tests):
+    """Return True if delivery or pass@k runs contain rubric/test scoring.
+
+    Some no-unit-test tasks have test_results={"error": "no verifier.py available"}.
+    That is not missing pass@k when rubric_results are present.
+    """
+    if has_delivery_pass_rate(dl_rubrics.values()) or has_delivery_pass_rate(dl_tests):
+        return True
+
+    pk_runs = get_passk_runs(task, pak)
+    if not pk_runs or not isinstance(pk_runs, dict):
+        return False
+
+    for run in pk_runs.values():
+        criteria = safe_get_criteria(run)
+        if criteria:
+            return True
+        cases = safe_get_cases(run)
+        if cases:
+            return True
+    return False
+
+
 def has_justification(item):
     """Return True if the item has at least 3 non-empty justification fields."""
     ann = item.get("annotations")
@@ -314,19 +354,7 @@ def run_checks(tasks, base_dir, expected_runs=8):
         has_test_file = os.path.exists(env_py_path) or os.path.exists(env_sh_path)
 
         # ── CHECK 14: Missing pass@k ──
-        has_pass_k = False
-        for rk, rv in dl_rubrics.items():
-            if not isinstance(rv, dict):
-                continue
-            if "pass_rate_opus" in rv or "pass_rate_gemini31" in rv:
-                has_pass_k = True
-                break
-        if not has_pass_k:
-            for tt in dl_tests:
-                if "pass_rate_opus" in tt or "pass_rate_gemini31" in tt:
-                    has_pass_k = True
-                    break
-        if not has_pass_k:
+        if not has_any_passk_result(t, pak, dl_rubrics, dl_tests):
             add(tid, "PassK", "missing", "Task has no pass@k results on any rubric or test")
 
         # ── CHECK 15: Duplicate test names ──
@@ -601,11 +629,7 @@ def run_checks(tasks, base_dir, expected_runs=8):
                     f"Task has weights in [1-5] range ({len(small)}) AND [10+] range ({len(large)})")
 
         # ── PASS@K run data ──
-        pk_runs = None
-        if pak and isinstance(pak, dict) and pak.get("runs"):
-            pk_runs = pak["runs"]
-        elif t.get("passk_runs"):
-            pk_runs = t["passk_runs"]
+        pk_runs = get_passk_runs(t, pak)
 
         if pk_runs and isinstance(pk_runs, dict):
             # ── CHECK 11: Run count per model ──
