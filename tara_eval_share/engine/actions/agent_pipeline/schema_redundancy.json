@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "required": ["item_id", "task_id", "item_type", "redundant_groups", "gate_pass", "confidence", "reasoning"],
+  "additionalProperties": false,
+  "properties": {
+    "item_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "item_type": { "type": "string", "enum": ["redundancy_check"] },
+    "redundant_groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["members", "behavior"],
+        "additionalProperties": false,
+        "properties": {
+          "members": { "type": "array", "items": { "type": "string" } },
+          "behavior": { "type": "string" }
+        }
+      }
+    },
+    "gate_pass": { "type": "boolean" },
+    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+    "reasoning": { "type": "string" }
+  }
+}

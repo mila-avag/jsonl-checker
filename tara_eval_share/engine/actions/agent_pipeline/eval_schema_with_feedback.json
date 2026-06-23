@@ -1,0 +1,193 @@
+{
+  "type": "object",
+  "required": [
+    "item_id",
+    "task_id",
+    "item_type",
+    "justification_verdict",
+    "justification_issues",
+    "verifier_verdict",
+    "verifier_issues",
+    "quality_issues",
+    "resolution_action",
+    "resolution_comment",
+    "confidence",
+    "reasoning",
+    "customer_feedback_verdict",
+    "customer_feedback_reasoning"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "item_id": {
+      "type": "string"
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "item_type": {
+      "type": "string",
+      "enum": [
+        "rubric",
+        "unit_test"
+      ]
+    },
+    "justification_verdict": {
+      "type": "string",
+      "enum": [
+        "accurate",
+        "has_issues"
+      ]
+    },
+    "justification_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "check_number",
+          "issue_type",
+          "description",
+          "evidence"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "check_number": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "issue_type": {
+            "type": "string",
+            "enum": [
+              "factual_error",
+              "internal_contradiction",
+              "unsound_logic"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "verifier_verdict": {
+      "type": "string",
+      "enum": [
+        "correct",
+        "flagged"
+      ]
+    },
+    "verifier_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "check_number",
+          "issue_type",
+          "description",
+          "evidence"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "check_number": {
+            "type": "integer",
+            "minimum": 4,
+            "maximum": 7
+          },
+          "issue_type": {
+            "type": "string",
+            "enum": [
+              "model_did_not_fail",
+              "environment_impossibility",
+              "ambiguous_policy",
+              "test_criterion_mismatch"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "quality_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "severity",
+          "category",
+          "description",
+          "evidence"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "major",
+              "minor"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "not_self_contained",
+              "inaccurate_misaligned",
+              "inaccurate_factual_error",
+              "inaccurate_makes_response_worse",
+              "inaccurate_unrelated",
+              "incorrect_justification",
+              "underfitted",
+              "too_prescriptive",
+              "subjective"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "resolution_action": {
+      "type": "string",
+      "enum": [
+        "keep",
+        "edit",
+        "delete"
+      ]
+    },
+    "resolution_comment": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "reasoning": {
+      "type": "string"
+    },
+    "customer_feedback_verdict": {
+      "type": "string",
+      "enum": [
+        "agree",
+        "disagree",
+        "partially_agree"
+      ]
+    },
+    "customer_feedback_reasoning": {
+      "type": "string"
+    }
+  }
+}
