@@ -43,7 +43,7 @@ from rich.console import Console
 from rich.progress import track
 
 MODEL = "claude-opus-4-6"
-EFFORT = "high"
+EFFORT = "medium"
 TIMEOUT_SECONDS = 600
 MAX_RETRIES = 3
 MAX_TURNS = 35
