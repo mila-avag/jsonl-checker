@@ -241,10 +241,12 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
     </ol>
     <div class="query-box" title="Click to copy"
          style="cursor:pointer;white-space:pre-wrap"
-         onclick="navigator.clipboard.writeText(this.textContent.trim())">python3 validate_delivery.py --delivery "YOUR_DELIVERY.jsonl" --output report.json --workers 20</div>
+         onclick="navigator.clipboard.writeText(this.textContent.trim())">python3 validate_delivery.py --delivery "YOUR_DELIVERY.jsonl" --output report.json --workers 10</div>
     <p style="color:#8b949e;font-size:.8rem;margin-top:8px">
       Click the command to copy it. It writes <code>report.json</code> with the same issues this tab analyzes.
-      Tip: bump <code>--workers</code> up to 20–32 to download environments faster.
+      <code>--workers 10</code> is a safe default; higher values download faster but can hit your machine's process limit
+      on very large deliveries (it spawns <code>curl</code>/<code>unzip</code> per worker), so back off to ~10 if you see a
+      <code>BlockingIOError</code>.
     </p>
   </div>
   <div class="validation-actions">
