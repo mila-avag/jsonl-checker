@@ -1742,8 +1742,9 @@ function renderRemoveTab() {
     return;
   }
   const g = analysisResult.groups;
-  const highBlended = g.highAvgPassKBlended || [];
-  const lowVerifier = g.outlierRubricsAll || [];
+  const missingPKIds = new Set((g.missingPK || []).map(t => t.id));
+  const highBlended = (g.highAvgPassKBlended || []).filter(t => !missingPKIds.has(t.id));
+  const lowVerifier = (g.outlierRubrics || []).filter(t => !missingPKIds.has(t.id));
 
   const map = {};
   for (const t of highBlended) {
@@ -1769,12 +1770,11 @@ function renderRemoveTab() {
     const reasonTags = r.reasons.map(rs => rs === 'high pass@k'
       ? '<span class="badge complete">HIGH PASS@K</span>'
       : '<span class="badge low">LOW VERIFIERS</span>').join(' ');
-    const pkFlag = (r.reasons.includes('low verifiers') && r.missingPK) ? ' <span class="badge missing">MISSING PASS@K</span>' : '';
     const blended = (r.blended !== undefined) ? `${(r.blended * 100).toFixed(1)}%` : '—';
     const verifiers = (r.rubricCount || 0) + (r.testCount || 0);
     return `<tr>
       <td style="font-family:monospace;color:#58a6ff">${escHtml(r.id)}</td>
-      <td>${reasonTags}${pkFlag}</td>
+      <td>${reasonTags}</td>
       <td>${blended}</td>
       <td>${verifiers} <span style="color:#484f58;font-size:.75rem">(${r.rubricCount || 0}R+${r.testCount || 0}T)</span></td>
     </tr>`;
@@ -1791,10 +1791,11 @@ function renderRemoveTab() {
 function copyRemoveIds(btn) {
   if (!analysisResult || !analysisResult.groups) return;
   const g = analysisResult.groups;
+  const missingPKIds = new Set((g.missingPK || []).map(t => t.id));
   const ids = [...new Set([
     ...(g.highAvgPassKBlended || []).map(t => t.id),
-    ...(g.outlierRubricsAll || []).map(t => t.id)
-  ])];
+    ...(g.outlierRubrics || []).map(t => t.id)
+  ])].filter(id => !missingPKIds.has(id));
   navigator.clipboard.writeText(ids.join('\n'));
   btn.textContent = `Copied ${ids.length}!`;
   btn.classList.add('copied');
