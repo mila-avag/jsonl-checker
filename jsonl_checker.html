@@ -221,6 +221,32 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
     Runs <code>validation/validate_delivery.py</code> against the uploaded JSONL via the hosted validation API.
     Set the API URL after deploying the backend service.
   </p>
+  <div style="background:#161b22;border:1px solid #d29922;border-radius:8px;padding:14px 16px;margin-bottom:16px">
+    <p style="color:#d29922;font-weight:600;margin-bottom:6px">⏳ Heads up: this can take a while.</p>
+    <p style="color:#c9d1d9;margin-bottom:8px">
+      Large deliveries (300+ tasks) can take <strong>10–15 minutes</strong> through the hosted API, since it downloads every
+      environment ZIP on a shared server. For a much faster run, do it <strong>locally</strong> — there are
+      <strong>no dependencies to install</strong> (just Python 3, plus <code>curl</code> and <code>unzip</code>, which macOS already has):
+    </p>
+    <ol style="color:#c9d1d9;margin:0 0 10px 20px;font-size:.85rem;line-height:1.8">
+      <li>
+        Download the script:
+        <a href="https://raw.githubusercontent.com/mila-avag/jsonl-checker/main/validation/validate_delivery.py"
+           download="validate_delivery.py" style="color:#58a6ff">validate_delivery.py ↗</a>
+        (<a href="https://github.com/mila-avag/jsonl-checker/blob/main/validation/validate_delivery.py"
+            target="_blank" rel="noopener" style="color:#58a6ff">view on GitHub</a>)
+      </li>
+      <li>Open Terminal and <code>cd</code> to the folder where you saved it (e.g. <code>cd ~/Downloads</code>).</li>
+      <li>Run the command below, swapping in the path to your delivery JSONL:</li>
+    </ol>
+    <div class="query-box" title="Click to copy"
+         style="cursor:pointer;white-space:pre-wrap"
+         onclick="navigator.clipboard.writeText(this.textContent.trim())">python3 validate_delivery.py --delivery "YOUR_DELIVERY.jsonl" --output report.json --workers 20</div>
+    <p style="color:#8b949e;font-size:.8rem;margin-top:8px">
+      Click the command to copy it. It writes <code>report.json</code> with the same issues this tab analyzes.
+      Tip: bump <code>--workers</code> up to 20–32 to download environments faster.
+    </p>
+  </div>
   <div class="validation-actions">
     <label style="font-size:.8rem;color:#8b949e;flex:1;min-width:280px">
       API URL
