@@ -235,6 +235,7 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <div class="redash-status" id="validationStatus">Upload a JSONL file first.</div>
   <button class="copy-btn hidden" id="validationReadinessExportBtn" onclick="exportValidationReadinessCsv()">Export validation readiness CSV</button>
   <div class="validation-output" id="validationOutput">No validation run yet.</div>
+  <div id="validationBreakdown" style="margin-top:16px"></div>
 </div>
 
 <script>
@@ -450,7 +451,7 @@ async function runDeliveryValidation() {
 
     const finalResult = await pollValidationJob(apiBase, result.job_id, output, status);
     appendValidationLog('Step 3/3: validation finished. Rendering report summary...');
-    renderValidationResult(apiBase, finalResult, output, status);
+    await renderValidationResult(apiBase, finalResult, output, status);
   } catch (err) {
     output.className = 'validation-output error';
     appendValidationLog(`ERROR: ${err.name === 'AbortError' ? 'Request timed out while contacting the validation API.' : String(err.message || err)}`);
@@ -550,7 +551,7 @@ async function pollValidationJob(apiBase, jobId, output, status) {
   }
 }
 
-function renderValidationResult(apiBase, result, output, status) {
+async function renderValidationResult(apiBase, result, output, status) {
   const passed = result.status === 'done' && result.exit_code === 0;
   const reportUrl = `${apiBase}/api/validations/${encodeURIComponent(result.job_id)}/report`;
   const issueBuckets = result.summary && result.summary.issue_buckets
@@ -579,6 +580,274 @@ function renderValidationResult(apiBase, result, output, status) {
   status.innerHTML = passed
     ? `<span style="color:#3fb950">Validation passed with no issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`
     : `<span style="color:#d29922">Validation completed with issues.</span> <a href="${reportUrl}" target="_blank" style="color:#58a6ff">Download report</a>`;
+
+  await renderValidationBreakdown(apiBase, result);
+}
+
+// ---------- Delivery validation breakdown (clean/affected + categories/subcategories + ID lists) ----------
+let lastValidationBreakdown = null;
+
+function fmtPctNum(part, whole) {
+  if (!whole) return '0.0%';
+  return `${((part / whole) * 100).toFixed(1)}%`;
+}
+
+function deliveryTaskIds() {
+  try {
+    return parseUploadedDeliveryRows()
+      .map(t => t.task_id || t.taskId || t.id)
+      .filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+
+function computeValidationBreakdown(issues, allIds) {
+  const allSet = new Set(allIds);
+  const affectedSet = new Set();
+  const cats = {}; // pair -> { issues, tasks:Set, subs:{ cat -> {issues, tasks:Set} } }
+  for (const it of issues) {
+    const tid = it.task_id || '';
+    const pair = issuePair(it) || 'Other';
+    const cat = issueCat(it) || 'other';
+    if (tid) { affectedSet.add(tid); allSet.add(tid); }
+    if (!cats[pair]) cats[pair] = { issues: 0, tasks: new Set(), subs: {} };
+    cats[pair].issues += 1;
+    if (tid) cats[pair].tasks.add(tid);
+    if (!cats[pair].subs[cat]) cats[pair].subs[cat] = { issues: 0, tasks: new Set() };
+    cats[pair].subs[cat].issues += 1;
+    if (tid) cats[pair].subs[cat].tasks.add(tid);
+  }
+  const total = allSet.size;
+  const affectedIds = [...affectedSet].sort();
+  const cleanIds = [...allSet].filter(id => !affectedSet.has(id)).sort();
+  return { total, affected: affectedIds.length, clean: cleanIds.length, affectedIds, cleanIds, cats, totalIssues: issues.length };
+}
+
+async function renderValidationBreakdown(apiBase, result) {
+  const container = document.getElementById('validationBreakdown');
+  if (!container) return;
+  container.innerHTML = '';
+  lastValidationBreakdown = null;
+  if (result.status !== 'done') return;
+
+  const reportUrl = `${apiBase}/api/validations/${encodeURIComponent(result.job_id)}/report`;
+  let issues = [];
+  try {
+    const { response, payload } = await fetchJsonWithTimeout(reportUrl, {}, 60000);
+    if (response.ok && Array.isArray(payload)) issues = payload;
+  } catch (e) {
+    container.innerHTML = `<div class="redash-status" style="color:#f85149">Could not load full report for breakdown: ${escHtml(String(e.message || e))}</div>`;
+    return;
+  }
+
+  const allIds = deliveryTaskIds();
+  const bd = computeValidationBreakdown(issues, allIds);
+  bd.fileName = currentFileName || 'delivery';
+  lastValidationBreakdown = bd;
+
+  const catEntries = Object.entries(bd.cats)
+    .sort((a, b) => b[1].issues - a[1].issues);
+
+  const statsHtml = `
+    <div class="stats-bar">
+      <div class="stat blue"><div class="num">${bd.total}</div><div class="label">Total Tasks</div></div>
+      <div class="stat green"><div class="num">${bd.clean}</div><div class="label">Clean — ${fmtPctNum(bd.clean, bd.total)}</div></div>
+      <div class="stat red"><div class="num">${bd.affected}</div><div class="label">Not Clean — ${fmtPctNum(bd.affected, bd.total)}</div></div>
+      <div class="stat yellow"><div class="num">${bd.totalIssues}</div><div class="label">Total Issues</div></div>
+    </div>`;
+
+  const downloadHtml = `
+    <div class="validation-actions" style="margin-bottom:12px">
+      <button class="copy-btn" onclick="downloadValidationSummaryTxt()">Download summary .txt</button>
+      <button class="copy-btn" onclick="downloadValidationCleanTxt()">Download clean IDs .txt</button>
+      <button class="copy-btn" onclick="downloadValidationAffectedTxt()">Download not-clean IDs .txt</button>
+      <button class="copy-btn" onclick="downloadValidationCategoryListsTxt()">Download category/subcategory ID lists .txt</button>
+      <button class="copy-btn" onclick="downloadValidationAllTxts()">Download all .txt</button>
+    </div>`;
+
+  const catGroupsHtml = catEntries.map(([pair, info]) => {
+    const subRows = Object.entries(info.subs)
+      .sort((a, b) => b[1].issues - a[1].issues)
+      .map(([cat, sub]) => {
+        const ids = [...sub.tasks].sort();
+        const safe = `${pair}__${cat}`.replace(/[^A-Za-z0-9_]/g, '_');
+        const expandId = `vbd_${safe}`;
+        return `
+          <div class="task-row" style="cursor:default">
+            <div class="task-row-header">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <span style="color:#484f58;cursor:pointer;font-size:.7rem" onclick="toggleValidationExpand('${expandId}')">▶</span>
+                <span style="color:#c9d1d9;font-weight:600;cursor:pointer" onclick="toggleValidationExpand('${expandId}')">${escHtml(cat)}</span>
+                <span class="task-detail">— ${sub.issues} issue${sub.issues === 1 ? '' : 's'}, ${sub.tasks.size} task${sub.tasks.size === 1 ? '' : 's'}</span>
+                <button class="copy-btn" style="padding:2px 8px" onclick="copyValidationIds(this, '${pair}', '${cat}')">Copy IDs</button>
+              </div>
+            </div>
+            <div class="task-expand" id="${expandId}">
+              <div class="query-box" style="max-height:200px">${ids.length ? escHtml(ids.join('\n')) : '(no task IDs)'}</div>
+            </div>
+          </div>`;
+      }).join('');
+    return `
+      <div class="group">
+        <div class="group-header" onclick="toggleGroup(this)">
+          <h2><span style="color:#58a6ff">●</span> ${escHtml(pair)} <span class="count">${info.issues} issues · ${info.tasks.size} tasks</span></h2>
+          <span class="arrow">▶</span>
+        </div>
+        <div class="group-body">${subRows}</div>
+      </div>`;
+  }).join('');
+
+  const cleanGroupHtml = `
+    <div class="group">
+      <div class="group-header" onclick="toggleGroup(this)">
+        <h2><span style="color:#3fb950">●</span> Clean tasks <span class="count">${bd.clean} · ${fmtPctNum(bd.clean, bd.total)}</span></h2>
+        <span class="arrow">▶</span>
+      </div>
+      <div class="group-body">
+        <div class="task-row" style="cursor:default">
+          <button class="copy-btn" style="margin-bottom:8px" onclick="copyValidationCleanIds(this)">Copy clean IDs</button>
+          <div class="query-box" style="max-height:240px">${bd.cleanIds.length ? escHtml(bd.cleanIds.join('\n')) : '(none)'}</div>
+        </div>
+      </div>
+    </div>`;
+
+  const affectedGroupHtml = `
+    <div class="group">
+      <div class="group-header" onclick="toggleGroup(this)">
+        <h2><span style="color:#f85149">●</span> Not-clean tasks <span class="count">${bd.affected} · ${fmtPctNum(bd.affected, bd.total)}</span></h2>
+        <span class="arrow">▶</span>
+      </div>
+      <div class="group-body">
+        <div class="task-row" style="cursor:default">
+          <button class="copy-btn" style="margin-bottom:8px" onclick="copyValidationAffectedIds(this)">Copy not-clean IDs</button>
+          <div class="query-box" style="max-height:240px">${bd.affectedIds.length ? escHtml(bd.affectedIds.join('\n')) : '(none)'}</div>
+        </div>
+      </div>
+    </div>`;
+
+  container.innerHTML = statsHtml + downloadHtml
+    + `<h3 style="font-size:.95rem;margin:8px 0 10px;color:#f0f6fc">Categories &amp; subcategories</h3>`
+    + catGroupsHtml + cleanGroupHtml + affectedGroupHtml;
+}
+
+function toggleValidationExpand(id) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('open');
+}
+
+function flashCopied(btn, label) {
+  const original = label || btn.textContent;
+  btn.textContent = 'Copied!';
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = original; btn.classList.remove('copied'); }, 1500);
+}
+
+function copyValidationIds(btn, pair, cat) {
+  if (!lastValidationBreakdown) return;
+  const info = lastValidationBreakdown.cats[pair];
+  if (!info || !info.subs[cat]) return;
+  const ids = [...info.subs[cat].tasks].sort();
+  navigator.clipboard.writeText(ids.join('\n'));
+  flashCopied(btn, 'Copy IDs');
+}
+
+function copyValidationCleanIds(btn) {
+  if (!lastValidationBreakdown) return;
+  navigator.clipboard.writeText(lastValidationBreakdown.cleanIds.join('\n'));
+  flashCopied(btn, 'Copy clean IDs');
+}
+
+function copyValidationAffectedIds(btn) {
+  if (!lastValidationBreakdown) return;
+  navigator.clipboard.writeText(lastValidationBreakdown.affectedIds.join('\n'));
+  flashCopied(btn, 'Copy not-clean IDs');
+}
+
+function validationBaseName() {
+  const bd = lastValidationBreakdown;
+  const name = (bd && bd.fileName) ? bd.fileName : (currentFileName || 'delivery');
+  return name.replace(/\.[^.]+$/, '');
+}
+
+function downloadText(filename, content) {
+  const blob = new Blob([content], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+function buildValidationSummaryText() {
+  const bd = lastValidationBreakdown;
+  if (!bd) return '';
+  const lines = [];
+  lines.push(`Total tasks: ${bd.total}`);
+  lines.push(`Clean tasks: ${bd.clean} (${fmtPctNum(bd.clean, bd.total)})`);
+  lines.push(`Not-clean tasks: ${bd.affected} (${fmtPctNum(bd.affected, bd.total)})`);
+  lines.push(`Total issues: ${bd.totalIssues}`);
+  lines.push('');
+  const catEntries = Object.entries(bd.cats).sort((a, b) => b[1].issues - a[1].issues);
+  for (const [pair, info] of catEntries) {
+    lines.push(`${pair}: ${info.issues} issues, ${info.tasks.size} tasks`);
+    const subs = Object.entries(info.subs).sort((a, b) => b[1].issues - a[1].issues);
+    for (const [cat, sub] of subs) {
+      lines.push(`    ${cat}: ${sub.issues} (${sub.tasks.size} tasks)`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function buildValidationCategoryListsText() {
+  const bd = lastValidationBreakdown;
+  if (!bd) return '';
+  const lines = [];
+  const catEntries = Object.entries(bd.cats).sort((a, b) => b[1].issues - a[1].issues);
+  for (const [pair, info] of catEntries) {
+    lines.push(`### ${pair} (${info.tasks.size} tasks)`);
+    [...info.tasks].sort().forEach(id => lines.push(id));
+    lines.push('');
+    const subs = Object.entries(info.subs).sort((a, b) => b[1].issues - a[1].issues);
+    for (const [cat, sub] of subs) {
+      lines.push(`--- ${pair} / ${cat} (${sub.tasks.size} tasks) ---`);
+      [...sub.tasks].sort().forEach(id => lines.push(id));
+      lines.push('');
+    }
+  }
+  return lines.join('\n');
+}
+
+function downloadValidationSummaryTxt() {
+  if (!lastValidationBreakdown) { alert('Run validation first.'); return; }
+  downloadText(`${validationBaseName()}_validation_summary.txt`, buildValidationSummaryText());
+}
+
+function downloadValidationCleanTxt() {
+  if (!lastValidationBreakdown) { alert('Run validation first.'); return; }
+  const bd = lastValidationBreakdown;
+  const content = `Clean tasks: ${bd.clean} / ${bd.total} (${fmtPctNum(bd.clean, bd.total)})\n\n` + bd.cleanIds.join('\n') + '\n';
+  downloadText(`${validationBaseName()}_clean_tasks.txt`, content);
+}
+
+function downloadValidationAffectedTxt() {
+  if (!lastValidationBreakdown) { alert('Run validation first.'); return; }
+  const bd = lastValidationBreakdown;
+  const content = `Not-clean tasks: ${bd.affected} / ${bd.total} (${fmtPctNum(bd.affected, bd.total)})\n\n` + bd.affectedIds.join('\n') + '\n';
+  downloadText(`${validationBaseName()}_not_clean_tasks.txt`, content);
+}
+
+function downloadValidationCategoryListsTxt() {
+  if (!lastValidationBreakdown) { alert('Run validation first.'); return; }
+  downloadText(`${validationBaseName()}_category_task_ids.txt`, buildValidationCategoryListsText());
+}
+
+function downloadValidationAllTxts() {
+  if (!lastValidationBreakdown) { alert('Run validation first.'); return; }
+  downloadValidationSummaryTxt();
+  downloadValidationCleanTxt();
+  downloadValidationAffectedTxt();
+  downloadValidationCategoryListsTxt();
 }
 
 function parseUploadedDeliveryRows() {
