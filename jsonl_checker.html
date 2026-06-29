@@ -23,6 +23,17 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
 .stat.orange .num{color:#db6d28}
 .stat.red .num{color:#f85149}
 .stat.blue .num{color:#58a6ff}
+.main-safety-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px 20px;margin-bottom:20px}
+.main-safety-card h3{font-size:.95rem;margin-bottom:10px;color:#f0f6fc}
+.main-safety-summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.main-safety-pill{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:8px 12px;min-width:130px}
+.main-safety-pill .label{font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
+.main-safety-pill .value{font-size:1.35rem;font-weight:700;color:#f0f6fc}
+.main-safety-bar{height:18px;background:#0d1117;border:1px solid #30363d;border-radius:999px;overflow:hidden;display:flex;margin-bottom:10px}
+.main-safety-bar-main{background:#58a6ff}
+.main-safety-bar-safety{background:#d29922}
+.main-safety-tiers{display:flex;gap:8px;flex-wrap:wrap;color:#8b949e;font-size:.78rem}
+.main-safety-tiers .tag{background:#21262d;color:#c9d1d9}
 .group{background:#161b22;border:1px solid #30363d;border-radius:10px;margin-bottom:16px;overflow:hidden}
 .group-header{padding:14px 20px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none}
 .group-header:hover{background:#1c2333}
@@ -112,12 +123,16 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
 
 <div class="tabs" id="tabs">
   <button class="tab-btn active" id="checkerTab" onclick="showTab('checker')">Justification Checker</button>
+  <button class="tab-btn" id="modelRewardTab" onclick="showTab('modelReward')">Model Pass Rate</button>
+  <button class="tab-btn" id="csvDeleterTab" onclick="showTab('csvDeleter')">CSV Rubric Deleter</button>
   <button class="tab-btn" id="validationTab" onclick="showTab('validation')">Run Delivery Validation</button>
 </div>
 
 <div id="results">
   <div class="stats-bar" id="statsBar"></div>
+  <div id="mainSafetyBreakdown"></div>
   <div class="status-bar" id="statusBar" style="display:none">
+    <button onclick="copyAllIds(this)">Copy All IDs</button>
     <button onclick="copyDoneIds(this)">Copy Done IDs</button>
     <button onclick="exportStatus()">Export Status</button>
     <button onclick="exportMissingJustifications()">Export Missing Justifications CSV</button>
@@ -139,6 +154,65 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
     <div class="redash-status" id="redashStatus"></div>
     <div class="redash-results" id="redashResults"></div>
   </div>
+</div>
+
+<div class="validation-section" id="modelReward">
+  <h2>Avg Reward (Pass Rate) per Model</h2>
+  <p>
+    Per-task weighted pass rate for each model, calculated the same way as the checker
+    (weighted by item <code>weight</code>/<code>score</code> across rubrics + unit tests).
+    The cards show the average reward per model across all tasks; the table shows each task's pass rate.
+  </p>
+  <div class="stats-bar" id="modelRewardSummary"></div>
+  <div class="validation-actions">
+    <button class="copy-btn" onclick="exportModelRewardCsv()">Export per-task CSV</button>
+  </div>
+  <div class="redash-results" id="modelRewardTable"></div>
+</div>
+
+<div class="validation-section" id="csvDeleter">
+  <h2>CSV Rubric Deleter → Backfill</h2>
+  <p>
+    Upload a rubric-export CSV (columns <code>task_id</code>, <code>attemptResponse</code> containing
+    <code>rubric_criteria_builder</code>). Using the rubrics flagged by the currently-loaded JSONL
+    (pass@k = 0 on both models <em>and</em> missing/partial justification), this removes those rubrics from each
+    task and builds a backfill CSV (<code>task_id</code>, <code>new_rubrics</code>). Original rubric IDs are preserved.
+    Tasks whose deletion percentage exceeds the chosen threshold are skipped entirely (left unchanged).
+  </p>
+  <p style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px">
+    <strong>How to get the CSV:</strong> Run the query in the
+    <a href="https://dashboard.scale.com/corp/genai-ops-hub/compass/playground?workflow=cmp_2056b4e3317253e056d2132f86dc84bb"
+       target="_blank" rel="noopener" style="color:#58a6ff">Compass playground workflow ↗</a>,
+    replace the task IDs in the query with the task IDs you want, then download the final CSV and upload it here.
+  </p>
+  <div class="drop-zone" id="csvDropZone" style="padding:28px;margin-bottom:16px">
+    <div class="icon">📑</div>
+    <p>Drop rubric-export CSV here or click to browse</p>
+    <input type="file" id="csvFileInput" accept=".csv">
+  </div>
+  <div class="validation-actions">
+    <label style="font-size:.85rem;color:#8b949e">Skip tasks where deleted % is over:
+      <select id="csvThreshold" onchange="onCsvThresholdChange()" style="margin-left:6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px;border-radius:6px">
+        <option value="10">10%</option>
+        <option value="15" selected>15%</option>
+        <option value="20">20%</option>
+      </select>
+    </label>
+    <label style="font-size:.85rem;color:#8b949e">Min remaining verifiers (rubrics + tests):
+      <input type="number" id="csvMinVerifiers" value="0" min="0" max="100" onchange="onCsvThresholdChange()"
+             style="width:70px;margin-left:6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px;border-radius:6px">
+    </label>
+    <button class="redash-btn" id="csvExportBtn" onclick="exportBackfillCsv()" disabled>Download Backfill CSV</button>
+  </div>
+  <p style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-top:12px">
+    <strong>How to backfill:</strong> Download the backfill CSV above, then run it in the
+    <a href="https://dashboard.scale.com/corp/genai-ops-hub/compass/playground?workflow=cmp_790b3b5ef436304748ce1a65f8084fa8"
+       target="_blank" rel="noopener" style="color:#58a6ff">backfill workflow ↗</a>
+    to apply the rubric deletions.
+  </p>
+  <div class="redash-status" id="csvDeleterStatus">Load a JSONL (Justification Checker tab) first, then drop the rubric CSV here.</div>
+  <div class="stats-bar" id="csvDeleterSummary" style="margin-top:12px"></div>
+  <div class="redash-results" id="csvDeleterTable"></div>
 </div>
 
 <div class="validation-section" id="deliveryValidation">
@@ -225,10 +299,19 @@ function getRedashApiKey() {
 
 function showTab(tab) {
   const isValidation = tab === 'validation';
-  document.getElementById('checkerTab').classList.toggle('active', !isValidation);
+  const isModelReward = tab === 'modelReward';
+  const isChecker = tab === 'checker';
+  const isCsvDeleter = tab === 'csvDeleter';
+  document.getElementById('checkerTab').classList.toggle('active', isChecker);
+  document.getElementById('modelRewardTab').classList.toggle('active', isModelReward);
+  document.getElementById('csvDeleterTab').classList.toggle('active', isCsvDeleter);
   document.getElementById('validationTab').classList.toggle('active', isValidation);
-  document.getElementById('results').style.display = isValidation ? 'none' : (analysisResult ? 'block' : 'none');
+  document.getElementById('results').style.display = isChecker ? (analysisResult ? 'block' : 'none') : 'none';
   document.getElementById('deliveryValidation').classList.toggle('active', isValidation);
+  document.getElementById('modelReward').classList.toggle('active', isModelReward);
+  document.getElementById('csvDeleter').classList.toggle('active', isCsvDeleter);
+  if (isModelReward) renderModelReward();
+  if (isCsvDeleter) renderCsvDeleter();
 }
 
 function appendValidationLog(message) {
@@ -707,6 +790,17 @@ function clearAllStatus() {
   saveStatus();
   if (analysisResult) renderResults(analysisResult);
 }
+function copyAllIds(btn) {
+  if (!analysisResult || !analysisResult.groups || !analysisResult.groups.modelRates) {
+    btn.textContent = 'No tasks'; setTimeout(() => { btn.textContent = 'Copy All IDs'; }, 1500); return;
+  }
+  const ids = analysisResult.groups.modelRates.map(t => t.id).filter(Boolean);
+  if (ids.length === 0) { btn.textContent = 'No tasks'; setTimeout(() => { btn.textContent = 'Copy All IDs'; }, 1500); return; }
+  navigator.clipboard.writeText(ids.join('\n'));
+  btn.textContent = `Copied ${ids.length}!`;
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'Copy All IDs'; btn.classList.remove('copied'); }, 1500);
+}
 function copyDoneIds(btn) {
   const ids = Object.keys(taskStatus).filter(id => taskStatus[id] && taskStatus[id].done);
   if (ids.length === 0) { btn.textContent = 'No done tasks'; setTimeout(() => { btn.textContent = 'Copy Done IDs'; }, 1500); return; }
@@ -756,11 +850,54 @@ function getPassRateValues(item) {
     .map(v => v > 1 ? v / 100 : v);
 }
 
+// Weight per item: unit tests use `weight`, rubrics use `score`.
+// Rubric scores can be negative (detrimental rubrics) — use magnitude as importance.
+function getItemWeight(item) {
+  if (!item || typeof item !== 'object') return 1;
+  let w = item.weight;
+  if (w === null || w === undefined) w = item.score;
+  if (w === null || w === undefined) return 1;
+  const f = parseFloat(w);
+  if (isNaN(f)) return 1;
+  return Math.abs(f);
+}
+
 function averagePassRates(items) {
-  const values = items.flatMap(([,item]) => getPassRateValues(item));
-  if (values.length === 0) return null;
-  const avg = values.reduce((s,v) => s + v, 0) / values.length;
-  return { avg, count: values.length };
+  let weightedSum = 0, totalWeight = 0, count = 0;
+  for (const [,item] of items) {
+    const w = getItemWeight(item);
+    for (const v of getPassRateValues(item)) {
+      weightedSum += v * w;
+      totalWeight += w;
+      count += 1;
+    }
+  }
+  if (count === 0) return null;
+  const avg = totalWeight > 0 ? weightedSum / totalWeight : 0;
+  return { avg, count };
+}
+
+function getModelPassRate(item, key) {
+  if (!item || typeof item !== 'object') return null;
+  const v = item[key];
+  if (v === null || v === undefined) return null;
+  const f = parseFloat(v);
+  if (isNaN(f)) return null;
+  return f > 1 ? f / 100 : f;
+}
+
+function averageModelPassRate(items, key) {
+  let weightedSum = 0, totalWeight = 0, n = 0;
+  for (const [,item] of items) {
+    const v = getModelPassRate(item, key);
+    if (v === null) continue;
+    const w = getItemWeight(item);
+    weightedSum += v * w;
+    totalWeight += w;
+    n += 1;
+  }
+  if (n === 0) return null;
+  return totalWeight > 0 ? weightedSum / totalWeight : 0;
 }
 
 function isPass0(item) {
@@ -818,9 +955,46 @@ function hasJustification(item) {
   return checkJustification(item).status === 'complete';
 }
 
+function getSafetyTier(task) {
+  const safetyTierKeys = ['safety_tier', 'safety_tier_annotation', 'prompt_safety_action_tier'];
+  const seen = new Set();
+  const visit = value => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return '';
+    seen.add(value);
+    for (const key of safetyTierKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        const tier = value[key];
+        if (tier !== null && tier !== undefined && String(tier).trim() !== '') return String(tier).trim();
+      }
+    }
+    for (const child of Object.values(value)) {
+      const tier = visit(child);
+      if (tier) return tier;
+    }
+    return '';
+  };
+  return visit(task);
+}
+
+function computeMainSafetyBreakdown(tasks) {
+  const tiers = {};
+  let safety = 0;
+  let main = 0;
+  for (const task of tasks) {
+    const tier = getSafetyTier(task);
+    if (tier) {
+      safety += 1;
+      tiers[tier] = (tiers[tier] || 0) + 1;
+    } else {
+      main += 1;
+    }
+  }
+  return { main, safety, tiers };
+}
+
 function analyzeJSONL(lines) {
   const tasks = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const groups = { missingPK: [], noMissing: [], onlyTests: [], onlyRubrics: [], both: [], outlierRubrics: [], highAvgPassK: [], noUnitTests: [] };
+  const groups = { missingPK: [], noMissing: [], onlyTests: [], onlyRubrics: [], both: [], outlierRubrics: [], outlierRubricsAll: [], outlierAfterDelete: [], highAvgPassK: [], highAvgPassKBlended: [], noUnitTests: [], modelRates: [] };
 
   // First pass: collect counts for stats
   const rubricCounts = [];
@@ -833,23 +1007,59 @@ function analyzeJSONL(lines) {
     const ti = toItems(task.unit_tests);
     rubricCounts.push(ri.length);
     testCounts.push(ti.length);
-    taskCounts.push({ id: tid, rubrics: ri.length, tests: ti.length });
+    const missingPK = ri.filter(([,r]) => !hasPassRate(r)).length > 0;
+    taskCounts.push({ id: tid, rubrics: ri.length, tests: ti.length, missingPK });
   }
 
   // Calculate stats
   const avgRubrics = rubricCounts.length > 0 ? (rubricCounts.reduce((a,b) => a+b, 0) / rubricCounts.length) : 0;
   const avgTests = testCounts.length > 0 ? (testCounts.reduce((a,b) => a+b, 0) / testCounts.length) : 0;
 
-  // Identify outlier tasks (fewer than 10 rubrics)
-  const minRubrics = 10;
+  // Identify low verifier-count tasks (rubrics + unit tests sum below threshold)
+  const minVerifiers = 10;
   for (const tc of taskCounts) {
-    if (tc.rubrics < minRubrics) {
-      groups.outlierRubrics.push({ id: tc.id, rubricCount: tc.rubrics, testCount: tc.tests, minRubrics });
+    const total = tc.rubrics + tc.tests;
+    if (total < minVerifiers) {
+      const entry = { id: tc.id, rubricCount: tc.rubrics, testCount: tc.tests, total, minVerifiers, missingPK: tc.missingPK };
+      groups.outlierRubricsAll.push(entry);
+      if (!tc.missingPK) groups.outlierRubrics.push(entry); // excludes tasks missing pass@k
     }
   }
 
+  // Rubrics flagged for deletion: pass@k == 0 rubrics that are missing/partial justification.
+  // Recompute low verifier-count tasks assuming those rubrics get deleted.
+  let totalRubricsAll = 0;
+  let totalRubricsToDelete = 0;
+  for (const task of tasks) {
+    const tid = task.task_id || '';
+    const ri = toItems(task.rubrics);
+    const ti = toItems(task.unit_tests);
+    const rNoPK = ri.filter(([,r]) => !hasPassRate(r)).length;
+    const flaggedRubrics = ri.filter(([,r]) =>
+      isPass0(r) && checkJustification(r).status !== 'complete'
+    );
+    const toDelete = flaggedRubrics.length;
+    totalRubricsAll += ri.length;
+    totalRubricsToDelete += toDelete;
+    const before = ri.length + ti.length;
+    const remaining = before - toDelete;
+    // Only tasks that newly drop below the threshold after deletion:
+    // exclude tasks already low before deletion and tasks missing pass@k.
+    if (rNoPK === 0 && before >= minVerifiers && remaining < minVerifiers) {
+      groups.outlierAfterDelete.push({
+        id: tid,
+        rubricCount: ri.length,
+        testCount: ti.length,
+        deleted: toDelete,
+        remaining,
+        before
+      });
+    }
+  }
+  const pctRubricsToDelete = totalRubricsAll > 0 ? (totalRubricsToDelete / totalRubricsAll) * 100 : 0;
+
   // Store stats for rendering
-  groups.stats = { avgRubrics, avgTests, minRubrics };
+  groups.stats = { avgRubrics, avgTests, minVerifiers, totalRubricsAll, totalRubricsToDelete, pctRubricsToDelete, mainSafety: computeMainSafetyBreakdown(tasks) };
 
   for (const task of tasks) {
     const tid = task.task_id || '';
@@ -860,9 +1070,19 @@ function analyzeJSONL(lines) {
       groups.noUnitTests.push({ id: tid, rubricCount: ri.length });
     }
 
-    const avgPassK = averagePassRates([...ri, ...ti]);
+    const allItems = [...ri, ...ti];
+    const opusAvg = averageModelPassRate(allItems, 'pass_rate_opus');
+    const geminiAvg = averageModelPassRate(allItems, 'pass_rate_gemini31');
+    groups.modelRates.push({ id: tid, opusAvg, geminiAvg, rubricCount: ri.length, testCount: ti.length });
+    const maxModelAvg = Math.max(opusAvg === null ? -1 : opusAvg, geminiAvg === null ? -1 : geminiAvg);
+    if (maxModelAvg > 0.8) {
+      groups.highAvgPassK.push({ id: tid, opusAvg, geminiAvg, max: maxModelAvg, rubricCount: ri.length, testCount: ti.length });
+    }
+
+    // Old definition: blended average across all pass@k scores (rubrics + tests)
+    const avgPassK = averagePassRates(allItems);
     if (avgPassK && avgPassK.avg > 0.8) {
-      groups.highAvgPassK.push({ id: tid, avg: avgPassK.avg, count: avgPassK.count, rubricCount: ri.length, testCount: ti.length });
+      groups.highAvgPassKBlended.push({ id: tid, avg: avgPassK.avg, count: avgPassK.count, rubricCount: ri.length, testCount: ti.length });
     }
 
     const rNoPK = ri.filter(([,r]) => !hasPassRate(r)).length;
@@ -914,9 +1134,40 @@ function analyzeJSONL(lines) {
     else groups.both.push({ id: tid, rubrics: mr, tests: mt, rPartial: mrPartial, tPartial: mtPartial, rubricItems: rubricDetails, testItems: testDetails });
   }
 
-  groups.highAvgPassK.sort((a,b) => b.avg - a.avg);
+  groups.highAvgPassK.sort((a,b) => b.max - a.max);
+  groups.highAvgPassKBlended.sort((a,b) => b.avg - a.avg);
 
   return { total: tasks.length, groups };
+}
+
+function renderMainSafetyBreakdown(total, breakdown) {
+  const container = document.getElementById('mainSafetyBreakdown');
+  if (!container) return;
+  const main = breakdown ? breakdown.main || 0 : 0;
+  const safety = breakdown ? breakdown.safety || 0 : 0;
+  const mainPct = total ? (main / total) * 100 : 0;
+  const safetyPct = total ? (safety / total) * 100 : 0;
+  const tiers = breakdown && breakdown.tiers ? breakdown.tiers : {};
+  const tierTags = Object.entries(tiers)
+    .sort(([a], [b]) => String(a).localeCompare(String(b), undefined, {numeric:true}))
+    .map(([tier, count]) => `<span class="tag">Tier ${escHtml(tier)}: ${count}</span>`)
+    .join('');
+
+  container.innerHTML = `
+    <div class="main-safety-card">
+      <h3>Main vs Safety Tasks</h3>
+      <div class="main-safety-summary">
+        <div class="main-safety-pill"><div class="label">Main</div><div class="value">${main}</div></div>
+        <div class="main-safety-pill"><div class="label">Safety</div><div class="value">${safety}</div></div>
+        <div class="main-safety-pill"><div class="label">Safety Share</div><div class="value">${safetyPct.toFixed(1)}%</div></div>
+      </div>
+      <div class="main-safety-bar" title="Main ${mainPct.toFixed(1)}%, Safety ${safetyPct.toFixed(1)}%">
+        <div class="main-safety-bar-main" style="width:${mainPct}%"></div>
+        <div class="main-safety-bar-safety" style="width:${safetyPct}%"></div>
+      </div>
+      <div class="main-safety-tiers">${tierTags || '<span class="tag">No safety tiers found</span>'}</div>
+    </div>
+  `;
 }
 
 function renderResults(result) {
@@ -924,7 +1175,9 @@ function renderResults(result) {
   document.getElementById('tabs').style.display = 'flex';
   document.getElementById('results').style.display = 'block';
   document.getElementById('deliveryValidation').classList.remove('active');
+  document.getElementById('modelReward').classList.remove('active');
   document.getElementById('checkerTab').classList.add('active');
+  document.getElementById('modelRewardTab').classList.remove('active');
   document.getElementById('validationTab').classList.remove('active');
   const { total, groups } = result;
 
@@ -937,6 +1190,9 @@ function renderResults(result) {
   const stats = groups.stats || {};
   const avgR = stats.avgRubrics !== undefined ? stats.avgRubrics.toFixed(1) : '—';
   const avgT = stats.avgTests !== undefined ? stats.avgTests.toFixed(1) : '—';
+  const pctDelete = stats.pctRubricsToDelete !== undefined ? stats.pctRubricsToDelete.toFixed(1) : '—';
+  const toDeleteCount = stats.totalRubricsToDelete || 0;
+  const totalRubricsForPct = stats.totalRubricsAll || 0;
 
   statsBar.innerHTML = `
     <div class="stat blue"><div class="num">${total}</div><div class="label">Total Tasks</div></div>
@@ -949,10 +1205,16 @@ function renderResults(result) {
     <div class="stat yellow"><div class="num">${totalMissT}</div><div class="label">Total Missing Test Just.</div></div>
     <div class="stat blue"><div class="num">${avgR}</div><div class="label">Avg Rubrics/Task</div></div>
     <div class="stat blue"><div class="num">${avgT}</div><div class="label">Avg Unit Tests/Task</div></div>
-    <div class="stat green"><div class="num">${groups.highAvgPassK.length}</div><div class="label">Avg Pass@k &gt;80%</div></div>
+    <div class="stat green"><div class="num">${groups.highAvgPassK.length}</div><div class="label">High Pass@k &gt;80% (Claude/Gemini, weighted)</div></div>
+    <div class="stat green"><div class="num">${groups.highAvgPassKBlended.length}</div><div class="label">High Avg Pass@k &gt;80% (Blended, weighted)</div></div>
     <div class="stat red"><div class="num">${groups.noUnitTests.length}</div><div class="label">No Unit Tests</div></div>
-    <div class="stat" style="${groups.outlierRubrics.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#a371f7">${groups.outlierRubrics.length}</div><div class="label">Low Rubric (&lt;10)</div></div>
+    <div class="stat" style="${groups.outlierRubrics.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#a371f7">${groups.outlierRubrics.length}</div><div class="label">Low Verifier (&lt;10, excl. missing pass@k)</div></div>
+    <div class="stat" style="${groups.outlierRubricsAll.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#a371f7">${groups.outlierRubricsAll.length}</div><div class="label">Low Verifier (&lt;10, incl. missing pass@k)</div></div>
+    <div class="stat" style="${toDeleteCount > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#db6d28">${pctDelete}%</div><div class="label">Rubrics to Delete (missing just., ${toDeleteCount} of ${totalRubricsForPct})</div></div>
+    <div class="stat" style="${groups.outlierAfterDelete.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#db6d28">${groups.outlierAfterDelete.length}</div><div class="label">Low Verifier After Delete (&lt;10)</div></div>
   `;
+
+  renderMainSafetyBreakdown(total, stats.mainSafety);
 
   const groupsDiv = document.getElementById('groups');
   groupsDiv.innerHTML = '';
@@ -994,15 +1256,36 @@ function renderResults(result) {
         return sections;
       }
     },
-    { key: 'outlierRubrics', title: 'Low Rubric Count (<10)', color: '#a371f7',
+    { key: 'outlierRubrics', title: 'Low Verifier Count (<10, excluding missing pass@k)', color: '#a371f7',
       detail: t => {
-        return `<span class="badge low">LOW</span> ${t.rubricCount} rubrics, ${t.testCount} tests`;
+        return `<span class="badge low">LOW</span> ${t.total} verifiers (${t.rubricCount} rubrics + ${t.testCount} tests)`;
       },
       expandable: false
     },
-    { key: 'highAvgPassK', title: 'High Avg Pass@k (>80%)', color: '#3fb950',
+    { key: 'outlierRubricsAll', title: 'Low Verifier Count (<10, including missing pass@k)', color: '#a371f7',
       detail: t => {
-        return `<span class="badge complete">${(t.avg * 100).toFixed(1)}%</span> avg across ${t.count} pass@k scores (${t.rubricCount} rubrics, ${t.testCount} tests)`;
+        const flag = t.missingPK ? ' <span class="badge missing">MISSING PASS@K</span>' : '';
+        return `<span class="badge low">LOW</span> ${t.total} verifiers (${t.rubricCount} rubrics + ${t.testCount} tests)${flag}`;
+      },
+      expandable: false
+    },
+    { key: 'outlierAfterDelete', title: 'Newly Low Verifier After Deleting Rubrics Missing Justification (<10, excl. previously low & missing pass@k)', color: '#db6d28',
+      detail: t => {
+        return `<span class="badge low">LOW</span> ${t.remaining} verifiers after deleting ${t.deleted} rubric(s) (was ${t.before}: ${t.rubricCount}R + ${t.testCount}T)`;
+      },
+      expandable: false
+    },
+    { key: 'highAvgPassK', title: 'High Pass@k (>80% weighted on Claude or Gemini)', color: '#3fb950',
+      detail: t => {
+        const opus = t.opusAvg === null || t.opusAvg === undefined ? '—' : `${(t.opusAvg * 100).toFixed(1)}%`;
+        const gemini = t.geminiAvg === null || t.geminiAvg === undefined ? '—' : `${(t.geminiAvg * 100).toFixed(1)}%`;
+        return `<span class="badge complete">${(t.max * 100).toFixed(1)}%</span> Claude ${opus} · Gemini ${gemini} (${t.rubricCount} rubrics, ${t.testCount} tests)`;
+      },
+      expandable: false
+    },
+    { key: 'highAvgPassKBlended', title: 'High Avg Pass@k (>80% weighted, blended across all scores)', color: '#3fb950',
+      detail: t => {
+        return `<span class="badge complete">${(t.avg * 100).toFixed(1)}%</span> weighted avg across ${t.count} pass@k scores (${t.rubricCount} rubrics, ${t.testCount} tests)`;
       },
       expandable: false
     },
@@ -1021,8 +1304,9 @@ function renderResults(result) {
     
     // Add threshold info for outlier section
     let headerExtra = '';
-    if (cfg.key === 'outlierRubrics') {
-      headerExtra = `<span style="font-size:.75rem;color:#8b949e;font-weight:400;margin-left:8px">(tasks with fewer than ${stats.minRubrics || 10} rubrics)</span>`;
+    if (cfg.key === 'outlierRubrics' || cfg.key === 'outlierRubricsAll') {
+      const note = cfg.key === 'outlierRubrics' ? ', excluding tasks missing pass@k' : ', including tasks missing pass@k';
+      headerExtra = `<span style="font-size:.75rem;color:#8b949e;font-weight:400;margin-left:8px">(tasks where rubrics + unit tests sum to fewer than ${stats.minVerifiers || 10}${note})</span>`;
     }
     
     group.innerHTML = `
@@ -1063,6 +1347,82 @@ function renderResults(result) {
   document.getElementById('redashSection').classList.toggle('hidden', groups.missingPK.length === 0);
   document.getElementById('statusBar').style.display = 'flex';
   updateProgress();
+}
+
+function fmtPct(v) {
+  return (v === null || v === undefined) ? '—' : `${(v * 100).toFixed(1)}%`;
+}
+
+function avgOf(values) {
+  const nums = values.filter(v => v !== null && v !== undefined && !isNaN(v));
+  if (nums.length === 0) return null;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+function renderModelReward() {
+  const summary = document.getElementById('modelRewardSummary');
+  const table = document.getElementById('modelRewardTable');
+  if (!summary || !table) return;
+
+  if (!analysisResult || !analysisResult.groups.modelRates) {
+    summary.innerHTML = '';
+    table.innerHTML = '<p style="color:#8b949e;font-size:.85rem">Upload a JSONL file first.</p>';
+    return;
+  }
+
+  const rows = analysisResult.groups.modelRates;
+  const claudeAvg = avgOf(rows.map(r => r.opusAvg));
+  const geminiAvg = avgOf(rows.map(r => r.geminiAvg));
+  const claudeScored = rows.filter(r => r.opusAvg !== null && r.opusAvg !== undefined).length;
+  const geminiScored = rows.filter(r => r.geminiAvg !== null && r.geminiAvg !== undefined).length;
+
+  summary.innerHTML = `
+    <div class="stat blue"><div class="num">${rows.length}</div><div class="label">Total Tasks</div></div>
+    <div class="stat green"><div class="num">${fmtPct(claudeAvg)}</div><div class="label">Claude Avg Reward (${claudeScored} tasks)</div></div>
+    <div class="stat green"><div class="num">${fmtPct(geminiAvg)}</div><div class="label">Gemini Avg Reward (${geminiScored} tasks)</div></div>
+  `;
+
+  const body = rows.map(r => `
+    <tr>
+      <td style="font-family:monospace;color:#58a6ff">${escHtml(r.id)}</td>
+      <td>${fmtPct(r.opusAvg)}</td>
+      <td>${fmtPct(r.geminiAvg)}</td>
+      <td style="color:#8b949e;font-size:.75rem">${r.rubricCount} rubrics, ${r.testCount} tests</td>
+    </tr>
+  `).join('');
+
+  table.innerHTML = `
+    <table>
+      <thead><tr><th>Task ID</th><th>Claude Pass Rate</th><th>Gemini Pass Rate</th><th>Verifiers</th></tr></thead>
+      <tbody>${body || '<tr><td colspan="4" style="color:#484f58">No tasks</td></tr>'}</tbody>
+    </table>
+  `;
+}
+
+function exportModelRewardCsv() {
+  if (!analysisResult || !analysisResult.groups.modelRates) {
+    alert('Upload a JSONL file first.');
+    return;
+  }
+  const rows = analysisResult.groups.modelRates;
+  const headers = ['Task ID', 'Claude Pass Rate', 'Gemini Pass Rate', 'Rubrics', 'Unit Tests'];
+  const fmtCsvPct = v => (v === null || v === undefined) ? '' : (v * 100).toFixed(1);
+  const csv = [
+    headers.map(csvCell).join(','),
+    ...rows.map(r => [
+      csvCell(r.id),
+      csvCell(fmtCsvPct(r.opusAvg)),
+      csvCell(fmtCsvPct(r.geminiAvg)),
+      csvCell(r.rubricCount),
+      csvCell(r.testCount)
+    ].join(','))
+  ].join('\n');
+  const blob = new Blob([csv], {type: 'text/csv'});
+  const a = document.createElement('a');
+  const baseName = currentFileName ? currentFileName.replace(/\.[^.]+$/, '') : 'jsonl_checker';
+  a.href = URL.createObjectURL(blob);
+  a.download = `${baseName}_model_pass_rate_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
 }
 
 function renderExpandContent(sections) {
@@ -1443,6 +1803,276 @@ function buildRedashTable(rows, taskIds) {
 function renderRedashResults(rows, taskIds) {
   const resultsDiv = document.getElementById('redashResults');
   resultsDiv.innerHTML = buildRedashTable(rows, taskIds);
+}
+
+// ---------- CSV Rubric Deleter → Backfill ----------
+let csvRubricData = null;   // { taskId: [rubricObj, ...] }
+let csvFileName = '';
+let csvBackfillResults = null;
+
+function normTitle(s) {
+  return (s || '').replace(/\\/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function simScore(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const ta = new Set(a.split(' ').filter(Boolean));
+  const tb = new Set(b.split(' ').filter(Boolean));
+  let inter = 0;
+  for (const x of ta) if (tb.has(x)) inter++;
+  const union = ta.size + tb.size - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+// Parser that handles quoted fields containing commas, newlines, and escaped ("") quotes.
+function parseCsvText(text) {
+  const rows = [];
+  let field = '', row = [], inQuotes = false, i = 0;
+  const pushField = () => { row.push(field); field = ''; };
+  const pushRow = () => { rows.push(row); row = []; };
+  while (i < text.length) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"') { inQuotes = true; i++; continue; }
+    if (c === ',') { pushField(); i++; continue; }
+    if (c === '\r') { i++; continue; }
+    if (c === '\n') { pushField(); pushRow(); i++; continue; }
+    field += c; i++;
+  }
+  if (field.length > 0 || row.length > 0) { pushField(); pushRow(); }
+  if (rows.length === 0) return [];
+  const headers = rows[0].map(h => h.trim());
+  return rows.slice(1)
+    .filter(r => r.some(x => x !== ''))
+    .map(r => { const o = {}; headers.forEach((h, idx) => o[h] = r[idx] !== undefined ? r[idx] : ''); return o; });
+}
+
+function ingestCsvRubrics(text) {
+  const rows = parseCsvText(text);
+  const data = {};
+  let parseErrors = 0, withRubrics = 0;
+  for (const r of rows) {
+    const tid = (r.task_id || '').trim();
+    const ar = r.attemptResponse || '';
+    if (!tid || !ar) continue;
+    try {
+      const obj = JSON.parse(ar);
+      const rc = obj.rubric_criteria_builder || obj.rubrics || obj.rubric_criteria || [];
+      if (Array.isArray(rc)) { data[tid] = rc; withRubrics++; }
+    } catch (e) { parseErrors++; }
+  }
+  return { data, parseErrors, rowCount: rows.length, withRubrics };
+}
+
+// From the loaded JSONL: { taskId: { flagged: [normalizedCriterion, ...], testCount } }
+// flagged = pass@k = 0 on both models AND justification not complete (same rule as the checker's "Rubrics to Delete").
+function getJsonlTaskInfo() {
+  if (!currentFileText) return null;
+  let tasks;
+  try { tasks = parseUploadedDeliveryRows(); } catch (e) { return null; }
+  const map = {};
+  for (const task of tasks) {
+    const tid = task.task_id || '';
+    if (!tid) continue;
+    const ri = toItems(task.rubrics);
+    const flagged = ri.filter(([, r]) => isPass0(r) && checkJustification(r).status !== 'complete');
+    map[tid] = {
+      flagged: flagged.map(([name, r]) => normTitle(r.criterion || r.title || r.name || name)).filter(Boolean),
+      testCount: toItems(task.unit_tests).length
+    };
+  }
+  return map;
+}
+
+function computeBackfill(threshold, minVerifiers) {
+  const infoMap = getJsonlTaskInfo();
+  const results = [];
+  for (const tid of Object.keys(csvRubricData)) {
+    const rubrics = csvRubricData[tid] || [];
+    const total = rubrics.length;
+    const info = infoMap ? infoMap[tid] : null;
+    const flaggedNorms = new Set(info ? info.flagged : []);
+    const testCount = info ? info.testCount : 0;
+    const inJsonl = !!info;
+
+    const kept = [];
+    const deleted = [];
+    for (const rb of rubrics) {
+      const nt = normTitle(rb.title || rb.criterion || rb.name || '');
+      if (flaggedNorms.has(nt)) deleted.push(rb); else kept.push(rb);
+    }
+    // Fuzzy-match any flagged criteria not matched by exact title.
+    const matchedNorms = new Set(deleted.map(rb => normTitle(rb.title || rb.criterion || rb.name || '')));
+    const unmatchedFlagged = [...flaggedNorms].filter(n => !matchedNorms.has(n));
+    for (const fn of unmatchedFlagged) {
+      let best = null, bestScore = 0;
+      for (const rb of kept) {
+        const sc = simScore(fn, normTitle(rb.title || rb.criterion || rb.name || ''));
+        if (sc > bestScore) { bestScore = sc; best = rb; }
+      }
+      if (best && bestScore >= 0.85) { kept.splice(kept.indexOf(best), 1); deleted.push(best); }
+    }
+
+    const delCount = deleted.length;
+    const delPct = total > 0 ? (delCount / total) * 100 : 0;
+    const remainingVerifiers = kept.length + testCount;
+    const overThreshold = delPct > threshold;
+    const belowMinVerifiers = delCount > 0 && minVerifiers > 0 && remainingVerifiers < minVerifiers;
+    const skipReason = overThreshold ? 'pct' : (belowMinVerifiers ? 'verifiers' : '');
+    results.push({
+      tid, total, delCount, delPct, testCount, remainingVerifiers,
+      skipped: overThreshold || belowMinVerifiers, skipReason, inJsonl,
+      flaggedCount: flaggedNorms.size,
+      unmatched: Math.max(0, flaggedNorms.size - delCount),
+      kept
+    });
+  }
+  results.sort((a, b) => b.delPct - a.delPct);
+  return results;
+}
+
+function onCsvThresholdChange() { renderCsvDeleter(); }
+
+function renderCsvDeleter() {
+  const status = document.getElementById('csvDeleterStatus');
+  const summary = document.getElementById('csvDeleterSummary');
+  const table = document.getElementById('csvDeleterTable');
+  const exportBtn = document.getElementById('csvExportBtn');
+  if (!status) return;
+
+  if (!currentFileText) {
+    status.innerHTML = '<span style="color:#d29922">Load a JSONL on the Justification Checker tab first — it provides pass@k + justification status.</span>';
+    summary.innerHTML = ''; table.innerHTML = ''; exportBtn.disabled = true;
+    csvBackfillResults = null;
+    return;
+  }
+  if (!csvRubricData) {
+    status.textContent = 'JSONL loaded. Now drop a rubric-export CSV above to compute deletions.';
+    summary.innerHTML = ''; table.innerHTML = ''; exportBtn.disabled = true;
+    csvBackfillResults = null;
+    return;
+  }
+
+  const threshold = parseInt(document.getElementById('csvThreshold').value, 10);
+  const minVerifiers = parseInt(document.getElementById('csvMinVerifiers').value || '0', 10);
+  const results = computeBackfill(threshold, minVerifiers);
+  csvBackfillResults = results;
+
+  const totalTasks = results.length;
+  const tasksWithDeletions = results.filter(r => r.delCount > 0).length;
+  const processed = results.filter(r => r.delCount > 0 && !r.skipped);
+  const skippedPct = results.filter(r => r.skipReason === 'pct');
+  const skippedVer = results.filter(r => r.skipReason === 'verifiers');
+  const notInJsonl = results.filter(r => !r.inJsonl).length;
+  const totalDeleted = processed.reduce((s, r) => s + r.delCount, 0);
+  const totalUnmatched = results.reduce((s, r) => s + r.unmatched, 0);
+
+  status.innerHTML = `<span style="color:#3fb950">Loaded ${escHtml(csvFileName)} — ${totalTasks} tasks.</span> `
+    + `Skip if deleted % &gt; ${threshold}%${minVerifiers > 0 ? ` or remaining verifiers &lt; ${minVerifiers}` : ''}.`;
+
+  summary.innerHTML = `
+    <div class="stat blue"><div class="num">${totalTasks}</div><div class="label">Tasks in CSV</div></div>
+    <div class="stat orange"><div class="num">${tasksWithDeletions}</div><div class="label">Tasks With Deletions</div></div>
+    <div class="stat green"><div class="num">${processed.length}</div><div class="label">In Backfill (processed)</div></div>
+    <div class="stat red"><div class="num">${skippedPct.length}</div><div class="label">Skipped (over ${threshold}%)</div></div>
+    <div class="stat" style="${skippedVer.length ? '' : 'opacity:.5'}"><div class="num" style="color:#f85149">${skippedVer.length}</div><div class="label">Skipped (&lt; ${minVerifiers} verifiers)</div></div>
+    <div class="stat yellow"><div class="num">${totalDeleted}</div><div class="label">Rubrics Deleted</div></div>
+    <div class="stat" style="${notInJsonl ? '' : 'opacity:.5'}"><div class="num" style="color:#a371f7">${notInJsonl}</div><div class="label">CSV Tasks Not In JSONL</div></div>
+    <div class="stat" style="${totalUnmatched ? '' : 'opacity:.5'}"><div class="num" style="color:#db6d28">${totalUnmatched}</div><div class="label">Flagged Rubrics Unmatched</div></div>
+  `;
+
+  const shown = results.filter(r => r.delCount > 0 || !r.inJsonl);
+  const body = shown.map(r => {
+    let statusTag;
+    if (r.skipReason === 'pct') statusTag = `<span class="tag not-found">SKIPPED %</span>`;
+    else if (r.skipReason === 'verifiers') statusTag = `<span class="tag not-found">SKIPPED &lt;VERIFIERS</span>`;
+    else if (r.delCount > 0) statusTag = `<span class="tag found">IN BACKFILL</span>`;
+    else statusTag = `<span class="tag" style="background:#21262d;color:#8b949e">NO CHANGE</span>`;
+    const jsonlTag = r.inJsonl ? '' : ` <span class="badge low">not in jsonl</span>`;
+    const unmatchedTag = r.unmatched > 0 ? ` <span class="badge partial">${r.unmatched} unmatched</span>` : '';
+    const verColor = (minVerifiers > 0 && r.remainingVerifiers < minVerifiers && r.delCount > 0) ? '#f85149' : '#c9d1d9';
+    return `<tr>
+      <td style="font-family:monospace;color:#58a6ff">${escHtml(r.tid)}${jsonlTag}</td>
+      <td>${r.total}</td>
+      <td>${r.delCount}</td>
+      <td>${r.total - r.delCount}</td>
+      <td style="color:${r.skipReason === 'pct' ? '#f85149' : '#c9d1d9'}">${r.delPct.toFixed(1)}%</td>
+      <td style="color:${verColor}">${r.remainingVerifiers}<span style="color:#484f58;font-size:.75rem"> (${r.total - r.delCount}R+${r.testCount}T)</span></td>
+      <td>${statusTag}${unmatchedTag}</td>
+    </tr>`;
+  }).join('');
+
+  table.innerHTML = `
+    <table>
+      <thead><tr><th>Task ID</th><th>Total Rubrics</th><th>Deleted</th><th>Remaining Rubrics</th><th>Deleted %</th><th>Remaining Verifiers</th><th>Status</th></tr></thead>
+      <tbody>${body || '<tr><td colspan="7" style="color:#484f58">No tasks with deletions</td></tr>'}</tbody>
+    </table>`;
+
+  exportBtn.disabled = processed.length === 0;
+}
+
+function exportBackfillCsv() {
+  if (!csvBackfillResults) { alert('Load a CSV first.'); return; }
+  const processed = csvBackfillResults.filter(r => r.delCount > 0 && !r.skipped);
+  if (processed.length === 0) { alert('No tasks to back-fill at this threshold.'); return; }
+  const threshold = parseInt(document.getElementById('csvThreshold').value, 10);
+  const minVerifiers = parseInt(document.getElementById('csvMinVerifiers').value || '0', 10);
+  const csv = [
+    ['task_id', 'new_rubrics'].map(csvCell).join(','),
+    ...processed.map(r => [csvCell(r.tid), csvCell(JSON.stringify(r.kept, null, 2))].join(','))
+  ].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  const baseName = csvFileName ? csvFileName.replace(/\.[^.]+$/, '') : 'rubric_backfill';
+  const verSuffix = minVerifiers > 0 ? `_min${minVerifiers}ver` : '';
+  a.href = URL.createObjectURL(blob);
+  a.download = `${baseName}_backfill_lt${threshold}pct${verSuffix}_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+}
+
+function processCsvFile(file) {
+  csvFileName = file.name;
+  const status = document.getElementById('csvDeleterStatus');
+  status.textContent = `Reading ${file.name} (${(file.size / 1024).toFixed(0)} KB)...`;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const { data, parseErrors, rowCount, withRubrics } = ingestCsvRubrics(e.target.result);
+      csvRubricData = data;
+      if (withRubrics === 0) {
+        status.innerHTML = `<span style="color:#f85149">No rubrics parsed from ${rowCount} rows. Expected columns task_id + attemptResponse.</span>`;
+        csvRubricData = null;
+        return;
+      }
+      if (parseErrors > 0) console.warn(`CSV deleter: ${parseErrors} rows had unparseable attemptResponse JSON`);
+      renderCsvDeleter();
+    } catch (err) {
+      status.innerHTML = `<span style="color:#f85149">Failed to parse CSV: ${escHtml(err.message)}</span>`;
+      csvRubricData = null;
+    }
+  };
+  reader.readAsText(file);
+}
+
+const csvDropZone = document.getElementById('csvDropZone');
+const csvFileInput = document.getElementById('csvFileInput');
+if (csvDropZone && csvFileInput) {
+  csvDropZone.addEventListener('click', () => csvFileInput.click());
+  csvDropZone.addEventListener('dragover', e => { e.preventDefault(); csvDropZone.classList.add('drag-over'); });
+  csvDropZone.addEventListener('dragleave', () => csvDropZone.classList.remove('drag-over'));
+  csvDropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    csvDropZone.classList.remove('drag-over');
+    if (e.dataTransfer.files.length) processCsvFile(e.dataTransfer.files[0]);
+  });
+  csvFileInput.addEventListener('change', e => { if (e.target.files.length) processCsvFile(e.target.files[0]); });
 }
 
 // File handling
