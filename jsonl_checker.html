@@ -224,8 +224,8 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <div style="background:#161b22;border:1px solid #d29922;border-radius:8px;padding:14px 16px;margin-bottom:16px">
     <p style="color:#d29922;font-weight:600;margin-bottom:6px">⏳ Heads up: this can take a while.</p>
     <p style="color:#c9d1d9;margin-bottom:8px">
-      Large deliveries (300+ tasks) can take <strong>10–15 minutes</strong> through the hosted API, since it downloads every
-      environment ZIP on a shared server. For a much faster run, do it <strong>locally</strong> — there are
+      Large deliveries (300+ tasks) can sometimes take <strong>~10–15 minutes</strong> through the hosted API, since it downloads
+      every environment ZIP on a shared server. For a much faster run, do it <strong>locally</strong> — there are
       <strong>no dependencies to install</strong> (just Python 3, plus <code>curl</code> and <code>unzip</code>, which macOS already has):
     </p>
     <ol style="color:#c9d1d9;margin:0 0 10px 20px;font-size:.85rem;line-height:1.8">
@@ -242,11 +242,15 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
     <div class="query-box" title="Click to copy"
          style="cursor:pointer;white-space:pre-wrap"
          onclick="navigator.clipboard.writeText(this.textContent.trim())">python3 validate_delivery.py --delivery "YOUR_DELIVERY.jsonl" --output report.json --workers 10</div>
-    <p style="color:#8b949e;font-size:.8rem;margin-top:8px">
-      Click the command to copy it. It writes <code>report.json</code> with the same issues this tab analyzes.
-      <code>--workers 10</code> is a safe default; higher values download faster but can hit your machine's process limit
-      on very large deliveries (it spawns <code>curl</code>/<code>unzip</code> per worker), so back off to ~10 if you see a
-      <code>BlockingIOError</code>.
+    <p style="color:#c9d1d9;font-size:.85rem;margin-top:8px">
+      It writes <code>report.json</code> <strong>and a self-contained <code>report.html</code></strong> — open that HTML in your
+      browser for this same designed breakdown (clean vs not-clean %, categories &amp; subcategories, per-group task-ID lists, and
+      the <code>.txt</code> download buttons). No server needed.
+    </p>
+    <p style="color:#8b949e;font-size:.8rem;margin-top:6px">
+      Click the command to copy it. <code>--workers 10</code> is a safe default; higher values download faster but can hit your
+      machine's process limit on very large deliveries (it spawns <code>curl</code>/<code>unzip</code> per worker), so back off to
+      ~10 if you see a <code>BlockingIOError</code>.
     </p>
   </div>
   <div class="validation-actions">

@@ -33,6 +33,7 @@ Checks performed:
   24. Invalid test weight values (must be in {1,3,5})
   25. Duplicate rubric criteria text within a task
   26. model_a run detection in pass@k
+  27. Required Opus/Claude and Gemini pass-rate fields on every rubric/test
 """
 
 import argparse
@@ -48,6 +49,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 csv.field_size_limit(50_000_000)
+
+PASS_RATE_FIELDS = ["pass_rate_opus", "pass_rate_gemini31"]
 
 ALL_JUSTIFICATION_FIELDS = [
     "why_rubric_is_correct",
@@ -280,6 +283,9 @@ def run_checks(tasks, base_dir, expected_runs=8):
     def add(tid, pair, cat, detail):
         issues.append({"task_id": tid, "pair": pair, "cat": cat, "detail": detail})
 
+    def missing_pass_rate_fields(item):
+        return [field for field in PASS_RATE_FIELDS if field not in item or item.get(field) is None]
+
     for tid in sorted(tasks.keys()):
         t = tasks[tid]
         d = t["data"]
@@ -406,11 +412,42 @@ def run_checks(tasks, base_dir, expected_runs=8):
                 add(tid, "DataIntegrity", "rubric_key_gap",
                     f"Rubric keys have gaps — missing: {missing_str}")
 
+        # ── CHECK 27: Required Opus/Claude and Gemini pass-rate fields ──
+        for rk, rv in dl_rubrics.items():
+            if not isinstance(rv, dict):
+                continue
+            missing = missing_pass_rate_fields(rv)
+            if missing:
+                add(tid, "PassRate", "delivery_rubric_missing",
+                    f"{rk} missing {', '.join(missing)}")
+        for tt in dl_tests:
+            tn = tt.get("test_name", "??")
+            missing = missing_pass_rate_fields(tt)
+            if missing:
+                add(tid, "PassRate", "delivery_test_missing",
+                    f"{tn} missing {', '.join(missing)}")
+        for idx, er in enumerate(env_rubrics, start=1):
+            if not isinstance(er, dict):
+                continue
+            missing = missing_pass_rate_fields(er)
+            if missing:
+                label = (er.get("criteria") or er.get("criterion") or f"rubric #{idx}").strip()
+                add(tid, "PassRate", "env_rubric_missing",
+                    f"{label[:70]} missing {', '.join(missing)}")
+        for et in env_tests:
+            if not isinstance(et, dict):
+                continue
+            tn = et.get("test_name", "??")
+            missing = missing_pass_rate_fields(et)
+            if missing:
+                add(tid, "PassRate", "env_test_missing",
+                    f"{tn} missing {', '.join(missing)}")
+
         # ── CHECK 21: Pass rate out of range ──
         for rk, rv in dl_rubrics.items():
             if not isinstance(rv, dict):
                 continue
-            for fld in ["pass_rate_opus", "pass_rate_gemini31"]:
+            for fld in PASS_RATE_FIELDS:
                 val = rv.get(fld)
                 if val is not None:
                     try:
@@ -423,7 +460,7 @@ def run_checks(tasks, base_dir, expected_runs=8):
                             f"{rk} {fld}={val!r} (not a number)")
         for tt in dl_tests:
             tn = tt.get("test_name", "??")
-            for fld in ["pass_rate_opus", "pass_rate_gemini31"]:
+            for fld in PASS_RATE_FIELDS:
                 val = tt.get(fld)
                 if val is not None:
                     try:
@@ -526,7 +563,7 @@ def run_checks(tasks, base_dir, expected_runs=8):
                     except (ValueError, TypeError):
                         pass
 
-                for fld in ["pass_rate_opus", "pass_rate_gemini31"]:
+                for fld in PASS_RATE_FIELDS:
                     dp, ep = dr.get(fld), er.get(fld)
                     if dp is not None and ep is not None:
                         try:
@@ -559,6 +596,15 @@ def run_checks(tasks, base_dir, expected_runs=8):
                             add(tid, "ENV_vs_Data", "test_weight", f"{tn}: delivery={dw} env={ew}")
                     except (ValueError, TypeError):
                         pass
+                for fld in PASS_RATE_FIELDS:
+                    dp, ep = dt.get(fld), et.get(fld)
+                    if dp is not None and ep is not None:
+                        try:
+                            if abs(float(dp) - float(ep)) > 0.001:
+                                add(tid, "ENV_vs_Data", f"test_{fld}",
+                                    f"{tn}: delivery={dp} env={ep}")
+                        except (ValueError, TypeError):
+                            pass
 
         # ── CHECK 8: Weight ratios ──
         if env_pr is not None and env_rubrics:
@@ -863,6 +909,184 @@ def print_report(issues):
         print(f"  {pair:<20} {total:>5}")
 
 
+_HTML_REPORT_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Delivery Validation — __DELIVERY_NAME_HTML__</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;padding:24px;line-height:1.5}
+h1{font-size:1.4rem;margin-bottom:4px;color:#f0f6fc}
+h3{font-size:.95rem;margin:8px 0 10px;color:#f0f6fc}
+.subtitle{color:#8b949e;margin-bottom:20px;font-size:.85rem;word-break:break-all}
+.stats-bar{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.stat{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 20px;flex:1;min-width:150px;text-align:center}
+.stat .num{font-size:1.8rem;font-weight:700}
+.stat .label{font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
+.stat.green .num{color:#3fb950}.stat.red .num{color:#f85149}.stat.blue .num{color:#58a6ff}.stat.yellow .num{color:#d29922}
+.group{background:#161b22;border:1px solid #30363d;border-radius:10px;margin-bottom:16px;overflow:hidden}
+.group-header{padding:14px 20px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none}
+.group-header:hover{background:#1c2333}
+.group-header h2{font-size:1rem;font-weight:600;display:flex;align-items:center;gap:8px}
+.group-header .count{background:#30363d;color:#c9d1d9;padding:2px 10px;border-radius:12px;font-size:.8rem;font-weight:600}
+.group-header .arrow{transition:transform .2s;color:#8b949e}
+.group-header.open .arrow{transform:rotate(90deg)}
+.group-body{display:none;border-top:1px solid #30363d}
+.group-body.open{display:block}
+.task-row{padding:10px 20px;border-bottom:1px solid #21262d;font-size:.82rem}
+.task-row:last-child{border-bottom:none}
+.task-row-header{display:flex;justify-content:space-between;align-items:center}
+.task-detail{color:#8b949e;font-size:.78rem}
+.task-expand{display:none;margin-top:8px}
+.task-expand.open{display:block}
+.query-box{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:'SF Mono',Monaco,monospace;font-size:.75rem;color:#8b949e;margin-top:8px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.copy-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:.75rem}
+.copy-btn:hover{background:#30363d;border-color:#58a6ff}
+.copy-btn.copied{background:#238636;border-color:#2ea043;color:#fff}
+.validation-actions{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+</style></head>
+<body>
+<h1>Delivery Validation Report</h1>
+<p class="subtitle">__DELIVERY_NAME_HTML__</p>
+<div id="app"></div>
+<script>
+const ISSUES = __ISSUES_JSON__;
+const ALL_IDS = __ALL_IDS_JSON__;
+const DELIVERY_NAME = __DELIVERY_NAME_JS__;
+
+function issuePair(i){return i.pair||i.category||'';}
+function issueCat(i){return i.cat||i.type||'';}
+function escHtml(s){if(s===null||s===undefined)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function fmtPctNum(p,w){if(!w)return '0.0%';return ((p/w)*100).toFixed(1)+'%';}
+
+function computeBreakdown(issues, allIds){
+  const allSet=new Set(allIds), affectedSet=new Set(), cats={};
+  for(const it of issues){
+    const tid=it.task_id||'', pair=issuePair(it)||'Other', cat=issueCat(it)||'other';
+    if(tid){affectedSet.add(tid);allSet.add(tid);}
+    if(!cats[pair])cats[pair]={issues:0,tasks:new Set(),subs:{}};
+    cats[pair].issues++; if(tid)cats[pair].tasks.add(tid);
+    if(!cats[pair].subs[cat])cats[pair].subs[cat]={issues:0,tasks:new Set()};
+    cats[pair].subs[cat].issues++; if(tid)cats[pair].subs[cat].tasks.add(tid);
+  }
+  const total=allSet.size;
+  const affectedIds=[...affectedSet].sort();
+  const cleanIds=[...allSet].filter(id=>!affectedSet.has(id)).sort();
+  return {total,affected:affectedIds.length,clean:cleanIds.length,affectedIds,cleanIds,cats,totalIssues:issues.length};
+}
+
+const BD = computeBreakdown(ISSUES, ALL_IDS);
+BD.fileName = DELIVERY_NAME;
+
+function toggleGroup(h){h.classList.toggle('open');h.nextElementSibling.classList.toggle('open');}
+function toggleExpand(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
+function flashCopied(btn,label){const o=label||btn.textContent;btn.textContent='Copied!';btn.classList.add('copied');setTimeout(()=>{btn.textContent=o;btn.classList.remove('copied');},1500);}
+function copyIds(btn,pair,cat){const info=BD.cats[pair];if(!info||!info.subs[cat])return;navigator.clipboard.writeText([...info.subs[cat].tasks].sort().join('\n'));flashCopied(btn,'Copy IDs');}
+function copyClean(btn){navigator.clipboard.writeText(BD.cleanIds.join('\n'));flashCopied(btn,'Copy clean IDs');}
+function copyAffected(btn){navigator.clipboard.writeText(BD.affectedIds.join('\n'));flashCopied(btn,'Copy not-clean IDs');}
+function baseName(){return (BD.fileName||'delivery').replace(/\.[^.]+$/,'');}
+function downloadText(fn,c){const b=new Blob([c],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=fn;a.click();}
+function summaryText(){
+  const lines=[];
+  lines.push('Total tasks: '+BD.total);
+  lines.push('Clean tasks: '+BD.clean+' ('+fmtPctNum(BD.clean,BD.total)+')');
+  lines.push('Not-clean tasks: '+BD.affected+' ('+fmtPctNum(BD.affected,BD.total)+')');
+  lines.push('Total issues: '+BD.totalIssues); lines.push('');
+  for(const [pair,info] of Object.entries(BD.cats).sort((a,b)=>b[1].issues-a[1].issues)){
+    lines.push(pair+': '+info.issues+' issues, '+info.tasks.size+' tasks');
+    for(const [cat,sub] of Object.entries(info.subs).sort((a,b)=>b[1].issues-a[1].issues))
+      lines.push('    '+cat+': '+sub.issues+' ('+sub.tasks.size+' tasks)');
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+function categoryListsText(){
+  const lines=[];
+  for(const [pair,info] of Object.entries(BD.cats).sort((a,b)=>b[1].issues-a[1].issues)){
+    lines.push('### '+pair+' ('+info.tasks.size+' tasks)');
+    [...info.tasks].sort().forEach(id=>lines.push(id)); lines.push('');
+    for(const [cat,sub] of Object.entries(info.subs).sort((a,b)=>b[1].issues-a[1].issues)){
+      lines.push('--- '+pair+' / '+cat+' ('+sub.tasks.size+' tasks) ---');
+      [...sub.tasks].sort().forEach(id=>lines.push(id)); lines.push('');
+    }
+  }
+  return lines.join('\n');
+}
+function dlSummary(){downloadText(baseName()+'_validation_summary.txt',summaryText());}
+function dlClean(){downloadText(baseName()+'_clean_tasks.txt','Clean tasks: '+BD.clean+' / '+BD.total+' ('+fmtPctNum(BD.clean,BD.total)+')\n\n'+BD.cleanIds.join('\n')+'\n');}
+function dlAffected(){downloadText(baseName()+'_not_clean_tasks.txt','Not-clean tasks: '+BD.affected+' / '+BD.total+' ('+fmtPctNum(BD.affected,BD.total)+')\n\n'+BD.affectedIds.join('\n')+'\n');}
+function dlCats(){downloadText(baseName()+'_category_task_ids.txt',categoryListsText());}
+function dlAll(){dlSummary();dlClean();dlAffected();dlCats();}
+
+function render(){
+  const cats=Object.entries(BD.cats).sort((a,b)=>b[1].issues-a[1].issues);
+  let html='<div class="stats-bar">'
+    +'<div class="stat blue"><div class="num">'+BD.total+'</div><div class="label">Total Tasks</div></div>'
+    +'<div class="stat green"><div class="num">'+BD.clean+'</div><div class="label">Clean — '+fmtPctNum(BD.clean,BD.total)+'</div></div>'
+    +'<div class="stat red"><div class="num">'+BD.affected+'</div><div class="label">Not Clean — '+fmtPctNum(BD.affected,BD.total)+'</div></div>'
+    +'<div class="stat yellow"><div class="num">'+BD.totalIssues+'</div><div class="label">Total Issues</div></div></div>';
+  html+='<div class="validation-actions">'
+    +'<button class="copy-btn" onclick="dlSummary()">Download summary .txt</button>'
+    +'<button class="copy-btn" onclick="dlClean()">Download clean IDs .txt</button>'
+    +'<button class="copy-btn" onclick="dlAffected()">Download not-clean IDs .txt</button>'
+    +'<button class="copy-btn" onclick="dlCats()">Download category/subcategory ID lists .txt</button>'
+    +'<button class="copy-btn" onclick="dlAll()">Download all .txt</button></div>';
+  html+='<h3>Categories &amp; subcategories</h3>';
+  for(const [pair,info] of cats){
+    let subRows='';
+    for(const [cat,sub] of Object.entries(info.subs).sort((a,b)=>b[1].issues-a[1].issues)){
+      const ids=[...sub.tasks].sort();
+      const expandId='vbd_'+(pair+'__'+cat).replace(/[^A-Za-z0-9_]/g,'_');
+      subRows+='<div class="task-row"><div class="task-row-header"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        +'<span style="color:#484f58;cursor:pointer;font-size:.7rem" onclick="toggleExpand(\''+expandId+'\')">▶</span>'
+        +'<span style="color:#c9d1d9;font-weight:600;cursor:pointer" onclick="toggleExpand(\''+expandId+'\')">'+escHtml(cat)+'</span>'
+        +'<span class="task-detail">— '+sub.issues+' issue'+(sub.issues===1?'':'s')+', '+sub.tasks.size+' task'+(sub.tasks.size===1?'':'s')+'</span>'
+        +'<button class="copy-btn" style="padding:2px 8px" onclick="copyIds(this,\''+pair+'\',\''+cat+'\')">Copy IDs</button>'
+        +'</div></div><div class="task-expand" id="'+expandId+'"><div class="query-box">'+(ids.length?escHtml(ids.join('\n')):'(no task IDs)')+'</div></div></div>';
+    }
+    html+='<div class="group"><div class="group-header" onclick="toggleGroup(this)">'
+      +'<h2><span style="color:#58a6ff">●</span> '+escHtml(pair)+' <span class="count">'+info.issues+' issues · '+info.tasks.size+' tasks</span></h2>'
+      +'<span class="arrow">▶</span></div><div class="group-body">'+subRows+'</div></div>';
+  }
+  html+='<div class="group"><div class="group-header" onclick="toggleGroup(this)">'
+    +'<h2><span style="color:#3fb950">●</span> Clean tasks <span class="count">'+BD.clean+' · '+fmtPctNum(BD.clean,BD.total)+'</span></h2>'
+    +'<span class="arrow">▶</span></div><div class="group-body"><div class="task-row">'
+    +'<button class="copy-btn" style="margin-bottom:8px" onclick="copyClean(this)">Copy clean IDs</button>'
+    +'<div class="query-box">'+(BD.cleanIds.length?escHtml(BD.cleanIds.join('\n')):'(none)')+'</div></div></div></div>';
+  html+='<div class="group"><div class="group-header" onclick="toggleGroup(this)">'
+    +'<h2><span style="color:#f85149">●</span> Not-clean tasks <span class="count">'+BD.affected+' · '+fmtPctNum(BD.affected,BD.total)+'</span></h2>'
+    +'<span class="arrow">▶</span></div><div class="group-body"><div class="task-row">'
+    +'<button class="copy-btn" style="margin-bottom:8px" onclick="copyAffected(this)">Copy not-clean IDs</button>'
+    +'<div class="query-box">'+(BD.affectedIds.length?escHtml(BD.affectedIds.join('\n')):'(none)')+'</div></div></div></div>';
+  document.getElementById('app').innerHTML=html;
+}
+render();
+</script>
+</body></html>
+"""
+
+
+def write_html_report(html_path, issues, all_task_ids, delivery_name):
+    """Write a self-contained, styled HTML breakdown report (no server needed)."""
+    compact = [
+        {"task_id": i.get("task_id", ""), "pair": i.get("pair", ""), "cat": i.get("cat", "")}
+        for i in issues
+    ]
+    html = (
+        _HTML_REPORT_TEMPLATE
+        .replace("__ISSUES_JSON__", json.dumps(compact))
+        .replace("__ALL_IDS_JSON__", json.dumps(sorted(set(all_task_ids))))
+        .replace("__DELIVERY_NAME_JS__", json.dumps(delivery_name))
+        .replace("__DELIVERY_NAME_HTML__", _esc_html(delivery_name))
+    )
+    with open(html_path, "w") as f:
+        f.write(html)
+
+
+def _esc_html(s):
+    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Validate OpenClaw/Skills delivery data — catches rubric/test "
@@ -875,6 +1099,9 @@ def main():
                         help="Working directory for downloads")
     parser.add_argument("--output", default="validation_report.json",
                         help="Output report path")
+    parser.add_argument("--html", default=None,
+                        help="Path for a self-contained HTML breakdown report "
+                             "(default: alongside --output as .html; use 'none' to skip)")
     parser.add_argument("--workers", type=int, default=10,
                         help="Download parallelism")
     parser.add_argument("--expected-runs", type=int, default=8,
@@ -950,6 +1177,16 @@ def main():
     with open(args.output, "w") as f:
         json.dump(issues, f, indent=2)
     print(f"\nReport saved to {args.output}")
+
+    html_path = args.html
+    if html_path is None:
+        root, _ = os.path.splitext(args.output)
+        html_path = root + ".html"
+    if str(html_path).lower() != "none":
+        delivery_name = os.path.basename(args.delivery[0]) if args.delivery else os.path.basename(args.output)
+        write_html_report(html_path, issues, list(tasks.keys()), delivery_name)
+        print(f"HTML report saved to {html_path}")
+        print(f"  Open it in your browser: file://{os.path.abspath(html_path)}")
 
     sys.exit(1 if issues else 0)
 
