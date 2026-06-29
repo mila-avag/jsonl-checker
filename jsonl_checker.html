@@ -126,6 +126,7 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <button class="tab-btn" id="modelRewardTab" onclick="showTab('modelReward')">Model Pass Rate</button>
   <button class="tab-btn" id="csvDeleterTab" onclick="showTab('csvDeleter')">CSV Rubric Deleter</button>
   <button class="tab-btn" id="validationTab" onclick="showTab('validation')">Run Delivery Validation</button>
+  <button class="tab-btn" id="removeTab" onclick="showTab('remove')">Tasks to Remove</button>
 </div>
 
 <div id="results">
@@ -213,6 +214,16 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <div class="redash-status" id="csvDeleterStatus">Load a JSONL (Justification Checker tab) first, then drop the rubric CSV here.</div>
   <div class="stats-bar" id="csvDeleterSummary" style="margin-top:12px"></div>
   <div class="redash-results" id="csvDeleterTable"></div>
+</div>
+
+<div class="validation-section" id="removeSection">
+  <h2>Tasks You Should Remove</h2>
+  <p>
+    Removal candidates from the loaded delivery: tasks where the <strong>blended pass@k is &gt;80%</strong>
+    (too easy — models already solve them) or that have a <strong>low verifier count (&lt;10 rubrics + unit tests)</strong>.
+  </p>
+  <div class="stats-bar" id="removeSummary"></div>
+  <div class="redash-results" id="removeTable"></div>
 </div>
 
 <div class="validation-section" id="deliveryValidation">
@@ -335,16 +346,20 @@ function showTab(tab) {
   const isModelReward = tab === 'modelReward';
   const isChecker = tab === 'checker';
   const isCsvDeleter = tab === 'csvDeleter';
+  const isRemove = tab === 'remove';
   document.getElementById('checkerTab').classList.toggle('active', isChecker);
   document.getElementById('modelRewardTab').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleterTab').classList.toggle('active', isCsvDeleter);
   document.getElementById('validationTab').classList.toggle('active', isValidation);
+  document.getElementById('removeTab').classList.toggle('active', isRemove);
   document.getElementById('results').style.display = isChecker ? (analysisResult ? 'block' : 'none') : 'none';
   document.getElementById('deliveryValidation').classList.toggle('active', isValidation);
   document.getElementById('modelReward').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleter').classList.toggle('active', isCsvDeleter);
+  document.getElementById('removeSection').classList.toggle('active', isRemove);
   if (isModelReward) renderModelReward();
   if (isCsvDeleter) renderCsvDeleter();
+  if (isRemove) renderRemoveTab();
 }
 
 function appendValidationLog(message) {
@@ -1506,7 +1521,6 @@ function renderResults(result) {
     <div class="stat yellow"><div class="num">${totalMissT}</div><div class="label">Total Missing Test Just.</div></div>
     <div class="stat blue"><div class="num">${avgR}</div><div class="label">Avg Rubrics/Task</div></div>
     <div class="stat blue"><div class="num">${avgT}</div><div class="label">Avg Unit Tests/Task</div></div>
-    <div class="stat green"><div class="num">${groups.highAvgPassK.length}</div><div class="label">High Pass@k &gt;80% (Claude/Gemini, weighted)</div></div>
     <div class="stat green"><div class="num">${groups.highAvgPassKBlended.length}</div><div class="label">High Avg Pass@k &gt;80% (Blended, weighted)</div></div>
     <div class="stat red"><div class="num">${groups.noUnitTests.length}</div><div class="label">No Unit Tests</div></div>
     <div class="stat" style="${groups.outlierRubrics.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#a371f7">${groups.outlierRubrics.length}</div><div class="label">Low Verifier (&lt;10, excl. missing pass@k)</div></div>
@@ -1573,14 +1587,6 @@ function renderResults(result) {
     { key: 'outlierAfterDelete', title: 'Newly Low Verifier After Deleting Rubrics Missing Justification (<10, excl. previously low & missing pass@k)', color: '#db6d28',
       detail: t => {
         return `<span class="badge low">LOW</span> ${t.remaining} verifiers after deleting ${t.deleted} rubric(s) (was ${t.before}: ${t.rubricCount}R + ${t.testCount}T)`;
-      },
-      expandable: false
-    },
-    { key: 'highAvgPassK', title: 'High Pass@k (>80% weighted on Claude or Gemini)', color: '#3fb950',
-      detail: t => {
-        const opus = t.opusAvg === null || t.opusAvg === undefined ? '—' : `${(t.opusAvg * 100).toFixed(1)}%`;
-        const gemini = t.geminiAvg === null || t.geminiAvg === undefined ? '—' : `${(t.geminiAvg * 100).toFixed(1)}%`;
-        return `<span class="badge complete">${(t.max * 100).toFixed(1)}%</span> Claude ${opus} · Gemini ${gemini} (${t.rubricCount} rubrics, ${t.testCount} tests)`;
       },
       expandable: false
     },
@@ -1724,6 +1730,75 @@ function exportModelRewardCsv() {
   a.href = URL.createObjectURL(blob);
   a.download = `${baseName}_model_pass_rate_${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
+}
+
+function renderRemoveTab() {
+  const summary = document.getElementById('removeSummary');
+  const table = document.getElementById('removeTable');
+  if (!summary || !table) return;
+  if (!analysisResult || !analysisResult.groups) {
+    summary.innerHTML = '';
+    table.innerHTML = '<p style="color:#8b949e;font-size:.85rem">Upload a JSONL file first.</p>';
+    return;
+  }
+  const g = analysisResult.groups;
+  const highBlended = g.highAvgPassKBlended || [];
+  const lowVerifier = g.outlierRubricsAll || [];
+
+  const map = {};
+  for (const t of highBlended) {
+    if (!map[t.id]) map[t.id] = { id: t.id, reasons: [], rubricCount: t.rubricCount, testCount: t.testCount };
+    map[t.id].reasons.push('high pass@k');
+    map[t.id].blended = t.avg;
+  }
+  for (const t of lowVerifier) {
+    if (!map[t.id]) map[t.id] = { id: t.id, reasons: [], rubricCount: t.rubricCount, testCount: t.testCount };
+    map[t.id].reasons.push('low verifiers');
+    map[t.id].total = t.total;
+    map[t.id].missingPK = t.missingPK;
+  }
+  const rows = Object.values(map).sort((a, b) => b.reasons.length - a.reasons.length || (b.blended || 0) - (a.blended || 0));
+
+  summary.innerHTML = `
+    <div class="stat blue"><div class="num">${rows.length}</div><div class="label">Removal Candidates</div></div>
+    <div class="stat green"><div class="num">${highBlended.length}</div><div class="label">High Blended Pass@k &gt;80%</div></div>
+    <div class="stat" style="${lowVerifier.length ? '' : 'opacity:.5'}"><div class="num" style="color:#a371f7">${lowVerifier.length}</div><div class="label">Low Verifiers (&lt;10)</div></div>
+  `;
+
+  const body = rows.map(r => {
+    const reasonTags = r.reasons.map(rs => rs === 'high pass@k'
+      ? '<span class="badge complete">HIGH PASS@K</span>'
+      : '<span class="badge low">LOW VERIFIERS</span>').join(' ');
+    const pkFlag = (r.reasons.includes('low verifiers') && r.missingPK) ? ' <span class="badge missing">MISSING PASS@K</span>' : '';
+    const blended = (r.blended !== undefined) ? `${(r.blended * 100).toFixed(1)}%` : '—';
+    const verifiers = (r.rubricCount || 0) + (r.testCount || 0);
+    return `<tr>
+      <td style="font-family:monospace;color:#58a6ff">${escHtml(r.id)}</td>
+      <td>${reasonTags}${pkFlag}</td>
+      <td>${blended}</td>
+      <td>${verifiers} <span style="color:#484f58;font-size:.75rem">(${r.rubricCount || 0}R+${r.testCount || 0}T)</span></td>
+    </tr>`;
+  }).join('');
+
+  table.innerHTML = `
+    <div class="validation-actions"><button class="copy-btn" onclick="copyRemoveIds(this)">Copy all IDs</button></div>
+    <table>
+      <thead><tr><th>Task ID</th><th>Reason</th><th>Blended Pass@k</th><th>Verifiers</th></tr></thead>
+      <tbody>${body || '<tr><td colspan="4" style="color:#484f58">No removal candidates</td></tr>'}</tbody>
+    </table>`;
+}
+
+function copyRemoveIds(btn) {
+  if (!analysisResult || !analysisResult.groups) return;
+  const g = analysisResult.groups;
+  const ids = [...new Set([
+    ...(g.highAvgPassKBlended || []).map(t => t.id),
+    ...(g.outlierRubricsAll || []).map(t => t.id)
+  ])];
+  navigator.clipboard.writeText(ids.join('\n'));
+  btn.textContent = `Copied ${ids.length}!`;
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'Copy all IDs'; btn.classList.remove('copied'); }, 1500);
 }
 
 function renderExpandContent(sections) {
