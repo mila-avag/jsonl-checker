@@ -125,6 +125,7 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <button class="tab-btn active" id="checkerTab" onclick="showTab('checker')">Justification Checker</button>
   <button class="tab-btn" id="modelRewardTab" onclick="showTab('modelReward')">Model Pass Rate</button>
   <button class="tab-btn" id="csvDeleterTab" onclick="showTab('csvDeleter')">CSV Rubric Deleter</button>
+  <button class="tab-btn" id="fixWeightsTab" onclick="showTab('fixWeights')">Fix Test Weights</button>
   <button class="tab-btn" id="validationTab" onclick="showTab('validation')">Run Delivery Validation</button>
   <button class="tab-btn" id="removeTab" onclick="showTab('remove')">Tasks to Remove</button>
 </div>
@@ -197,6 +198,10 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
         <option value="10">10%</option>
         <option value="15" selected>15%</option>
         <option value="20">20%</option>
+        <option value="25">25%</option>
+        <option value="30">30%</option>
+        <option value="35">35%</option>
+        <option value="40">40%</option>
       </select>
     </label>
     <label style="font-size:.85rem;color:#8b949e">Min remaining verifiers (rubrics + tests):
@@ -214,6 +219,58 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <div class="redash-status" id="csvDeleterStatus">Load a JSONL (Justification Checker tab) first, then drop the rubric CSV here.</div>
   <div class="stats-bar" id="csvDeleterSummary" style="margin-top:12px"></div>
   <div class="redash-results" id="csvDeleterTable"></div>
+</div>
+
+<div class="validation-section" id="fixWeights">
+  <h2>Fix Test Weights</h2>
+  <p>
+    Applies formatter <strong>mismatch</strong> and <strong>malformed</strong> fixes to a <code>test_weights</code> CSV
+    (logic ported from <code>fix_test_weights.py</code>). For <em>mismatch</em> tasks it drops tests listed under
+    <code>Only in test_weights</code> and adds tests under <code>Only in unit_tests</code> (auto-weighting new tests:
+    <strong>5</strong> for presence/PII/immutability checks, <strong>1</strong> for formatting/style checks, <strong>3</strong> otherwise).
+    For <em>malformed</em> tasks it re-emits the current weights as valid JSON. The output is a fixed CSV with
+    <code>TASK</code> and <code>test_weights</code> columns containing only the affected tasks.
+  </p>
+  <ol style="color:#c9d1d9;margin:0 0 14px 20px;font-size:.85rem;line-height:1.8">
+    <li>
+      <strong>Weights CSV:</strong> run the
+      <a href="https://redash.scale.com/queries/328624/source" target="_blank" rel="noopener" style="color:#58a6ff">Redash query 328624 ↗</a>
+      and download the results CSV (needs a <code>TASK</code>/<code>task_id</code> column and a <code>test_weights</code> JSON column).
+    </li>
+    <li>
+      <strong>Formatter errors CSV:</strong> the formatter results export (first column = task ID, remaining columns = the error text,
+      which mentions <code>mismatch</code> / <code>malformed</code> and the <code>Only in test_weights</code> / <code>Only in unit_tests</code> lists).
+    </li>
+    <li>Drop both files below — the fixed CSV is generated automatically.</li>
+    <li>
+      <strong>Download</strong> the fixed CSV, then upload it to backfill metadata via
+      <a href="https://dashboard.scale.com/corp/dct/update-task-metadata" target="_blank" rel="noopener" style="color:#58a6ff">Update Task Metadata ↗</a>.
+    </li>
+  </ol>
+  <div style="display:flex;gap:16px;flex-wrap:wrap">
+    <div class="drop-zone" id="fwWeightsDrop" style="padding:28px;margin-bottom:16px;flex:1;min-width:260px">
+      <div class="icon">⚖️</div>
+      <p>Drop <strong>weights</strong> CSV (Redash 328624) or click to browse</p>
+      <input type="file" id="fwWeightsInput" accept=".csv">
+    </div>
+    <div class="drop-zone" id="fwFormatterDrop" style="padding:28px;margin-bottom:16px;flex:1;min-width:260px">
+      <div class="icon">🧹</div>
+      <p>Drop <strong>formatter errors</strong> CSV or click to browse</p>
+      <input type="file" id="fwFormatterInput" accept=".csv">
+    </div>
+  </div>
+  <div class="validation-actions">
+    <button class="redash-btn" id="fwExportBtn" onclick="exportFixWeightsCsv()" disabled>Download Fixed CSV</button>
+    <button class="copy-btn" id="fwManifestBtn" onclick="exportFixWeightsManifest()" disabled>Download manifest CSV</button>
+  </div>
+  <p style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px">
+    <strong>Then backfill:</strong> upload the fixed CSV to
+    <a href="https://dashboard.scale.com/corp/dct/update-task-metadata" target="_blank" rel="noopener" style="color:#58a6ff">dashboard.scale.com/corp/dct/update-task-metadata ↗</a>
+    to apply the corrected <code>test_weights</code> to each task's metadata.
+  </p>
+  <div class="redash-status" id="fwStatus">Drop both CSVs above to generate the fixed file.</div>
+  <div class="stats-bar" id="fwSummary" style="margin-top:12px"></div>
+  <div class="redash-results" id="fwTable"></div>
 </div>
 
 <div class="validation-section" id="removeSection">
@@ -346,16 +403,19 @@ function showTab(tab) {
   const isModelReward = tab === 'modelReward';
   const isChecker = tab === 'checker';
   const isCsvDeleter = tab === 'csvDeleter';
+  const isFixWeights = tab === 'fixWeights';
   const isRemove = tab === 'remove';
   document.getElementById('checkerTab').classList.toggle('active', isChecker);
   document.getElementById('modelRewardTab').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleterTab').classList.toggle('active', isCsvDeleter);
+  document.getElementById('fixWeightsTab').classList.toggle('active', isFixWeights);
   document.getElementById('validationTab').classList.toggle('active', isValidation);
   document.getElementById('removeTab').classList.toggle('active', isRemove);
   document.getElementById('results').style.display = isChecker ? (analysisResult ? 'block' : 'none') : 'none';
   document.getElementById('deliveryValidation').classList.toggle('active', isValidation);
   document.getElementById('modelReward').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleter').classList.toggle('active', isCsvDeleter);
+  document.getElementById('fixWeights').classList.toggle('active', isFixWeights);
   document.getElementById('removeSection').classList.toggle('active', isRemove);
   if (isModelReward) renderModelReward();
   if (isCsvDeleter) renderCsvDeleter();
@@ -2487,6 +2547,305 @@ function processFile(file) {
   };
   reader.readAsText(file);
 }
+
+/* ============================================================
+   Fix Test Weights tab — ported from fix_test_weights.py
+   ============================================================ */
+const FW_W5_TOKENS = ['no_pii','privacy','sensitive','immutab','_unchanged','not_modified',
+  'no_secret','confidential','personal_data','data_leak','secure','restricted','no_service_state',
+  'state_was_mutated','_exists','_present','_created','_found','file_exist','file_creat','file_present',
+  'dir_exist','directory_exist','folder_exist','path_exist','output_exist','result_exist','written',
+  'saved','generated','produced','_is_present','_not_empty'];
+const FW_W1_TOKENS = ['format','markdown','style','spell','grammar','indent','whitespace','newline',
+  'blank','casing','capitaliz','punctuat','encoding','charset'];
+
+let fwWeights = null, fwErrors = null, fwWeightsName = '', fwFormatterName = '', fwResult = null;
+
+function fwAssignWeight(name) {
+  const n = (name || '').toLowerCase();
+  if (FW_W5_TOKENS.some(t => n.includes(t))) return 5;
+  if (FW_W1_TOKENS.some(t => n.includes(t))) return 1;
+  return 3;
+}
+
+function fwGetName(e) {
+  return e.test || e.test_name || e.name || '';
+}
+
+function fwNormalize(entries) {
+  if (!Array.isArray(entries)) return [];
+  const out = [];
+  for (const e of entries) {
+    const n = fwGetName(e);
+    if (n) out.push({ test: n, weight: (e.weight === undefined || e.weight === null) ? 3 : e.weight });
+  }
+  return out;
+}
+
+// Robust CSV parser -> array of rows (each row an array of cell strings)
+function fwParseCsv(text) {
+  const rows = [];
+  let row = [], cell = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { cell += '"'; i++; }
+        else inQuotes = false;
+      } else cell += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { row.push(cell); cell = ''; }
+      else if (c === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+      else if (c === '\r') { /* skip */ }
+      else cell += c;
+    }
+  }
+  if (cell.length || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+// Parse a value that may be JSON-encoded one or more times (Redash exports the array as a JSON string).
+function fwDeepParse(v) {
+  let x = v;
+  for (let k = 0; k < 4; k++) {
+    if (typeof x !== 'string') break;
+    try { x = JSON.parse(x); } catch { break; }
+  }
+  return x;
+}
+
+function fwParseWeightsCsv(text) {
+  const rows = fwParseCsv(text);
+  if (!rows.length) return {};
+  const header = rows[0].map(h => h.trim().toUpperCase());
+  const taskIdx = header.findIndex(h => h === 'TASK' || h === 'TASK_ID');
+  const twIdx = header.findIndex(h => h === 'TEST_WEIGHTS');
+  const weights = {};
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    if (!cells.length) continue;
+    const tid = ((taskIdx >= 0 ? cells[taskIdx] : cells[0]) || '').trim();
+    if (!tid) continue;
+    const parsed = fwDeepParse((twIdx >= 0 ? cells[twIdx] : '[]') || '[]');
+    weights[tid] = fwNormalize(Array.isArray(parsed) ? parsed : []);
+  }
+  return weights;
+}
+
+function fwParseFormatterCsv(text) {
+  const rows = fwParseCsv(text);
+  const errors = {};
+  for (let r = 1; r < rows.length; r++) {  // skip header
+    const cells = rows[r];
+    if (!cells.length) continue;
+    const tid = (cells[0] || '').trim();
+    if (!tid) continue;
+    const snippet = cells.slice(1).filter(c => c != null).join(' ').trim();
+    errors[tid] = (errors[tid] || '') + ' ' + snippet;
+  }
+  return errors;
+}
+
+// Extract the bracketed list following a label, honoring nested [...] in item names.
+function fwExtractList(err, label) {
+  const li = err.indexOf(label);
+  if (li < 0) return null;
+  let i = err.indexOf('[', li);
+  if (i < 0) return null;
+  const start = i;
+  let depth = 0;
+  for (; i < err.length; i++) {
+    if (err[i] === '[') depth++;
+    else if (err[i] === ']') { depth--; if (depth === 0) return err.slice(start + 1, i); }
+  }
+  return err.slice(start + 1);
+}
+
+// Split list items on TOP-LEVEL commas / tabs / 2+ spaces (so test names like foo[bar] stay intact).
+function fwSplitItems(inner) {
+  if (inner == null) return [];
+  const items = [];
+  let depth = 0, cur = '';
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === '[') { depth++; cur += c; }
+    else if (c === ']') { depth--; cur += c; }
+    else if (depth === 0 && (c === ',' || c === '\t')) { if (cur.trim()) items.push(cur.trim()); cur = ''; }
+    else if (depth === 0 && c === ' ' && inner[i + 1] === ' ') { while (inner[i + 1] === ' ') i++; if (cur.trim()) { items.push(cur.trim()); cur = ''; } }
+    else cur += c;
+  }
+  if (cur.trim()) items.push(cur.trim());
+  return items;
+}
+
+function fwParseMismatch(err) {
+  return [fwSplitItems(fwExtractList(err, 'Only in test_weights:')),
+          fwSplitItems(fwExtractList(err, 'Only in unit_tests:'))];
+}
+
+function runFixWeights() {
+  const status = document.getElementById('fwStatus');
+  if (!fwWeights || !fwErrors) {
+    status.textContent = 'Drop both CSVs above to generate the fixed file.';
+    return;
+  }
+  const errors = fwErrors;
+  const mismatchIds = Object.keys(errors).filter(t => errors[t].toLowerCase().includes('mismatch'));
+  const malformedIds = Object.keys(errors).filter(t =>
+    errors[t].toLowerCase().includes('malformed') && !errors[t].toLowerCase().includes('mismatch'));
+
+  const fixRows = [], manifestRows = [], notInWeights = [];
+
+  const countW = (cur, w) => cur.filter(e => e.weight === w).length;
+
+  for (const tid of mismatchIds) {
+    const [onlyTw, onlyUt] = fwParseMismatch(errors[tid]);
+    let cur = (fwWeights[tid] || []).slice();
+    if (!(tid in fwWeights)) notInWeights.push(tid);
+    const curNames = new Set(cur.map(e => e.test));
+    const onlyTwSet = new Set(onlyTw);
+    const removed = [...curNames].filter(n => onlyTwSet.has(n)).length;
+    cur = cur.filter(e => !onlyTwSet.has(e.test));
+    let added = 0;
+    for (const t of onlyUt) {
+      if (!curNames.has(t)) { cur.push({ test: t, weight: fwAssignWeight(t) }); added++; }
+    }
+    fixRows.push({ TASK: tid, test_weights: JSON.stringify(cur) });
+    manifestRows.push({ TASK_ID: tid, error_type: 'mismatch', base_count: (fwWeights[tid] || []).length,
+      only_in_test_weights: onlyTw.length, only_in_unit_tests: onlyUt.length, removed, added,
+      final_count: cur.length, weight_5: countW(cur, 5), weight_3: countW(cur, 3), weight_1: countW(cur, 1) });
+  }
+
+  for (const tid of malformedIds) {
+    const cur = (fwWeights[tid] || []).slice();
+    if (!(tid in fwWeights)) notInWeights.push(tid);
+    fixRows.push({ TASK: tid, test_weights: JSON.stringify(cur) });
+    manifestRows.push({ TASK_ID: tid, error_type: 'malformed', base_count: cur.length,
+      only_in_test_weights: 0, only_in_unit_tests: 0, removed: 0, added: 0, final_count: cur.length,
+      weight_5: countW(cur, 5), weight_3: countW(cur, 3), weight_1: countW(cur, 1) });
+  }
+
+  const totalRemoved = manifestRows.reduce((s, r) => s + r.removed, 0);
+  const totalAdded = manifestRows.reduce((s, r) => s + r.added, 0);
+  const otherCount = Object.keys(errors).length - mismatchIds.length - malformedIds.length;
+  fwResult = { fixRows, manifestRows,
+    summary: { tasksFixed: fixRows.length, mismatch: mismatchIds.length, malformed: malformedIds.length,
+      other: otherCount, totalRemoved, totalAdded, notInWeights: notInWeights.length } };
+  renderFixWeights();
+}
+
+function renderFixWeights() {
+  const status = document.getElementById('fwStatus');
+  const summary = document.getElementById('fwSummary');
+  const table = document.getElementById('fwTable');
+  const exportBtn = document.getElementById('fwExportBtn');
+  const manifestBtn = document.getElementById('fwManifestBtn');
+
+  const w = fwWeights ? Object.keys(fwWeights).length : 0;
+  const e = fwErrors ? Object.keys(fwErrors).length : 0;
+  status.innerHTML = `Weights: <strong>${fwWeights ? escHtml(fwWeightsName) + ' (' + w + ' tasks)' : 'not loaded'}</strong>`
+    + ` &nbsp;·&nbsp; Formatter: <strong>${fwErrors ? escHtml(fwFormatterName) + ' (' + e + ' tasks)' : 'not loaded'}</strong>`;
+
+  if (!fwResult) { summary.innerHTML = ''; table.innerHTML = ''; exportBtn.disabled = true; manifestBtn.disabled = true; return; }
+
+  const s = fwResult.summary;
+  summary.innerHTML = [
+    `<div class="stat blue"><div class="num">${s.tasksFixed}</div><div class="label">Tasks Fixed</div></div>`,
+    `<div class="stat yellow"><div class="num">${s.mismatch}</div><div class="label">Mismatch</div></div>`,
+    `<div class="stat orange"><div class="num">${s.malformed}</div><div class="label">Malformed</div></div>`,
+    `<div class="stat green"><div class="num">${s.totalAdded}</div><div class="label">Tests Added</div></div>`,
+    `<div class="stat red"><div class="num">${s.totalRemoved}</div><div class="label">Tests Removed</div></div>`,
+    `<div class="stat"><div class="num">${s.other}</div><div class="label">Other / Skipped</div></div>`,
+  ].join('');
+
+  const rows = fwResult.manifestRows.slice(0, 500);
+  const body = rows.map(r => `<tr>
+    <td style="font-family:monospace;color:#58a6ff">${escHtml(r.TASK_ID)}</td>
+    <td>${escHtml(r.error_type)}</td>
+    <td style="text-align:right">${r.base_count}</td>
+    <td style="text-align:right;color:#f85149">${r.removed}</td>
+    <td style="text-align:right;color:#3fb950">${r.added}</td>
+    <td style="text-align:right"><strong>${r.final_count}</strong></td>
+    <td style="text-align:right">${r.weight_5}/${r.weight_3}/${r.weight_1}</td>
+  </tr>`).join('');
+  const note = fwResult.manifestRows.length > 500
+    ? `<p style="color:#8b949e;font-size:.8rem;margin-top:8px">Showing first 500 of ${fwResult.manifestRows.length} tasks (full set is in the downloads).</p>` : '';
+  table.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:.8rem;margin-top:12px">
+    <tr style="text-align:left;color:#8b949e;border-bottom:1px solid #30363d">
+      <th style="padding:6px">TASK</th><th style="padding:6px">type</th>
+      <th style="padding:6px;text-align:right">base</th><th style="padding:6px;text-align:right">removed</th>
+      <th style="padding:6px;text-align:right">added</th><th style="padding:6px;text-align:right">final</th>
+      <th style="padding:6px;text-align:right">w 5/3/1</th></tr>${body}</table>${note}`;
+
+  exportBtn.disabled = fwResult.fixRows.length === 0;
+  manifestBtn.disabled = fwResult.manifestRows.length === 0;
+}
+
+function fwDownload(filename, headerCols, rows, rowFn) {
+  const lines = [headerCols.map(csvCell).join(',')];
+  for (const r of rows) lines.push(rowFn(r).map(csvCell).join(','));
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+function exportFixWeightsCsv() {
+  if (!fwResult) return;
+  const base = (fwWeightsName || 'test_weights').replace(/\.[^.]+$/, '');
+  fwDownload(`${base}_fixed_${new Date().toISOString().slice(0, 10)}.csv`,
+    ['TASK', 'test_weights'], fwResult.fixRows, r => [r.TASK, r.test_weights]);
+}
+
+function exportFixWeightsManifest() {
+  if (!fwResult) return;
+  const base = (fwWeightsName || 'test_weights').replace(/\.[^.]+$/, '');
+  const cols = ['TASK_ID', 'error_type', 'base_count', 'only_in_test_weights', 'only_in_unit_tests',
+    'removed', 'added', 'final_count', 'weight_5', 'weight_3', 'weight_1'];
+  fwDownload(`${base}_fixed_manifest_${new Date().toISOString().slice(0, 10)}.csv`,
+    cols, fwResult.manifestRows, r => cols.map(c => r[c]));
+}
+
+function fwProcessWeights(file) {
+  fwWeightsName = file.name;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try { fwWeights = fwParseWeightsCsv(ev.target.result); }
+    catch (err) { document.getElementById('fwStatus').innerHTML = `<span style="color:#f85149">Weights CSV parse failed: ${escHtml(err.message)}</span>`; fwWeights = null; return; }
+    fwResult = null;
+    if (fwWeights && fwErrors) runFixWeights(); else renderFixWeights();
+  };
+  reader.readAsText(file);
+}
+
+function fwProcessFormatter(file) {
+  fwFormatterName = file.name;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try { fwErrors = fwParseFormatterCsv(ev.target.result); }
+    catch (err) { document.getElementById('fwStatus').innerHTML = `<span style="color:#f85149">Formatter CSV parse failed: ${escHtml(err.message)}</span>`; fwErrors = null; return; }
+    fwResult = null;
+    if (fwWeights && fwErrors) runFixWeights(); else renderFixWeights();
+  };
+  reader.readAsText(file);
+}
+
+function fwWireDrop(dropId, inputId, handler) {
+  const drop = document.getElementById(dropId), input = document.getElementById(inputId);
+  if (!drop || !input) return;
+  drop.addEventListener('click', () => input.click());
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag-over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault(); drop.classList.remove('drag-over');
+    if (e.dataTransfer.files.length) handler(e.dataTransfer.files[0]);
+  });
+  input.addEventListener('change', e => { if (e.target.files.length) handler(e.target.files[0]); });
+}
+fwWireDrop('fwWeightsDrop', 'fwWeightsInput', fwProcessWeights);
+fwWireDrop('fwFormatterDrop', 'fwFormatterInput', fwProcessFormatter);
 </script>
 </body>
 </html>
