@@ -143,6 +143,18 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
     <input type="file" id="importFile" accept=".json" style="display:none" onchange="importStatus(event)">
     <div class="progress-text">Done: <span id="doneCount">0</span> / <span id="totalActionable">0</span></div>
   </div>
+  <div class="filter-bar" id="taskFilterBar" style="display:none;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:16px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <strong style="font-size:.85rem;color:#c9d1d9">Filter by task IDs</strong>
+      <span style="font-size:.78rem;color:#8b949e">Paste IDs (space, comma, or newline separated). Shows only tasks that are in the JSONL <em>and</em> in your list.</span>
+    </div>
+    <textarea id="taskFilterInput" placeholder="e.g. 69d4f5e3090e6e279e9efd81  6a2ef82e16410841a44930e1 ..." style="width:100%;min-height:60px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:8px;font-family:'SF Mono',Monaco,monospace;font-size:.78rem;resize:vertical"></textarea>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap">
+      <button class="copy-btn" onclick="applyTaskFilter()">Apply filter</button>
+      <button class="copy-btn" onclick="clearTaskFilter()">Clear filter</button>
+      <span id="taskFilterStatus" style="font-size:.78rem;color:#8b949e"></span>
+    </div>
+  </div>
   <div id="groups"></div>
   <div class="redash-section" id="redashSection">
     <h3>Redash Pass@k Lookup</h3>
@@ -1167,10 +1179,11 @@ function clearAllStatus() {
   if (analysisResult) renderResults(analysisResult);
 }
 function copyAllIds(btn) {
-  if (!analysisResult || !analysisResult.groups || !analysisResult.groups.modelRates) {
+  const vg = viewGroups();
+  if (!vg || !vg.modelRates) {
     btn.textContent = 'No tasks'; setTimeout(() => { btn.textContent = 'Copy All IDs'; }, 1500); return;
   }
-  const ids = analysisResult.groups.modelRates.map(t => t.id).filter(Boolean);
+  const ids = vg.modelRates.map(t => t.id).filter(Boolean);
   if (ids.length === 0) { btn.textContent = 'No tasks'; setTimeout(() => { btn.textContent = 'Copy All IDs'; }, 1500); return; }
   navigator.clipboard.writeText(ids.join('\n'));
   btn.textContent = `Copied ${ids.length}!`;
@@ -1189,20 +1202,70 @@ function updateProgress() {
   const doneEl = document.getElementById('doneCount');
   const totalEl = document.getElementById('totalActionable');
   if (!doneEl || !analysisResult) return;
-  const actionable = (analysisResult.groups.onlyTests || []).length
-    + (analysisResult.groups.onlyRubrics || []).length
-    + (analysisResult.groups.both || []).length
-    + (analysisResult.groups.missingPK || []).length;
+  const vg = viewGroups() || analysisResult.groups;
+  const actionable = (vg.onlyTests || []).length
+    + (vg.onlyRubrics || []).length
+    + (vg.both || []).length
+    + (vg.missingPK || []).length;
   const actionableIds = [
-    ...(analysisResult.groups.onlyTests || []),
-    ...(analysisResult.groups.onlyRubrics || []),
-    ...(analysisResult.groups.both || []),
-    ...(analysisResult.groups.missingPK || [])
+    ...(vg.onlyTests || []),
+    ...(vg.onlyRubrics || []),
+    ...(vg.both || []),
+    ...(vg.missingPK || [])
   ].map(t => t.id);
   const doneCount = actionableIds.filter(id => taskStatus[id] && taskStatus[id].done).length;
   doneEl.textContent = doneCount;
   totalEl.textContent = actionable;
 }
+
+// ── Task-ID filter ──────────────────────────────────────────────
+let taskFilterIds = null; // Set of ids, or null when no filter is active
+
+function parseIdList(text) {
+  return (text || '').split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+}
+// Return groups filtered to only tasks whose id is in `ids`.
+function filterGroupsByIds(groups, ids) {
+  const fg = {};
+  for (const k of Object.keys(groups)) {
+    const v = groups[k];
+    if (Array.isArray(v)) {
+      fg[k] = v.filter(t => (t && typeof t === 'object' && 'id' in t) ? ids.has(t.id) : true);
+    } else {
+      fg[k] = v;
+    }
+  }
+  return fg;
+}
+// The groups the viewer should render: filtered when a filter is active, else the full set.
+function viewGroups() {
+  if (!analysisResult || !analysisResult.groups) return null;
+  return taskFilterIds ? filterGroupsByIds(analysisResult.groups, taskFilterIds) : analysisResult.groups;
+}
+function applyTaskFilter() {
+  const ta = document.getElementById('taskFilterInput');
+  const ids = parseIdList(ta ? ta.value : '');
+  taskFilterIds = ids.length ? new Set(ids) : null;
+  if (analysisResult) renderResults(analysisResult);
+}
+function clearTaskFilter() {
+  const ta = document.getElementById('taskFilterInput');
+  if (ta) ta.value = '';
+  taskFilterIds = null;
+  if (analysisResult) renderResults(analysisResult);
+}
+function updateFilterStatus() {
+  const el = document.getElementById('taskFilterStatus');
+  if (!el) return;
+  if (!taskFilterIds) { el.textContent = ''; return; }
+  const allIds = new Set((analysisResult.groups.modelRates || []).map(t => t.id));
+  let matched = 0;
+  taskFilterIds.forEach(id => { if (allIds.has(id)) matched++; });
+  const notFound = taskFilterIds.size - matched;
+  el.innerHTML = `<span style="color:#58a6ff">Filter active</span> — showing <strong>${matched}</strong> of ${taskFilterIds.size} pasted ID${taskFilterIds.size === 1 ? '' : 's'} found in this JSONL` +
+    (notFound > 0 ? ` <span style="color:#d29922">(${notFound} not in JSONL)</span>` : '');
+}
+
 loadStatus();
 initValidationApiInput();
 
@@ -1253,13 +1316,31 @@ function averagePassRates(items) {
   return { avg, count };
 }
 
+// The second (non-Claude) model reports its pass rate as pass_rate_gemini31 or,
+// as a fallback, pass_rate_gpt. Either satisfies the "gemini" slot.
+const GEMINI_PASS_RATE_KEYS = ['pass_rate_gemini31', 'pass_rate_gpt'];
+
+// `key` may be a single field name or an array of field names (first present wins).
 function getModelPassRate(item, key) {
   if (!item || typeof item !== 'object') return null;
-  const v = item[key];
+  const keys = Array.isArray(key) ? key : [key];
+  let v;
+  for (const k of keys) {
+    if (item[k] !== null && item[k] !== undefined) { v = item[k]; break; }
+  }
   if (v === null || v === undefined) return null;
   const f = parseFloat(v);
   if (isNaN(f)) return null;
   return f > 1 ? f / 100 : f;
+}
+
+// Second-model pass rate, accepting pass_rate_gpt as a fallback for pass_rate_gemini31.
+function getGeminiPassRate(item) {
+  if (!item || typeof item !== 'object') return undefined;
+  for (const k of GEMINI_PASS_RATE_KEYS) {
+    if (item[k] !== null && item[k] !== undefined) return item[k];
+  }
+  return undefined;
 }
 
 function averageModelPassRate(items, key) {
@@ -1278,7 +1359,7 @@ function averageModelPassRate(items, key) {
 
 function isPass0(item) {
   const po = item.pass_rate_opus;
-  const pg = item.pass_rate_gemini31;
+  const pg = getGeminiPassRate(item);
   if (po === null || po === undefined) return false;
   const poF = parseFloat(po);
   if (isNaN(poF)) return false;
@@ -1291,7 +1372,7 @@ function isPass0(item) {
 
 function isPass0OrMissing(item) {
   const po = item.pass_rate_opus;
-  const pg = item.pass_rate_gemini31;
+  const pg = getGeminiPassRate(item);
   const poF = (po === null || po === undefined) ? 0 : parseFloat(po);
   const pgF = (pg === null || pg === undefined) ? 0 : parseFloat(pg);
   if (isNaN(poF) || isNaN(pgF)) return false;
@@ -1448,7 +1529,7 @@ function analyzeJSONL(lines) {
 
     const allItems = [...ri, ...ti];
     const opusAvg = averageModelPassRate(allItems, 'pass_rate_opus');
-    const geminiAvg = averageModelPassRate(allItems, 'pass_rate_gemini31');
+    const geminiAvg = averageModelPassRate(allItems, GEMINI_PASS_RATE_KEYS);
     groups.modelRates.push({ id: tid, opusAvg, geminiAvg, rubricCount: ri.length, testCount: ti.length });
     const maxModelAvg = Math.max(opusAvg === null ? -1 : opusAvg, geminiAvg === null ? -1 : geminiAvg);
     if (maxModelAvg > 0.8) {
@@ -1555,7 +1636,14 @@ function renderResults(result) {
   document.getElementById('checkerTab').classList.add('active');
   document.getElementById('modelRewardTab').classList.remove('active');
   document.getElementById('validationTab').classList.remove('active');
-  const { total, groups } = result;
+
+  // Show the filter bar once results exist; render either the full or filtered view.
+  const filterBar = document.getElementById('taskFilterBar');
+  if (filterBar) filterBar.style.display = 'block';
+  updateFilterStatus();
+
+  const groups = viewGroups() || result.groups;
+  const total = taskFilterIds ? (groups.modelRates || []).length : result.total;
 
   const statsBar = document.getElementById('statsBar');
   const totalMissR = groups.onlyRubrics.reduce((s,t) => s+t.count, 0)
@@ -1589,7 +1677,12 @@ function renderResults(result) {
     <div class="stat" style="${groups.outlierAfterDelete.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#db6d28">${groups.outlierAfterDelete.length}</div><div class="label">Low Verifier After Delete (&lt;10)</div></div>
   `;
 
-  renderMainSafetyBreakdown(total, stats.mainSafety);
+  const safetyDiv = document.getElementById('mainSafetyBreakdown');
+  if (taskFilterIds) {
+    if (safetyDiv) safetyDiv.innerHTML = '<div style="font-size:.78rem;color:#8b949e;margin-bottom:12px">Main/Safety breakdown hidden while a task-ID filter is active (it reflects the full delivery).</div>';
+  } else {
+    renderMainSafetyBreakdown(total, stats.mainSafety);
+  }
 
   const groupsDiv = document.getElementById('groups');
   groupsDiv.innerHTML = '';
@@ -1746,7 +1839,7 @@ function renderModelReward() {
   summary.innerHTML = `
     <div class="stat blue"><div class="num">${rows.length}</div><div class="label">Total Tasks</div></div>
     <div class="stat green"><div class="num">${fmtPct(claudeAvg)}</div><div class="label">Claude Avg Reward (${claudeScored} tasks)</div></div>
-    <div class="stat green"><div class="num">${fmtPct(geminiAvg)}</div><div class="label">Gemini Avg Reward (${geminiScored} tasks)</div></div>
+    <div class="stat green"><div class="num">${fmtPct(geminiAvg)}</div><div class="label">Gemini/GPT Avg Reward (${geminiScored} tasks)</div></div>
   `;
 
   const body = rows.map(r => `
@@ -1760,7 +1853,7 @@ function renderModelReward() {
 
   table.innerHTML = `
     <table>
-      <thead><tr><th>Task ID</th><th>Claude Pass Rate</th><th>Gemini Pass Rate</th><th>Verifiers</th></tr></thead>
+      <thead><tr><th>Task ID</th><th>Claude Pass Rate</th><th>Gemini/GPT Pass Rate</th><th>Verifiers</th></tr></thead>
       <tbody>${body || '<tr><td colspan="4" style="color:#484f58">No tasks</td></tr>'}</tbody>
     </table>
   `;
@@ -1772,7 +1865,7 @@ function exportModelRewardCsv() {
     return;
   }
   const rows = analysisResult.groups.modelRates;
-  const headers = ['Task ID', 'Claude Pass Rate', 'Gemini Pass Rate', 'Rubrics', 'Unit Tests'];
+  const headers = ['Task ID', 'Claude Pass Rate', 'Gemini/GPT Pass Rate', 'Rubrics', 'Unit Tests'];
   const fmtCsvPct = v => (v === null || v === undefined) ? '' : (v * 100).toFixed(1);
   const csv = [
     headers.map(csvCell).join(','),
@@ -1913,7 +2006,7 @@ function copyId(id) {
 }
 
 function copyAll(key) {
-  const ids = analysisResult.groups[key].map(t => t.id).join('\n');
+  const ids = (viewGroups()[key] || []).map(t => t.id).join('\n');
   navigator.clipboard.writeText(ids);
   const btn = event.target;
   btn.textContent = 'Copied!';
@@ -2538,6 +2631,9 @@ function processFile(file) {
       const lines = raw.split('\n').filter(l => l.trim());
       dropZone.querySelector('p').textContent = `Loaded: ${file.name} — ${lines.length} lines parsed`;
       const result = analyzeJSONL(lines);
+      taskFilterIds = null;
+      const filterInput = document.getElementById('taskFilterInput');
+      if (filterInput) filterInput.value = '';
       renderResults(result);
     } catch(err) {
       console.error('JSONL Checker Error:', err);
