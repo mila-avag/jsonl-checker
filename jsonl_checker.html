@@ -128,6 +128,7 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <button class="tab-btn" id="fixWeightsTab" onclick="showTab('fixWeights')">Fix Test Weights</button>
   <button class="tab-btn" id="validationTab" onclick="showTab('validation')">Run Delivery Validation</button>
   <button class="tab-btn" id="removeTab" onclick="showTab('remove')">Tasks to Remove</button>
+  <button class="tab-btn" id="deltaTrimTab" onclick="showTab('deltaTrim')">Delta Trimmer</button>
 </div>
 
 <div id="results">
@@ -295,6 +296,43 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <div class="redash-results" id="removeTable"></div>
 </div>
 
+<div class="validation-section" id="deltaTrim">
+  <h2>Delta Trimmer (complexity bar)</h2>
+  <p>
+    Computes each task's relative pass-rate gap straight from the <strong>loaded JSONL</strong>:
+    <code>delta_rel = (opus − gemini/gpt) / opus</code>, using the same weighted per-task averages as
+    the Model Pass Rate tab (<code>pass_rate_opus</code> vs <code>pass_rate_gemini31</code>, falling
+    back to <code>pass_rate_gpt</code>). Tasks with <strong><code>delta_rel</code> = 0 are always removed</strong>
+    (they can't be sent); it then drops the next <strong>lowest-delta</strong> tasks (negatives first,
+    then low positives) one at a time <em>only if needed</em> until the kept batch's average
+    <code>delta_rel</code> reaches the complexity bar — keeping as many tasks as possible. Respects the
+    task-ID filter if one is active.
+  </p>
+  <p style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px;font-size:.85rem">
+    <strong>Null deltas</strong> (tasks missing an opus or gemini/gpt average, or with opus = 0) are
+    <em>kept</em> and <strong>flagged for review</strong>, but excluded from the average.
+  </p>
+  <div style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap">
+    <label style="font-size:.85rem;color:#c9d1d9">Complexity bar (min batch avg delta):
+      <input type="number" id="dtThreshold" value="15" min="0" step="0.5" style="width:70px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px;margin-left:6px">%
+    </label>
+    <label style="font-size:.85rem;color:#c9d1d9">Flag low-gap band (0 – X%):
+      <input type="number" id="dtLowGap" value="5" min="0" step="0.5" style="width:70px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px;margin-left:6px">%
+    </label>
+    <button class="redash-btn" onclick="runDeltaTrim()">Trim batch</button>
+    <span id="dtStatus" style="font-size:.8rem;color:#8b949e"></span>
+  </div>
+  <div class="validation-actions" id="dtActions" style="display:none">
+    <button class="copy-btn" onclick="copyDeltaIds(this,'kept')">Copy kept IDs</button>
+    <button class="copy-btn" onclick="copyDeltaIds(this,'discarded')">Copy discarded IDs</button>
+    <button class="copy-btn" onclick="copyDeltaIds(this,'lowgap')">Copy low-gap IDs</button>
+    <button class="copy-btn" onclick="copyDeltaIds(this,'null')">Copy flagged null IDs</button>
+    <button class="copy-btn" onclick="exportDeltaTrimCsv()">Export CSV</button>
+  </div>
+  <div class="stats-bar" id="dtSummary" style="margin-top:14px"></div>
+  <div class="redash-results" id="dtTables"></div>
+</div>
+
 <div class="validation-section" id="deliveryValidation">
   <h2>Run Delivery Validation</h2>
   <p>
@@ -417,21 +455,25 @@ function showTab(tab) {
   const isCsvDeleter = tab === 'csvDeleter';
   const isFixWeights = tab === 'fixWeights';
   const isRemove = tab === 'remove';
+  const isDeltaTrim = tab === 'deltaTrim';
   document.getElementById('checkerTab').classList.toggle('active', isChecker);
   document.getElementById('modelRewardTab').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleterTab').classList.toggle('active', isCsvDeleter);
   document.getElementById('fixWeightsTab').classList.toggle('active', isFixWeights);
   document.getElementById('validationTab').classList.toggle('active', isValidation);
   document.getElementById('removeTab').classList.toggle('active', isRemove);
+  document.getElementById('deltaTrimTab').classList.toggle('active', isDeltaTrim);
   document.getElementById('results').style.display = isChecker ? (analysisResult ? 'block' : 'none') : 'none';
   document.getElementById('deliveryValidation').classList.toggle('active', isValidation);
   document.getElementById('modelReward').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleter').classList.toggle('active', isCsvDeleter);
   document.getElementById('fixWeights').classList.toggle('active', isFixWeights);
   document.getElementById('removeSection').classList.toggle('active', isRemove);
+  document.getElementById('deltaTrim').classList.toggle('active', isDeltaTrim);
   if (isModelReward) renderModelReward();
   if (isCsvDeleter) renderCsvDeleter();
   if (isRemove) renderRemoveTab();
+  if (isDeltaTrim && analysisResult) runDeltaTrim();
 }
 
 function appendValidationLog(message) {
@@ -895,6 +937,139 @@ function downloadText(filename, content) {
   a.href = URL.createObjectURL(blob);
   a.download = filename;
   a.click();
+}
+
+// ---- Delta Trimmer: trim lowest delta_rel until kept batch avg >= complexity bar ----
+let deltaTrimResult = null;
+
+function runDeltaTrim() {
+  const statusEl = document.getElementById('dtStatus');
+  const thrPct = parseFloat(document.getElementById('dtThreshold').value);
+  const threshold = (isNaN(thrPct) ? 15 : thrPct) / 100;
+  const lowGapPct = parseFloat(document.getElementById('dtLowGap').value);
+  const lowGapBand = (isNaN(lowGapPct) ? 5 : lowGapPct) / 100;
+
+  const vg = viewGroups();
+  if (!vg || !vg.modelRates || !vg.modelRates.length) {
+    statusEl.textContent = 'Load a JSONL first (the trimmer reads opus vs gemini/gpt pass rates from it).';
+    deltaTrimResult = null; renderDeltaTrim(); return;
+  }
+
+  // delta_rel = (opus - gemini/gpt) / opus, per task, from the JSONL's weighted averages.
+  const parsed = vg.modelRates.map(t => {
+    const o = t.opusAvg, g = t.geminiAvg;
+    let delta = null;
+    if (o !== null && o !== undefined && o !== 0 && g !== null && g !== undefined) {
+      delta = (o - g) / o;
+    }
+    return { id: t.id, delta, opusAvg: o, geminiAvg: g };
+  }).filter(r => r.id);
+  const nullRows = parsed.filter(r => r.delta === null);
+  const valued = parsed.filter(r => r.delta !== null);
+
+  // Hard rule: delta == 0 can never be sent, so those are ALWAYS removed first.
+  // Only then does the greedy trim drop the next-lowest (negatives, then low
+  // positives) "if needed" to bring the kept batch average up to the bar.
+  const zeroRows = valued.filter(r => r.delta === 0);
+  const trimmable = valued.filter(r => r.delta !== 0).sort((a, b) => b.delta - a.delta);
+
+  // Prefix means (sorted desc) are non-increasing, so the largest prefix whose
+  // mean >= threshold is exactly the greedy "drop the lowest until avg is met" result.
+  let running = 0, bestM = 0, bestSum = 0;
+  for (let i = 0; i < trimmable.length; i++) {
+    running += trimmable[i].delta;
+    if (running / (i + 1) >= threshold) { bestM = i + 1; bestSum = running; }
+  }
+  const keptValued = trimmable.slice(0, bestM);
+  const trimDiscarded = trimmable.slice(bestM);
+
+  const isLowGap = t => t.delta !== null && t.delta > 0 && t.delta <= lowGapBand;
+  [...keptValued, ...trimDiscarded].forEach(t => { t.lowGap = isLowGap(t); });
+  zeroRows.forEach(t => { t.lowGap = false; });
+
+  deltaTrimResult = {
+    threshold, lowGapBand, keptValued, trimDiscarded, zeroRows, nullRows,
+    discarded: [...trimDiscarded, ...zeroRows],
+    lowGap: [...keptValued, ...trimDiscarded].filter(t => t.lowGap),
+    keptAvg: bestM > 0 ? bestSum / bestM : null,
+    origAvg: valued.length ? valued.reduce((s, r) => s + r.delta, 0) / valued.length : null,
+    totalValued: valued.length
+  };
+  statusEl.textContent = '';
+  renderDeltaTrim();
+}
+
+function fmtDeltaPct(v) {
+  return (v === null || v === undefined || isNaN(v)) ? '—' : `${(v * 100).toFixed(2)}%`;
+}
+
+function renderDeltaTrim() {
+  const summary = document.getElementById('dtSummary');
+  const tables = document.getElementById('dtTables');
+  const actions = document.getElementById('dtActions');
+  if (!deltaTrimResult) { summary.innerHTML = ''; tables.innerHTML = ''; actions.style.display = 'none'; return; }
+  const r = deltaTrimResult;
+  const keptTotal = r.keptValued.length + r.nullRows.length;
+  const met = r.keptAvg !== null && r.keptAvg >= r.threshold;
+
+  summary.innerHTML = `
+    <div class="stat green"><div class="num">${keptTotal}</div><div class="label">Kept total (incl. ${r.nullRows.length} null-flagged)</div></div>
+    <div class="stat"><div class="num" style="color:#db6d28">${r.discarded.length}</div><div class="label">Discarded (${r.zeroRows.length} zero + ${r.trimDiscarded.length} trimmed)</div></div>
+    <div class="stat"><div class="num" style="color:${met ? '#3fb950' : '#f85149'}">${fmtDeltaPct(r.keptAvg)}</div><div class="label">Kept batch avg (bar ${fmtDeltaPct(r.threshold)})</div></div>
+    <div class="stat blue"><div class="num">${fmtDeltaPct(r.origAvg)}</div><div class="label">Original avg (all ${r.totalValued} valued)</div></div>
+    <div class="stat" style="${r.zeroRows.length ? '' : 'opacity:.5'}"><div class="num" style="color:#f85149">${r.zeroRows.length}</div><div class="label">✕ Delta = 0 (always removed)</div></div>
+    <div class="stat" style="${r.lowGap.length ? '' : 'opacity:.5'}"><div class="num" style="color:#d29922">${r.lowGap.length}</div><div class="label">⚑ Low gap 0–${fmtDeltaPct(r.lowGapBand)} (review)</div></div>
+    <div class="stat" style="${r.nullRows.length ? '' : 'opacity:.5'}"><div class="num" style="color:#d29922">${r.nullRows.length}</div><div class="label">⚑ Null delta (kept, review)</div></div>
+  `;
+
+  const idCell = id => `<td style="font-family:monospace;color:#58a6ff">${escHtml(id)}</td>`;
+  const lowGapBadge = t => t.lowGap ? ' <span class="badge partial">LOW GAP</span>' : '';
+  const row = (t, badge) => `<tr>${idCell(t.id)}<td>${fmtDeltaPct(t.opusAvg)}</td><td>${fmtDeltaPct(t.geminiAvg)}</td><td>${fmtDeltaPct(t.delta)}</td><td>${badge}${lowGapBadge(t)}</td></tr>`;
+  const keptBody = r.keptValued.map(t => row(t, '<span class="badge complete">KEPT</span>')).join('')
+    + r.nullRows.map(t => row(t, '<span class="badge missing">NULL · REVIEW</span>')).join('');
+  const discBody = r.zeroRows.map(t => row(t, '<span class="badge low">ZERO · CANNOT SEND</span>')).join('')
+    + r.trimDiscarded.map(t => row(t, '<span class="badge low">TRIMMED</span>')).join('');
+  const head = '<thead><tr><th>Task ID</th><th>Opus</th><th>Gemini/GPT</th><th>delta_rel</th><th>Status</th></tr></thead>';
+
+  tables.innerHTML = `
+    <h3 style="margin:18px 0 8px">Kept (${keptTotal})</h3>
+    <table>
+      ${head}
+      <tbody>${keptBody || '<tr><td colspan="5" style="color:#484f58">None</td></tr>'}</tbody>
+    </table>
+    <h3 style="margin:18px 0 8px">Discarded (${r.discarded.length})</h3>
+    <table>
+      ${head}
+      <tbody>${discBody || '<tr><td colspan="5" style="color:#484f58">None</td></tr>'}</tbody>
+    </table>`;
+  actions.style.display = 'flex';
+}
+
+function copyDeltaIds(btn, which) {
+  if (!deltaTrimResult) return;
+  const r = deltaTrimResult;
+  let ids = [], label = btn.textContent;
+  if (which === 'kept') ids = [...r.keptValued.map(t => t.id), ...r.nullRows.map(t => t.id)];
+  else if (which === 'discarded') ids = r.discarded.map(t => t.id);
+  else if (which === 'lowgap') ids = r.lowGap.map(t => t.id);
+  else if (which === 'null') ids = r.nullRows.map(t => t.id);
+  if (!ids.length) { btn.textContent = 'None'; setTimeout(() => { btn.textContent = label; }, 1500); return; }
+  navigator.clipboard.writeText(ids.join('\n'));
+  btn.textContent = `Copied ${ids.length}!`;
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = label; btn.classList.remove('copied'); }, 1500);
+}
+
+function exportDeltaTrimCsv() {
+  if (!deltaTrimResult) return;
+  const r = deltaTrimResult;
+  const num = v => (v === null || v === undefined) ? '' : v;
+  const lines = ['task_id,opus_avg,gemini_gpt_avg,delta_rel,decision,low_gap'];
+  r.keptValued.forEach(t => lines.push(`${csvCell(t.id)},${num(t.opusAvg)},${num(t.geminiAvg)},${num(t.delta)},kept,${t.lowGap ? 'yes' : 'no'}`));
+  r.nullRows.forEach(t => lines.push(`${csvCell(t.id)},${num(t.opusAvg)},${num(t.geminiAvg)},,null_kept_review,no`));
+  r.zeroRows.forEach(t => lines.push(`${csvCell(t.id)},${num(t.opusAvg)},${num(t.geminiAvg)},${num(t.delta)},zero_removed,no`));
+  r.trimDiscarded.forEach(t => lines.push(`${csvCell(t.id)},${num(t.opusAvg)},${num(t.geminiAvg)},${num(t.delta)},discarded,${t.lowGap ? 'yes' : 'no'}`));
+  downloadText(`delta_trim_${new Date().toISOString().slice(0, 10)}.csv`, lines.join('\n'));
 }
 
 function buildValidationSummaryText() {
