@@ -317,6 +317,7 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <p style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px;font-size:.85rem">
     <strong>Null deltas</strong> (tasks missing an opus or gemini/gpt average, or with opus = 0) are
     <em>kept</em> and <strong>flagged for review</strong>, but excluded from the average.
+    Tasks <strong>missing pass@k entirely are excluded</strong> from every count.
   </p>
   <div style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap">
     <label style="font-size:.85rem;color:#c9d1d9">Complexity bar (min batch avg delta):
@@ -1055,15 +1056,22 @@ function runDeltaTrim() {
     deltaTrimResult = null; renderDeltaTrim(); return;
   }
 
+  // Tasks missing pass@k are excluded from the trimmer entirely — they don't
+  // appear in any count (not kept, discarded, zero, null, or low-gap).
+  const missingPKIds = new Set((vg.missingPK || []).map(t => t.id));
+
   // delta_rel = (opus - gemini/gpt) / opus, per task, from the JSONL's weighted averages.
-  const parsed = vg.modelRates.map(t => {
-    const o = t.opusAvg, g = t.geminiAvg;
-    let delta = null;
-    if (o !== null && o !== undefined && o !== 0 && g !== null && g !== undefined) {
-      delta = (o - g) / o;
-    }
-    return { id: t.id, delta, opusAvg: o, geminiAvg: g };
-  }).filter(r => r.id);
+  const parsed = vg.modelRates
+    .filter(t => t.id && !missingPKIds.has(t.id))
+    .map(t => {
+      const o = t.opusAvg, g = t.geminiAvg;
+      let delta = null;
+      if (o !== null && o !== undefined && o !== 0 && g !== null && g !== undefined) {
+        delta = (o - g) / o;
+      }
+      return { id: t.id, delta, opusAvg: o, geminiAvg: g };
+    });
+  const excludedMissingPK = (vg.modelRates || []).filter(t => t.id && missingPKIds.has(t.id)).length;
   const nullRows = parsed.filter(r => r.delta === null);
   const valued = parsed.filter(r => r.delta !== null);
 
@@ -1093,7 +1101,8 @@ function runDeltaTrim() {
     lowGap: [...keptValued, ...trimDiscarded].filter(t => t.lowGap),
     keptAvg: bestM > 0 ? bestSum / bestM : null,
     origAvg: valued.length ? valued.reduce((s, r) => s + r.delta, 0) / valued.length : null,
-    totalValued: valued.length
+    totalValued: valued.length,
+    excludedMissingPK
   };
   statusEl.textContent = '';
   renderDeltaTrim();
@@ -1120,6 +1129,7 @@ function renderDeltaTrim() {
     <div class="stat" style="${r.zeroRows.length ? '' : 'opacity:.5'}"><div class="num" style="color:#f85149">${r.zeroRows.length}</div><div class="label">✕ Delta = 0 (always removed)</div></div>
     <div class="stat" style="${r.lowGap.length ? '' : 'opacity:.5'}"><div class="num" style="color:#d29922">${r.lowGap.length}</div><div class="label">⚑ Low gap 0–${fmtDeltaPct(r.lowGapBand)} (review)</div></div>
     <div class="stat" style="${r.nullRows.length ? '' : 'opacity:.5'}"><div class="num" style="color:#d29922">${r.nullRows.length}</div><div class="label">⚑ Null delta (kept, review)</div></div>
+    <div class="stat" style="${r.excludedMissingPK ? '' : 'opacity:.5'}"><div class="num" style="color:#8b949e">${r.excludedMissingPK}</div><div class="label">Excluded (missing pass@k)</div></div>
   `;
 
   const idCell = id => `<td style="font-family:monospace;color:#58a6ff">${escHtml(id)}</td>`;
