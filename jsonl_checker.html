@@ -194,6 +194,12 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
     task and builds a backfill CSV (<code>task_id</code>, <code>new_rubrics</code>). Original rubric IDs are preserved.
     Tasks whose deletion percentage exceeds the chosen threshold are skipped entirely (left unchanged).
   </p>
+  <p style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px;font-size:.85rem">
+    <strong>Pass-rate safety check:</strong> for each task it recomputes the weighted pass rate
+    (opus and gemini/gpt) with the rubrics removed. Deleting pass@k = 0 rubrics shouldn't lower it —
+    if a deletion <em>would</em> drop the pass rate, the task is <strong>flagged</strong>
+    (<span style="color:#f85149">PASS RATE DROP</span>) so you can review it before backfilling.
+  </p>
   <p style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px">
     <strong>How to get the CSV:</strong> Run the query in the
     <a href="https://dashboard.scale.com/corp/genai-ops-hub/compass/playground?workflow=cmp_2056b4e3317253e056d2132f86dc84bb"
@@ -747,6 +753,7 @@ async function renderValidationResult(apiBase, result, output, status) {
 
 // ---------- Delivery validation breakdown (clean/affected + categories/subcategories + ID lists) ----------
 let lastValidationBreakdown = null;
+let validationSkip = new Set();
 
 function fmtPctNum(part, whole) {
   if (!whole) return '0.0%';
@@ -767,11 +774,15 @@ function computeValidationBreakdown(issues, allIds) {
   const allSet = new Set(allIds);
   const affectedSet = new Set();
   const cats = {}; // pair -> { issues, tasks:Set, subs:{ cat -> {issues, tasks:Set} } }
+  const taskPairs = {}; // tid -> Set of category (pair) names that task has issues in
   for (const it of issues) {
     const tid = it.task_id || '';
     const pair = issuePair(it) || 'Other';
     const cat = issueCat(it) || 'other';
-    if (tid) { affectedSet.add(tid); allSet.add(tid); }
+    if (tid) {
+      affectedSet.add(tid); allSet.add(tid);
+      (taskPairs[tid] || (taskPairs[tid] = new Set())).add(pair);
+    }
     if (!cats[pair]) cats[pair] = { issues: 0, tasks: new Set(), subs: {} };
     cats[pair].issues += 1;
     if (tid) cats[pair].tasks.add(tid);
@@ -782,7 +793,19 @@ function computeValidationBreakdown(issues, allIds) {
   const total = allSet.size;
   const affectedIds = [...affectedSet].sort();
   const cleanIds = [...allSet].filter(id => !affectedSet.has(id)).sort();
-  return { total, affected: affectedIds.length, clean: cleanIds.length, affectedIds, cleanIds, cats, totalIssues: issues.length };
+  return { total, affected: affectedIds.length, clean: cleanIds.length, affectedIds, cleanIds, cats, taskPairs, totalIssues: issues.length };
+}
+
+// Which currently-affected tasks would become clean if the selected categories
+// were ignored (i.e. all of a task's issue categories are in the skip set).
+function computeCleanWithSkips(bd, skipSet) {
+  if (!bd || !skipSet || skipSet.size === 0) return [];
+  return bd.affectedIds.filter(tid => {
+    const pairs = bd.taskPairs[tid];
+    if (!pairs || pairs.size === 0) return false;
+    for (const p of pairs) { if (!skipSet.has(p)) return false; }
+    return true;
+  });
 }
 
 async function renderValidationBreakdown(apiBase, result) {
@@ -806,9 +829,27 @@ async function renderValidationBreakdown(apiBase, result) {
   const bd = computeValidationBreakdown(issues, allIds);
   bd.fileName = currentFileName || 'delivery';
   lastValidationBreakdown = bd;
+  validationSkip = new Set();
+  renderValidationBreakdownView();
+}
+
+// Rebuilds the breakdown DOM from the cached breakdown, honouring the set of
+// skipped categories (validationSkip). Re-run whenever a skip box is toggled.
+function renderValidationBreakdownView() {
+  const container = document.getElementById('validationBreakdown');
+  const bd = lastValidationBreakdown;
+  if (!container || !bd) return;
 
   const catEntries = Object.entries(bd.cats)
     .sort((a, b) => b[1].issues - a[1].issues);
+
+  const cleanWithSkips = computeCleanWithSkips(bd, validationSkip);
+  const cleanWithSkipsSet = new Set(cleanWithSkips);
+  bd.cleanWithSkipsIds = cleanWithSkips;
+  bd.effectiveCleanIds = [...bd.cleanIds, ...cleanWithSkips].sort();
+  const effectiveClean = bd.effectiveCleanIds.length;
+  const stillNotClean = bd.total - effectiveClean;
+  const anySkip = validationSkip.size > 0;
 
   const statsHtml = `
     <div class="stats-bar">
@@ -816,6 +857,24 @@ async function renderValidationBreakdown(apiBase, result) {
       <div class="stat green"><div class="num">${bd.clean}</div><div class="label">Clean — ${fmtPctNum(bd.clean, bd.total)}</div></div>
       <div class="stat red"><div class="num">${bd.affected}</div><div class="label">Not Clean — ${fmtPctNum(bd.affected, bd.total)}</div></div>
       <div class="stat yellow"><div class="num">${bd.totalIssues}</div><div class="label">Total Issues</div></div>
+      <div class="stat" style="${anySkip ? '' : 'opacity:.5'}"><div class="num" style="color:#2ea043">${cleanWithSkips.length}</div><div class="label">Clean With Skips</div></div>
+      <div class="stat" style="${anySkip ? '' : 'opacity:.5'}"><div class="num" style="color:#3fb950">${effectiveClean}</div><div class="label">Effective Clean — ${fmtPctNum(effectiveClean, bd.total)}</div></div>
+    </div>`;
+
+  const skipPanelHtml = `
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <strong style="font-size:.85rem;color:#c9d1d9">Skip categories</strong>
+        <span style="font-size:.78rem;color:#8b949e">A task counts as <em>clean with skips</em> when all of its issues fall only in the checked categories.</span>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap">
+        ${catEntries.map(([pair, info]) => `
+          <label style="display:inline-flex;align-items:center;gap:6px;font-size:.82rem;color:#c9d1d9;cursor:pointer">
+            <input type="checkbox" ${validationSkip.has(pair) ? 'checked' : ''} onchange="toggleValidationSkip('${escHtml(pair)}')">
+            ${escHtml(pair)} <span style="color:#8b949e">(${info.tasks.size})</span>
+          </label>`).join('')}
+        ${anySkip ? `<button class="copy-btn" style="padding:2px 10px" onclick="clearValidationSkips()">Clear skips</button>` : ''}
+      </div>
     </div>`;
 
   const downloadHtml = `
@@ -828,6 +887,7 @@ async function renderValidationBreakdown(apiBase, result) {
     </div>`;
 
   const catGroupsHtml = catEntries.map(([pair, info]) => {
+    const skipped = validationSkip.has(pair);
     const subRows = Object.entries(info.subs)
       .sort((a, b) => b[1].issues - a[1].issues)
       .map(([cat, sub]) => {
@@ -850,14 +910,29 @@ async function renderValidationBreakdown(apiBase, result) {
           </div>`;
       }).join('');
     return `
-      <div class="group">
+      <div class="group" style="${skipped ? 'opacity:.6' : ''}">
         <div class="group-header" onclick="toggleGroup(this)">
-          <h2><span style="color:#58a6ff">●</span> ${escHtml(pair)} <span class="count">${info.issues} issues · ${info.tasks.size} tasks</span></h2>
+          <h2><span style="color:#58a6ff">●</span> ${escHtml(pair)}${skipped ? ' <span class="badge partial">SKIPPED</span>' : ''} <span class="count">${info.issues} issues · ${info.tasks.size} tasks</span></h2>
           <span class="arrow">▶</span>
         </div>
         <div class="group-body">${subRows}</div>
       </div>`;
   }).join('');
+
+  const cleanWithSkipsGroupHtml = anySkip ? `
+    <div class="group">
+      <div class="group-header" onclick="toggleGroup(this)">
+        <h2><span style="color:#2ea043">●</span> Clean with skips <span class="count">${cleanWithSkips.length} · only ${[...validationSkip].map(escHtml).join(', ')}</span></h2>
+        <span class="arrow">▶</span>
+      </div>
+      <div class="group-body">
+        <div class="task-row" style="cursor:default">
+          <button class="copy-btn" style="margin-bottom:8px" onclick="copyValidationCleanWithSkipsIds(this)">Copy clean-with-skips IDs</button>
+          <button class="copy-btn" style="margin-bottom:8px" onclick="copyValidationEffectiveCleanIds(this)">Copy effective-clean IDs (${effectiveClean})</button>
+          <div class="query-box" style="max-height:240px">${cleanWithSkips.length ? escHtml(cleanWithSkips.join('\n')) : '(none — no task has all its issues inside the skipped categories)'}</div>
+        </div>
+      </div>
+    </div>` : '';
 
   const cleanGroupHtml = `
     <div class="group">
@@ -873,23 +948,48 @@ async function renderValidationBreakdown(apiBase, result) {
       </div>
     </div>`;
 
+  const affectedLabel = anySkip ? `${stillNotClean} · ${fmtPctNum(stillNotClean, bd.total)} (after skips)` : `${bd.affected} · ${fmtPctNum(bd.affected, bd.total)}`;
+  const affectedList = anySkip ? bd.affectedIds.filter(id => !cleanWithSkipsSet.has(id)) : bd.affectedIds;
   const affectedGroupHtml = `
     <div class="group">
       <div class="group-header" onclick="toggleGroup(this)">
-        <h2><span style="color:#f85149">●</span> Not-clean tasks <span class="count">${bd.affected} · ${fmtPctNum(bd.affected, bd.total)}</span></h2>
+        <h2><span style="color:#f85149">●</span> Not-clean tasks <span class="count">${affectedLabel}</span></h2>
         <span class="arrow">▶</span>
       </div>
       <div class="group-body">
         <div class="task-row" style="cursor:default">
           <button class="copy-btn" style="margin-bottom:8px" onclick="copyValidationAffectedIds(this)">Copy not-clean IDs</button>
-          <div class="query-box" style="max-height:240px">${bd.affectedIds.length ? escHtml(bd.affectedIds.join('\n')) : '(none)'}</div>
+          <div class="query-box" style="max-height:240px">${affectedList.length ? escHtml(affectedList.join('\n')) : '(none)'}</div>
         </div>
       </div>
     </div>`;
 
-  container.innerHTML = statsHtml + downloadHtml
+  container.innerHTML = statsHtml + skipPanelHtml + downloadHtml
     + `<h3 style="font-size:.95rem;margin:8px 0 10px;color:#f0f6fc">Categories &amp; subcategories</h3>`
-    + catGroupsHtml + cleanGroupHtml + affectedGroupHtml;
+    + catGroupsHtml + cleanWithSkipsGroupHtml + cleanGroupHtml + affectedGroupHtml;
+}
+
+function toggleValidationSkip(pair) {
+  if (validationSkip.has(pair)) validationSkip.delete(pair);
+  else validationSkip.add(pair);
+  renderValidationBreakdownView();
+}
+
+function clearValidationSkips() {
+  validationSkip = new Set();
+  renderValidationBreakdownView();
+}
+
+function copyValidationCleanWithSkipsIds(btn) {
+  if (!lastValidationBreakdown) return;
+  navigator.clipboard.writeText((lastValidationBreakdown.cleanWithSkipsIds || []).join('\n'));
+  flashCopied(btn, 'Copy clean-with-skips IDs');
+}
+
+function copyValidationEffectiveCleanIds(btn) {
+  if (!lastValidationBreakdown) return;
+  navigator.clipboard.writeText((lastValidationBreakdown.effectiveCleanIds || []).join('\n'));
+  flashCopied(btn, btn.textContent);
 }
 
 function toggleValidationExpand(id) {
@@ -2587,13 +2687,48 @@ function getJsonlTaskInfo() {
     const tid = task.task_id || '';
     if (!tid) continue;
     const ri = toItems(task.rubrics);
+    const ti = toItems(task.unit_tests);
     const flagged = ri.filter(([, r]) => isPass0(r) && checkJustification(r).status !== 'complete');
+    // Lookup from a rubric's normalized title to its JSONL item, so the CSV
+    // deleter can find each deleted rubric's pass rates.
+    const rubricByNorm = {};
+    ri.forEach(([name, r]) => {
+      const nt = normTitle(r.criterion || r.title || r.name || name);
+      if (nt && !(nt in rubricByNorm)) rubricByNorm[nt] = r;
+    });
     map[tid] = {
       flagged: flagged.map(([name, r]) => normTitle(r.criterion || r.title || r.name || name)).filter(Boolean),
-      testCount: toItems(task.unit_tests).length
+      testCount: ti.length,
+      allItems: [...ri, ...ti],
+      rubricByNorm
     };
   }
   return map;
+}
+
+// Maps the CSV rubrics slated for deletion back to their JSONL items and checks
+// whether removing them lowers the task's weighted pass rate for either model.
+// Returns null when there's nothing to check (no deletions or no JSONL data).
+function computePassRateDrop(info, deleted) {
+  if (!info || !info.allItems || !deleted || deleted.length === 0) return null;
+  const deletedItems = new Set();
+  let matched = 0;
+  for (const rb of deleted) {
+    const nt = normTitle(rb.title || rb.criterion || rb.name || '');
+    const jr = nt ? info.rubricByNorm[nt] : null;
+    if (jr) { deletedItems.add(jr); matched++; }
+  }
+  if (deletedItems.size === 0) return null;
+  const remaining = info.allItems.filter(([, it]) => !deletedItems.has(it));
+  const check = key => {
+    const before = averageModelPassRate(info.allItems, key);
+    const after = averageModelPassRate(remaining, key);
+    const drop = (before !== null && after !== null && after < before - 1e-9);
+    return { before, after, drop };
+  };
+  const opus = check('pass_rate_opus');
+  const gemini = check(GEMINI_PASS_RATE_KEYS);
+  return { opus, gemini, dropped: opus.drop || gemini.drop, matched };
 }
 
 function computeBackfill(threshold, minVerifiers) {
@@ -2631,11 +2766,18 @@ function computeBackfill(threshold, minVerifiers) {
     const overThreshold = delPct > threshold;
     const belowMinVerifiers = delCount > 0 && minVerifiers > 0 && remainingVerifiers < minVerifiers;
     const skipReason = overThreshold ? 'pct' : (belowMinVerifiers ? 'verifiers' : '');
+
+    // Safety check: does removing these rubrics drop the task's weighted pass
+    // rate for either model? (It shouldn't for pass@k=0 rubrics — a drop means
+    // we're about to delete something that was actually contributing.)
+    const passDrop = computePassRateDrop(info, deleted);
+
     results.push({
       tid, total, delCount, delPct, testCount, remainingVerifiers,
       skipped: overThreshold || belowMinVerifiers, skipReason, inJsonl,
       flaggedCount: flaggedNorms.size,
       unmatched: Math.max(0, flaggedNorms.size - delCount),
+      passDrop,
       kept
     });
   }
@@ -2678,6 +2820,7 @@ function renderCsvDeleter() {
   const notInJsonl = results.filter(r => !r.inJsonl).length;
   const totalDeleted = processed.reduce((s, r) => s + r.delCount, 0);
   const totalUnmatched = results.reduce((s, r) => s + r.unmatched, 0);
+  const passDropTasks = results.filter(r => r.delCount > 0 && r.passDrop && r.passDrop.dropped);
 
   status.innerHTML = `<span style="color:#3fb950">Loaded ${escHtml(csvFileName)} — ${totalTasks} tasks.</span> `
     + `Skip if deleted % &gt; ${threshold}%${minVerifiers > 0 ? ` or remaining verifiers &lt; ${minVerifiers}` : ''}.`;
@@ -2691,7 +2834,11 @@ function renderCsvDeleter() {
     <div class="stat yellow"><div class="num">${totalDeleted}</div><div class="label">Rubrics Deleted</div></div>
     <div class="stat" style="${notInJsonl ? '' : 'opacity:.5'}"><div class="num" style="color:#a371f7">${notInJsonl}</div><div class="label">CSV Tasks Not In JSONL</div></div>
     <div class="stat" style="${totalUnmatched ? '' : 'opacity:.5'}"><div class="num" style="color:#db6d28">${totalUnmatched}</div><div class="label">Flagged Rubrics Unmatched</div></div>
+    <div class="stat" style="${passDropTasks.length ? '' : 'opacity:.5'}"><div class="num" style="color:#f85149">${passDropTasks.length}</div><div class="label">⚠ Pass Rate Would Drop</div></div>
   `;
+  if (passDropTasks.length) {
+    status.innerHTML += ` <span style="color:#f85149">⚠ ${passDropTasks.length} task(s) would lose pass rate if deleted — flagged below.</span>`;
+  }
 
   const shown = results.filter(r => r.delCount > 0 || !r.inJsonl);
   const body = shown.map(r => {
@@ -2703,24 +2850,51 @@ function renderCsvDeleter() {
     const jsonlTag = r.inJsonl ? '' : ` <span class="badge low">not in jsonl</span>`;
     const unmatchedTag = r.unmatched > 0 ? ` <span class="badge partial">${r.unmatched} unmatched</span>` : '';
     const verColor = (minVerifiers > 0 && r.remainingVerifiers < minVerifiers && r.delCount > 0) ? '#f85149' : '#c9d1d9';
-    return `<tr>
+    const pd = r.passDrop;
+    const passCell = fmtPassDrop(pd);
+    const dropTag = (pd && pd.dropped) ? ` <span class="badge missing">PASS RATE DROP</span>` : '';
+    return `<tr${(pd && pd.dropped) ? ' style="background:rgba(248,81,73,.08)"' : ''}>
       <td style="font-family:monospace;color:#58a6ff">${escHtml(r.tid)}${jsonlTag}</td>
       <td>${r.total}</td>
       <td>${r.delCount}</td>
       <td>${r.total - r.delCount}</td>
       <td style="color:${r.skipReason === 'pct' ? '#f85149' : '#c9d1d9'}">${r.delPct.toFixed(1)}%</td>
       <td style="color:${verColor}">${r.remainingVerifiers}<span style="color:#484f58;font-size:.75rem"> (${r.total - r.delCount}R+${r.testCount}T)</span></td>
-      <td>${statusTag}${unmatchedTag}</td>
+      <td>${passCell}</td>
+      <td>${statusTag}${unmatchedTag}${dropTag}</td>
     </tr>`;
   }).join('');
 
   table.innerHTML = `
+    ${passDropTasks.length ? `<div class="validation-actions"><button class="copy-btn" onclick="copyPassDropIds(this)">Copy pass-drop IDs</button></div>` : ''}
     <table>
-      <thead><tr><th>Task ID</th><th>Total Rubrics</th><th>Deleted</th><th>Remaining Rubrics</th><th>Deleted %</th><th>Remaining Verifiers</th><th>Status</th></tr></thead>
-      <tbody>${body || '<tr><td colspan="7" style="color:#484f58">No tasks with deletions</td></tr>'}</tbody>
+      <thead><tr><th>Task ID</th><th>Total Rubrics</th><th>Deleted</th><th>Remaining Rubrics</th><th>Deleted %</th><th>Remaining Verifiers</th><th>Pass Rate (before→after)</th><th>Status</th></tr></thead>
+      <tbody>${body || '<tr><td colspan="8" style="color:#484f58">No tasks with deletions</td></tr>'}</tbody>
     </table>`;
 
   exportBtn.disabled = processed.length === 0;
+}
+
+// Renders "opus a%→b%, gem c%→d%" for a task's pass-rate safety check, colouring
+// any model whose rate would drop.
+function fmtPassDrop(pd) {
+  if (!pd) return '<span style="color:#484f58">—</span>';
+  const one = (label, m) => {
+    if (!m || m.before === null || m.after === null) return `<span style="color:#484f58">${label} —</span>`;
+    const col = m.drop ? '#f85149' : '#3fb950';
+    return `<span style="color:${col}">${label} ${(m.before * 100).toFixed(0)}→${(m.after * 100).toFixed(0)}%</span>`;
+  };
+  return `<span style="font-size:.75rem">${one('opus', pd.opus)}<br>${one('gem', pd.gemini)}</span>`;
+}
+
+function copyPassDropIds(btn) {
+  if (!csvBackfillResults) return;
+  const ids = csvBackfillResults.filter(r => r.delCount > 0 && r.passDrop && r.passDrop.dropped).map(r => r.tid);
+  if (!ids.length) { btn.textContent = 'None'; setTimeout(() => { btn.textContent = 'Copy pass-drop IDs'; }, 1500); return; }
+  navigator.clipboard.writeText(ids.join('\n'));
+  btn.textContent = `Copied ${ids.length}!`;
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'Copy pass-drop IDs'; btn.classList.remove('copied'); }, 1500);
 }
 
 function exportBackfillCsv() {
