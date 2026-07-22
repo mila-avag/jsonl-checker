@@ -766,7 +766,12 @@ async function renderValidationResult(apiBase, result, output, status) {
 
 // ---------- Delivery validation breakdown (clean/affected + categories/subcategories + ID lists) ----------
 let lastValidationBreakdown = null;
-let validationSkip = new Set();
+let validationSkip = new Set();        // skipped whole categories (pair)
+let validationSkipSubs = new Set();     // skipped subcategories ("pair\u0001cat")
+
+// Key for a subcategory skip. Uses a non-printable separator so it can't
+// collide with characters in category/subcategory names.
+function subSkipKey(pair, cat) { return `${pair}\u0001${cat}`; }
 
 function fmtPctNum(part, whole) {
   if (!whole) return '0.0%';
@@ -788,6 +793,7 @@ function computeValidationBreakdown(issues, allIds) {
   const affectedSet = new Set();
   const cats = {}; // pair -> { issues, tasks:Set, subs:{ cat -> {issues, tasks:Set} } }
   const taskPairs = {}; // tid -> Set of category (pair) names that task has issues in
+  const taskSubs = {};  // tid -> Set of "pair\u0001cat" subcategory keys
   for (const it of issues) {
     const tid = it.task_id || '';
     const pair = issuePair(it) || 'Other';
@@ -795,6 +801,7 @@ function computeValidationBreakdown(issues, allIds) {
     if (tid) {
       affectedSet.add(tid); allSet.add(tid);
       (taskPairs[tid] || (taskPairs[tid] = new Set())).add(pair);
+      (taskSubs[tid] || (taskSubs[tid] = new Set())).add(subSkipKey(pair, cat));
     }
     if (!cats[pair]) cats[pair] = { issues: 0, tasks: new Set(), subs: {} };
     cats[pair].issues += 1;
@@ -806,17 +813,26 @@ function computeValidationBreakdown(issues, allIds) {
   const total = allSet.size;
   const affectedIds = [...affectedSet].sort();
   const cleanIds = [...allSet].filter(id => !affectedSet.has(id)).sort();
-  return { total, affected: affectedIds.length, clean: cleanIds.length, affectedIds, cleanIds, cats, taskPairs, totalIssues: issues.length };
+  return { total, affected: affectedIds.length, clean: cleanIds.length, affectedIds, cleanIds, cats, taskPairs, taskSubs, totalIssues: issues.length };
 }
 
 // Which currently-affected tasks would become clean if the selected categories
-// were ignored (i.e. all of a task's issue categories are in the skip set).
-function computeCleanWithSkips(bd, skipSet) {
-  if (!bd || !skipSet || skipSet.size === 0) return [];
+// AND subcategories were ignored. A task qualifies when EVERY subcategory it has
+// an issue in is covered — either its whole category is skipped, or that specific
+// subcategory is skipped.
+function computeCleanWithSkips(bd, skipPairs, skipSubs) {
+  const hasPairs = skipPairs && skipPairs.size > 0;
+  const hasSubs = skipSubs && skipSubs.size > 0;
+  if (!bd || (!hasPairs && !hasSubs)) return [];
   return bd.affectedIds.filter(tid => {
-    const pairs = bd.taskPairs[tid];
-    if (!pairs || pairs.size === 0) return false;
-    for (const p of pairs) { if (!skipSet.has(p)) return false; }
+    const subs = bd.taskSubs[tid];
+    if (!subs || subs.size === 0) return false;
+    for (const key of subs) {
+      const pair = key.split('\u0001')[0];
+      if (hasPairs && skipPairs.has(pair)) continue;   // whole category skipped
+      if (hasSubs && skipSubs.has(key)) continue;      // this subcategory skipped
+      return false;                                     // uncovered issue
+    }
     return true;
   });
 }
@@ -845,11 +861,13 @@ async function renderValidationBreakdown(apiBase, result) {
   bd.allIds = allIds;
   lastValidationBreakdown = bd;
   validationSkip = new Set();
+  validationSkipSubs = new Set();
   renderValidationBreakdownView();
 }
 
-// Rebuilds the breakdown DOM from the cached breakdown, honouring the set of
-// skipped categories (validationSkip). Re-run whenever a skip box is toggled.
+// Rebuilds the breakdown DOM from the cached breakdown, honouring the skipped
+// categories (validationSkip) and subcategories (validationSkipSubs). Re-run
+// whenever a skip box is toggled.
 function renderValidationBreakdownView() {
   const container = document.getElementById('validationBreakdown');
   const bd = lastValidationBreakdown;
@@ -858,13 +876,13 @@ function renderValidationBreakdownView() {
   const catEntries = Object.entries(bd.cats)
     .sort((a, b) => b[1].issues - a[1].issues);
 
-  const cleanWithSkips = computeCleanWithSkips(bd, validationSkip);
+  const cleanWithSkips = computeCleanWithSkips(bd, validationSkip, validationSkipSubs);
   const cleanWithSkipsSet = new Set(cleanWithSkips);
   bd.cleanWithSkipsIds = cleanWithSkips;
   bd.effectiveCleanIds = [...bd.cleanIds, ...cleanWithSkips].sort();
   const effectiveClean = bd.effectiveCleanIds.length;
   const stillNotClean = bd.total - effectiveClean;
-  const anySkip = validationSkip.size > 0;
+  const anySkip = validationSkip.size > 0 || validationSkipSubs.size > 0;
 
   const statsHtml = `
     <div class="stats-bar">
@@ -876,13 +894,42 @@ function renderValidationBreakdownView() {
       <div class="stat" style="${anySkip ? '' : 'opacity:.5'}"><div class="num" style="color:#3fb950">${effectiveClean}</div><div class="label">Effective Clean — ${fmtPctNum(effectiveClean, bd.total)}</div></div>
     </div>`;
 
+  const subSkipCount = validationSkipSubs.size;
+  const subDropdownHtml = catEntries.map(([pair, info]) => {
+    const pairSkipped = validationSkip.has(pair);
+    const subItems = Object.entries(info.subs)
+      .sort((a, b) => b[1].issues - a[1].issues)
+      .map(([cat, sub]) => {
+        const key = subSkipKey(pair, cat);
+        const checked = pairSkipped || validationSkipSubs.has(key);
+        return `
+          <label style="display:inline-flex;align-items:center;gap:6px;font-size:.8rem;color:${pairSkipped ? '#6e7681' : '#c9d1d9'};cursor:${pairSkipped ? 'not-allowed' : 'pointer'}">
+            <input type="checkbox" ${checked ? 'checked' : ''} ${pairSkipped ? 'disabled' : ''}
+                   onchange="toggleValidationSkipSub('${escHtml(pair)}', '${escHtml(cat)}')">
+            ${escHtml(cat)} <span style="color:#8b949e">(${sub.tasks.size})</span>
+          </label>`;
+      }).join('');
+    return `
+      <div style="margin:6px 0 10px">
+        <div style="font-size:.78rem;font-weight:600;color:#58a6ff;margin-bottom:4px">
+          ${escHtml(pair)}${pairSkipped ? ' <span style="color:#8b949e;font-weight:400">— whole category skipped</span>' : ''}
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;padding-left:6px">${subItems}</div>
+      </div>`;
+  }).join('');
+
+  const skipSummaryBits = [];
+  if (validationSkip.size) skipSummaryBits.push(`${validationSkip.size} categor${validationSkip.size === 1 ? 'y' : 'ies'}`);
+  if (subSkipCount) skipSummaryBits.push(`${subSkipCount} subcategor${subSkipCount === 1 ? 'y' : 'ies'}`);
+  const skipSummary = skipSummaryBits.length ? ` — skipping ${skipSummaryBits.join(' + ')}` : '';
+
   const skipPanelHtml = `
     <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-bottom:12px">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
         <strong style="font-size:.85rem;color:#c9d1d9">Skip categories</strong>
-        <span style="font-size:.78rem;color:#8b949e">A task counts as <em>clean with skips</em> when all of its issues fall only in the checked categories.</span>
+        <span style="font-size:.78rem;color:#8b949e">A task counts as <em>clean with skips</em> when every one of its issues falls in a skipped category or subcategory.</span>
       </div>
-      <div style="display:flex;gap:14px;flex-wrap:wrap">
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
         ${catEntries.map(([pair, info]) => `
           <label style="display:inline-flex;align-items:center;gap:6px;font-size:.82rem;color:#c9d1d9;cursor:pointer">
             <input type="checkbox" ${validationSkip.has(pair) ? 'checked' : ''} onchange="toggleValidationSkip('${escHtml(pair)}')">
@@ -890,6 +937,15 @@ function renderValidationBreakdownView() {
           </label>`).join('')}
         ${anySkip ? `<button class="copy-btn" style="padding:2px 10px" onclick="clearValidationSkips()">Clear skips</button>` : ''}
       </div>
+      <details style="margin-top:10px" ${subSkipCount ? 'open' : ''}>
+        <summary style="cursor:pointer;font-size:.82rem;color:#c9d1d9;user-select:none">
+          Skip specific subcategories${subSkipCount ? ` <span style="color:#2ea043">(${subSkipCount} selected)</span>` : ''}
+        </summary>
+        <div style="margin-top:8px;border-top:1px solid #21262d;padding-top:8px;max-height:260px;overflow:auto">
+          ${subDropdownHtml}
+        </div>
+      </details>
+      ${skipSummary ? `<div style="font-size:.76rem;color:#8b949e;margin-top:8px">${escHtml(skipSummary.trim())}</div>` : ''}
     </div>`;
 
   const downloadHtml = `
@@ -910,12 +966,19 @@ function renderValidationBreakdownView() {
         const ids = [...sub.tasks].sort();
         const safe = `${pair}__${cat}`.replace(/[^A-Za-z0-9_]/g, '_');
         const expandId = `vbd_${safe}`;
+        const subKey = subSkipKey(pair, cat);
+        const subSkipped = skipped || validationSkipSubs.has(subKey);
         return `
-          <div class="task-row" style="cursor:default">
+          <div class="task-row" style="cursor:default${subSkipped ? ';opacity:.55' : ''}">
             <div class="task-row-header">
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <label title="Skip this subcategory" style="display:inline-flex;align-items:center;cursor:${skipped ? 'not-allowed' : 'pointer'}">
+                  <input type="checkbox" ${subSkipped ? 'checked' : ''} ${skipped ? 'disabled' : ''}
+                         onchange="toggleValidationSkipSub('${escHtml(pair)}', '${escHtml(cat)}')">
+                </label>
                 <span style="color:#484f58;cursor:pointer;font-size:.7rem" onclick="toggleValidationExpand('${expandId}')">▶</span>
                 <span style="color:#c9d1d9;font-weight:600;cursor:pointer" onclick="toggleValidationExpand('${expandId}')">${escHtml(cat)}</span>
+                ${subSkipped ? '<span class="badge partial">SKIPPED</span>' : ''}
                 <span class="task-detail">— ${sub.issues} issue${sub.issues === 1 ? '' : 's'}, ${sub.tasks.size} task${sub.tasks.size === 1 ? '' : 's'}</span>
                 <button class="copy-btn" style="padding:2px 8px" onclick="copyValidationIds(this, '${pair}', '${cat}')">Copy IDs</button>
               </div>
@@ -935,10 +998,16 @@ function renderValidationBreakdownView() {
       </div>`;
   }).join('');
 
+  const skipLabel = [
+    ...[...validationSkip],
+    ...[...validationSkipSubs]
+      .filter(k => !validationSkip.has(k.split('\u0001')[0]))
+      .map(k => { const [p, c] = k.split('\u0001'); return `${p}/${c}`; }),
+  ].map(escHtml).join(', ');
   const cleanWithSkipsGroupHtml = anySkip ? `
     <div class="group">
       <div class="group-header" onclick="toggleGroup(this)">
-        <h2><span style="color:#2ea043">●</span> Clean with skips <span class="count">${cleanWithSkips.length} · only ${[...validationSkip].map(escHtml).join(', ')}</span></h2>
+        <h2><span style="color:#2ea043">●</span> Clean with skips <span class="count">${cleanWithSkips.length} · only ${skipLabel}</span></h2>
         <span class="arrow">▶</span>
       </div>
       <div class="group-body">
@@ -991,8 +1060,18 @@ function toggleValidationSkip(pair) {
   renderValidationBreakdownView();
 }
 
+function toggleValidationSkipSub(pair, cat) {
+  // Skipping the whole category overrides subcategory selections.
+  if (validationSkip.has(pair)) return;
+  const key = subSkipKey(pair, cat);
+  if (validationSkipSubs.has(key)) validationSkipSubs.delete(key);
+  else validationSkipSubs.add(key);
+  renderValidationBreakdownView();
+}
+
 function clearValidationSkips() {
   validationSkip = new Set();
+  validationSkipSubs = new Set();
   renderValidationBreakdownView();
 }
 
@@ -1328,6 +1407,7 @@ async function loadSavedValidationReport(file) {
   bd.allIds = taskIds;
   lastValidationBreakdown = bd;
   validationSkip = new Set();
+  validationSkipSubs = new Set();
 
   const output = document.getElementById('validationOutput');
   if (output) {
