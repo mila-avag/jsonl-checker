@@ -54,7 +54,20 @@ from pathlib import Path
 
 csv.field_size_limit(50_000_000)
 
-PASS_RATE_FIELDS = ["pass_rate_opus", "pass_rate_gemini31"]
+OPUS_FIELD = "pass_rate_opus"
+# The "second model" pass rate is reported as gemini31 on some deliveries and
+# gpt on others. Either satisfies the requirement.
+SECOND_MODEL_FIELDS = ["pass_rate_gemini31", "pass_rate_gpt"]
+# Full set used by range/comparison checks (they no-op on absent fields).
+PASS_RATE_FIELDS = ["pass_rate_opus", "pass_rate_gemini31", "pass_rate_gpt"]
+
+
+def second_model_pass_rate(item):
+    """Return the second-model pass rate (gemini31 preferred, else gpt), or None."""
+    for field in SECOND_MODEL_FIELDS:
+        if item.get(field) is not None:
+            return item.get(field)
+    return None
 
 ALL_JUSTIFICATION_FIELDS = [
     "why_rubric_is_correct",
@@ -126,7 +139,7 @@ def has_delivery_pass_rate(items):
     for item in items:
         if not isinstance(item, dict):
             continue
-        if "pass_rate_opus" in item or "pass_rate_gemini31" in item:
+        if "pass_rate_opus" in item or any(f in item for f in SECOND_MODEL_FIELDS):
             return True
     return False
 
@@ -186,7 +199,7 @@ def has_justification(item):
 def is_pass0(item):
     """Check if both opus and gemini pass rates are 0 (or gemini missing with opus=0)."""
     pr_o = item.get("pass_rate_opus")
-    pr_g = item.get("pass_rate_gemini31")
+    pr_g = second_model_pass_rate(item)
     try:
         pr_o = float(pr_o) if pr_o is not None else None
     except (ValueError, TypeError):
@@ -333,7 +346,13 @@ def run_checks(tasks, base_dir, expected_runs=8):
         issues.append({"task_id": tid, "pair": pair, "cat": cat, "detail": detail})
 
     def missing_pass_rate_fields(item):
-        return [field for field in PASS_RATE_FIELDS if field not in item or item.get(field) is None]
+        missing = []
+        if item.get(OPUS_FIELD) is None:
+            missing.append(OPUS_FIELD)
+        # The second model may be reported as gemini31 OR gpt — either is fine.
+        if second_model_pass_rate(item) is None:
+            missing.append("/".join(SECOND_MODEL_FIELDS))
+        return missing
 
     for tid in sorted(tasks.keys()):
         t = tasks[tid]
