@@ -44,6 +44,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
+import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -203,46 +207,91 @@ def is_pass0(item):
 
 # ── download ─────────────────────────────────────────────────────────
 
+_DL_HEADERS = {"User-Agent": "jsonl-checker-validator/2.0"}
+_SKIP_EXT = (".pyc", ".pyo")
+_COPY_CHUNK = 1024 * 256
+
+
+def _http_download(url, dest_path, timeout=120, retries=2):
+    """Stream a URL to disk with retries. Returns None on success, else an
+    error string. Pure stdlib (urllib) — no curl subprocess, so it scales to
+    high worker counts without hitting the OS process limit."""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=_DL_HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = getattr(resp, "status", 200) or 200
+                if code != 200:
+                    last = f"HTTP {code}"
+                else:
+                    with open(dest_path, "wb") as f:
+                        shutil.copyfileobj(resp, f, length=_COPY_CHUNK)
+                    return None
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            last = f"NET {getattr(e, 'reason', e)}"
+        if attempt < retries:
+            time.sleep(0.5 * (attempt + 1))
+    return last or "DOWNLOAD_FAILED"
+
+
+def _extract_tests(zip_path, dest_dir):
+    """Extract ONLY the delivery's tests/ folder (the one containing
+    rubric.json or test_weights.json) from the env zip, skipping caches.
+    Avoids unpacking the whole ~18 MB environment to disk. Returns True if a
+    tests/ folder was found."""
+    with zipfile.ZipFile(zip_path) as z:
+        marker = None
+        for n in z.namelist():
+            base = n.rsplit("/", 1)[-1]
+            if base in ("rubric.json", "test_weights.json") and n.endswith("tests/" + base):
+                marker = n
+                break
+        if marker is None:
+            return False
+        prefix = marker[: marker.rindex("tests/") + len("tests/")]
+        os.makedirs(dest_dir, exist_ok=True)
+        for info in z.infolist():
+            n = info.filename
+            if not n.startswith(prefix) or n.endswith("/"):
+                continue
+            if n.endswith(_SKIP_EXT) or "/__pycache__/" in n or n.endswith("/__pycache__"):
+                continue
+            rel = n[len(prefix):]
+            if not rel:
+                continue
+            target = os.path.join(dest_dir, rel)
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with z.open(info) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out, length=_COPY_CHUNK)
+        return True
+
+
 def download_env(tid, url, base_dir):
     td = os.path.join(base_dir, tid)
     os.makedirs(td, exist_ok=True)
     zp = os.path.join(td, "dl.zip")
+
+    err = _http_download(url, zp)
+    if err:
+        if os.path.exists(zp):
+            os.remove(zp)
+        return tid, err
+
+    dest = os.path.join(td, "tests")
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
     try:
-        r = subprocess.run(
-            ["curl", "-sS", "-o", zp, "-w", "%{http_code}", url],
-            capture_output=True, text=True, timeout=120,
-        )
-        if r.stdout.strip() != "200":
-            return tid, f"HTTP {r.stdout.strip()}"
-    except subprocess.TimeoutExpired:
-        return tid, "TIMEOUT"
-
-    extract_dir = os.path.join(td, "_raw")
-    try:
-        subprocess.run(
-            ["unzip", "-o", "-q", zp, "-d", extract_dir],
-            capture_output=True, text=True, timeout=300, errors="replace",
-        )
-    except subprocess.TimeoutExpired:
-        return tid, "UNZIP_TIMEOUT"
-
-    tests_dir = None
-    for root, dirs, files in os.walk(extract_dir):
-        if os.path.basename(root) == "tests" and (
-            "rubric.json" in files or "test_weights.json" in files
-        ):
-            tests_dir = root
-            break
-
-    if tests_dir:
-        dest = os.path.join(td, "tests")
-        if os.path.exists(dest):
-            shutil.rmtree(dest)
-        shutil.copytree(tests_dir, dest)
-
-    shutil.rmtree(extract_dir, ignore_errors=True)
-    if os.path.exists(zp):
-        os.remove(zp)
+        _extract_tests(zp, dest)
+    except zipfile.BadZipFile:
+        return tid, "BAD_ZIP"
+    finally:
+        if os.path.exists(zp):
+            os.remove(zp)
     return tid, "OK"
 
 
@@ -1149,20 +1198,52 @@ def main():
             if url:
                 links[tid] = url
 
-        print(f"Downloading {len(links)} environments...")
+        # Dedup by URL: download each unique env once, reuse it for any other
+        # tasks that point at the same URL (symlink the extracted tests folder).
+        url_owner = {}
+        to_download = {}
+        shared = []
+        for tid, url in links.items():
+            if url in url_owner:
+                shared.append((tid, url_owner[url]))
+            else:
+                url_owner[url] = tid
+                to_download[tid] = url
+
+        msg = f"Downloading {len(to_download)} environments"
+        if shared:
+            msg += f" ({len(links)} tasks, {len(shared)} share an env)"
+        print(msg + "...")
         done = 0
         errors = []
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(download_env, t, u, base_dir): t for t, u in links.items()}
+            futs = {ex.submit(download_env, t, u, base_dir): t for t, u in to_download.items()}
             for fut in as_completed(futs):
                 done += 1
                 tid, st = fut.result()
                 if st != "OK":
                     errors.append((tid, st))
-                if done % 50 == 0 or done == len(links):
-                    print(f"  [{done}/{len(links)}]")
+                if done % 50 == 0 or done == len(to_download):
+                    print(f"  [{done}/{len(to_download)}]")
 
-        print(f"Downloads: {len(links) - len(errors)} OK, {len(errors)} errors")
+        # Fan the shared envs back out to their duplicate task IDs.
+        for tid, owner in shared:
+            src = os.path.join(base_dir, owner, "tests")
+            if not os.path.isdir(src):
+                continue
+            dst_dir = os.path.join(base_dir, tid)
+            os.makedirs(dst_dir, exist_ok=True)
+            dst = os.path.join(dst_dir, "tests")
+            if os.path.exists(dst) or os.path.islink(dst):
+                continue
+            try:
+                os.symlink(os.path.abspath(src), dst, target_is_directory=True)
+            except OSError:
+                shutil.copytree(src, dst)
+
+        ok = len(to_download) - len(errors)
+        print(f"Downloads: {ok} OK, {len(errors)} errors" +
+              (f", {len(shared)} reused" if shared else ""))
         if errors:
             for tid, err in errors[:10]:
                 print(f"  FAIL: {tid} — {err}")

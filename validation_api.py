@@ -33,7 +33,11 @@ ROOT = Path(__file__).resolve().parent
 VALIDATOR = ROOT / "validation" / "validate_delivery.py"
 JOB_ROOT = Path(os.environ.get("VALIDATION_JOB_ROOT", "/tmp/jsonl_checker_validation_jobs"))
 MAX_WORKERS = int(os.environ.get("VALIDATION_API_MAX_JOBS", "2"))
-DEFAULT_VALIDATION_WORKERS = int(os.environ.get("VALIDATION_WORKERS", "10"))
+DEFAULT_VALIDATION_WORKERS = int(os.environ.get("VALIDATION_WORKERS", "16"))
+# Hard ceiling on download parallelism per job. The validator now downloads
+# with pure-Python urllib (no curl/unzip subprocess per file), so it scales
+# well past the old 32 cap. Tune via VALIDATION_MAX_WORKERS on the host.
+MAX_VALIDATION_WORKERS = int(os.environ.get("VALIDATION_MAX_WORKERS", "96"))
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get(
@@ -60,12 +64,12 @@ jobs_lock = Lock()
 class ValidationRequest(BaseModel):
     fileName: str = Field(default="delivery.jsonl")
     content: str
-    workers: int = Field(default=DEFAULT_VALIDATION_WORKERS, ge=1, le=32)
+    workers: int = Field(default=DEFAULT_VALIDATION_WORKERS, ge=1, le=MAX_VALIDATION_WORKERS)
 
 
 class UploadInitRequest(BaseModel):
     fileName: str = Field(default="delivery.jsonl")
-    workers: int = Field(default=DEFAULT_VALIDATION_WORKERS, ge=1, le=32)
+    workers: int = Field(default=DEFAULT_VALIDATION_WORKERS, ge=1, le=MAX_VALIDATION_WORKERS)
     totalChunks: int = Field(ge=1, le=200)
     encoding: str = Field(default="gzip")
 
@@ -281,13 +285,14 @@ def healthz() -> dict[str, str]:
 
 @app.get("/readyz")
 def readyz() -> dict[str, Any]:
-    deps = {name: shutil.which(name) for name in ("curl", "unzip")}
-    missing = [name for name, path in deps.items() if not path]
+    # curl/unzip are no longer required — the validator downloads and extracts
+    # with pure-Python stdlib (urllib + zipfile). Reported here for info only.
+    optional = {name: shutil.which(name) for name in ("curl", "unzip")}
     return {
-        "status": "ok" if not missing else "missing_dependencies",
-        "dependencies": deps,
-        "missing": missing,
+        "status": "ok" if VALIDATOR.exists() else "validator_missing",
+        "optional_tools": optional,
         "validator_exists": VALIDATOR.exists(),
+        "max_workers": MAX_VALIDATION_WORKERS,
     }
 
 
@@ -314,7 +319,7 @@ async def create_validation_upload(
     except UnicodeDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"Payload is not UTF-8: {exc}") from exc
     file_name = urllib.parse.unquote(x_file_name or "delivery.jsonl")
-    workers = max(1, min(int(x_workers or DEFAULT_VALIDATION_WORKERS), 32))
+    workers = max(1, min(int(x_workers or DEFAULT_VALIDATION_WORKERS), MAX_VALIDATION_WORKERS))
     return enqueue_validation(file_name, content, workers)
 
 
@@ -328,7 +333,7 @@ def init_chunked_validation(req: UploadInitRequest) -> dict[str, Any]:
         json.dumps(
             {
                 "file_name": req.fileName,
-                "workers": max(1, min(req.workers, 32)),
+                "workers": max(1, min(req.workers, MAX_VALIDATION_WORKERS)),
                 "total_chunks": req.totalChunks,
                 "encoding": req.encoding,
                 "created_at": time.time(),
