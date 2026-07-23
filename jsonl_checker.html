@@ -127,7 +127,6 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <button class="tab-btn" id="csvDeleterTab" onclick="showTab('csvDeleter')">CSV Rubric Deleter</button>
   <button class="tab-btn" id="fixWeightsTab" onclick="showTab('fixWeights')">Fix Test Weights</button>
   <button class="tab-btn" id="validationTab" onclick="showTab('validation')">Run Delivery Validation</button>
-  <button class="tab-btn" id="removeTab" onclick="showTab('remove')">Tasks to Remove</button>
   <button class="tab-btn" id="deltaTrimTab" onclick="showTab('deltaTrim')">Delta Trimmer</button>
 </div>
 
@@ -174,8 +173,10 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
 <div class="validation-section" id="modelReward">
   <h2>Avg Reward (Pass Rate) per Model</h2>
   <p>
-    Per-task weighted pass rate for each model, calculated the same way as the checker
-    (weighted by item <code>weight</code>/<code>score</code> across rubrics + unit tests).
+    Per-task weighted pass rate for each model, using the pass@k scoring across rubrics + unit tests:
+    positive-weight items contribute <code>pass·w</code> (numerator) and <code>w</code> (denominator);
+    negative-weight (detrimental) rubrics are penalties — <code>−|w|·(1−pass)</code> in the numerator and
+    <strong>excluded from the denominator</strong>.
     The cards show the average reward per model across all tasks; the table shows each task's pass rate.
   </p>
   <div class="stats-bar" id="modelRewardSummary"></div>
@@ -290,16 +291,6 @@ h1{font-size:1.6rem;margin-bottom:8px;color:#f0f6fc}
   <div class="redash-status" id="fwStatus">Drop both CSVs above to generate the fixed file.</div>
   <div class="stats-bar" id="fwSummary" style="margin-top:12px"></div>
   <div class="redash-results" id="fwTable"></div>
-</div>
-
-<div class="validation-section" id="removeSection">
-  <h2>Tasks You Should Remove</h2>
-  <p>
-    Removal candidates from the loaded delivery: tasks where the <strong>blended pass@k is &gt;80%</strong>
-    (too easy — models already solve them) or that have a <strong>low verifier count (&lt;10 rubrics + unit tests)</strong>.
-  </p>
-  <div class="stats-bar" id="removeSummary"></div>
-  <div class="redash-results" id="removeTable"></div>
 </div>
 
 <div class="validation-section" id="deltaTrim">
@@ -473,25 +464,21 @@ function showTab(tab) {
   const isChecker = tab === 'checker';
   const isCsvDeleter = tab === 'csvDeleter';
   const isFixWeights = tab === 'fixWeights';
-  const isRemove = tab === 'remove';
   const isDeltaTrim = tab === 'deltaTrim';
   document.getElementById('checkerTab').classList.toggle('active', isChecker);
   document.getElementById('modelRewardTab').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleterTab').classList.toggle('active', isCsvDeleter);
   document.getElementById('fixWeightsTab').classList.toggle('active', isFixWeights);
   document.getElementById('validationTab').classList.toggle('active', isValidation);
-  document.getElementById('removeTab').classList.toggle('active', isRemove);
   document.getElementById('deltaTrimTab').classList.toggle('active', isDeltaTrim);
   document.getElementById('results').style.display = isChecker ? (analysisResult ? 'block' : 'none') : 'none';
   document.getElementById('deliveryValidation').classList.toggle('active', isValidation);
   document.getElementById('modelReward').classList.toggle('active', isModelReward);
   document.getElementById('csvDeleter').classList.toggle('active', isCsvDeleter);
   document.getElementById('fixWeights').classList.toggle('active', isFixWeights);
-  document.getElementById('removeSection').classList.toggle('active', isRemove);
   document.getElementById('deltaTrim').classList.toggle('active', isDeltaTrim);
   if (isModelReward) renderModelReward();
   if (isCsvDeleter) renderCsvDeleter();
-  if (isRemove) renderRemoveTab();
   if (isDeltaTrim && analysisResult) runDeltaTrim();
 }
 
@@ -1755,6 +1742,18 @@ function getItemWeight(item) {
   return Math.abs(f);
 }
 
+// RAW (signed) weight — negative for detrimental rubrics. Used by the pass@k
+// scoring in averageModelPassRate so penalties are handled like the live metric.
+function getItemRawWeight(item) {
+  if (!item || typeof item !== 'object') return 1;
+  let w = item.weight;
+  if (w === null || w === undefined) w = item.score;
+  if (w === null || w === undefined) return 1;
+  const f = parseFloat(w);
+  if (isNaN(f)) return 1;
+  return f;
+}
+
 function averagePassRates(items) {
   let weightedSum = 0, totalWeight = 0, count = 0;
   for (const [,item] of items) {
@@ -1797,18 +1796,28 @@ function getGeminiPassRate(item) {
   return undefined;
 }
 
+// pass@k-style weighted pass rate over (rubrics + unit_tests), matching the
+// standalone compute_delta_rel.py definition:
+//   positive weight (w >= 0): +pass*w in numerator, w in denominator
+//   negative weight (w < 0) : penalty -|w|*(1-pass) in numerator, EXCLUDED from denominator
+// A detrimental rubric can therefore only subtract from the score and never
+// dilutes the denominator (this is what yields the ~20%+ delta figure).
 function averageModelPassRate(items, key) {
-  let weightedSum = 0, totalWeight = 0, n = 0;
+  let numerator = 0, denominator = 0, n = 0;
   for (const [,item] of items) {
     const v = getModelPassRate(item, key);
     if (v === null) continue;
-    const w = getItemWeight(item);
-    weightedSum += v * w;
-    totalWeight += w;
+    const w = getItemRawWeight(item);
     n += 1;
+    if (w >= 0) {
+      numerator += v * w;
+      denominator += w;
+    } else {
+      numerator += w * (1 - v); // w < 0  =>  -|w| * (1 - pass)
+    }
   }
-  if (n === 0) return null;
-  return totalWeight > 0 ? weightedSum / totalWeight : 0;
+  if (n === 0 || denominator === 0) return null;
+  return numerator / denominator;
 }
 
 function isPass0(item) {
@@ -1905,7 +1914,7 @@ function computeMainSafetyBreakdown(tasks) {
 
 function analyzeJSONL(lines) {
   const tasks = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const groups = { missingPK: [], noMissing: [], onlyTests: [], onlyRubrics: [], both: [], outlierRubrics: [], outlierRubricsAll: [], outlierAfterDelete: [], highAvgPassK: [], highAvgPassKBlended: [], noUnitTests: [], modelRates: [] };
+  const groups = { missingPK: [], noMissing: [], onlyTests: [], onlyRubrics: [], both: [], outlierRubrics: [], outlierRubricsAll: [], outlierAfterDelete: [], noUnitTests: [], modelRates: [] };
 
   // First pass: collect counts for stats
   const rubricCounts = [];
@@ -1985,16 +1994,6 @@ function analyzeJSONL(lines) {
     const opusAvg = averageModelPassRate(allItems, 'pass_rate_opus');
     const geminiAvg = averageModelPassRate(allItems, GEMINI_PASS_RATE_KEYS);
     groups.modelRates.push({ id: tid, opusAvg, geminiAvg, rubricCount: ri.length, testCount: ti.length });
-    const maxModelAvg = Math.max(opusAvg === null ? -1 : opusAvg, geminiAvg === null ? -1 : geminiAvg);
-    if (maxModelAvg > 0.8) {
-      groups.highAvgPassK.push({ id: tid, opusAvg, geminiAvg, max: maxModelAvg, rubricCount: ri.length, testCount: ti.length });
-    }
-
-    // Old definition: blended average across all pass@k scores (rubrics + tests)
-    const avgPassK = averagePassRates(allItems);
-    if (avgPassK && avgPassK.avg > 0.8) {
-      groups.highAvgPassKBlended.push({ id: tid, avg: avgPassK.avg, count: avgPassK.count, rubricCount: ri.length, testCount: ti.length });
-    }
 
     const rNoPK = ri.filter(([,r]) => !hasPassRate(r)).length;
     const tNoPK = ti.filter(([,t]) => !hasPassRate(t)).length;
@@ -2044,9 +2043,6 @@ function analyzeJSONL(lines) {
     else if (mr > 0 && mt === 0) groups.onlyRubrics.push({ id: tid, count: mr, partial: mrPartial, items: rubricDetails });
     else groups.both.push({ id: tid, rubrics: mr, tests: mt, rPartial: mrPartial, tPartial: mtPartial, rubricItems: rubricDetails, testItems: testDetails });
   }
-
-  groups.highAvgPassK.sort((a,b) => b.max - a.max);
-  groups.highAvgPassKBlended.sort((a,b) => b.avg - a.avg);
 
   return { total: tasks.length, groups };
 }
@@ -2123,7 +2119,6 @@ function renderResults(result) {
     <div class="stat yellow"><div class="num">${totalMissT}</div><div class="label">Total Missing Test Just.</div></div>
     <div class="stat blue"><div class="num">${avgR}</div><div class="label">Avg Rubrics/Task</div></div>
     <div class="stat blue"><div class="num">${avgT}</div><div class="label">Avg Unit Tests/Task</div></div>
-    <div class="stat green"><div class="num">${groups.highAvgPassKBlended.length}</div><div class="label">High Avg Pass@k &gt;80% (Blended, weighted)</div></div>
     <div class="stat red"><div class="num">${groups.noUnitTests.length}</div><div class="label">No Unit Tests</div></div>
     <div class="stat" style="${groups.outlierRubrics.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#a371f7">${groups.outlierRubrics.length}</div><div class="label">Low Verifier (&lt;10, excl. missing pass@k)</div></div>
     <div class="stat" style="${groups.outlierRubricsAll.length > 0 ? '' : 'opacity:0.5'}"><div class="num" style="color:#a371f7">${groups.outlierRubricsAll.length}</div><div class="label">Low Verifier (&lt;10, incl. missing pass@k)</div></div>
@@ -2194,12 +2189,6 @@ function renderResults(result) {
     { key: 'outlierAfterDelete', title: 'Newly Low Verifier After Deleting Rubrics Missing Justification (<10, excl. previously low & missing pass@k)', color: '#db6d28',
       detail: t => {
         return `<span class="badge low">LOW</span> ${t.remaining} verifiers after deleting ${t.deleted} rubric(s) (was ${t.before}: ${t.rubricCount}R + ${t.testCount}T)`;
-      },
-      expandable: false
-    },
-    { key: 'highAvgPassKBlended', title: 'High Avg Pass@k (>80% weighted, blended across all scores)', color: '#3fb950',
-      detail: t => {
-        return `<span class="badge complete">${(t.avg * 100).toFixed(1)}%</span> weighted avg across ${t.count} pass@k scores (${t.rubricCount} rubrics, ${t.testCount} tests)`;
       },
       expandable: false
     },
@@ -2337,76 +2326,6 @@ function exportModelRewardCsv() {
   a.href = URL.createObjectURL(blob);
   a.download = `${baseName}_model_pass_rate_${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
-}
-
-function renderRemoveTab() {
-  const summary = document.getElementById('removeSummary');
-  const table = document.getElementById('removeTable');
-  if (!summary || !table) return;
-  if (!analysisResult || !analysisResult.groups) {
-    summary.innerHTML = '';
-    table.innerHTML = '<p style="color:#8b949e;font-size:.85rem">Upload a JSONL file first.</p>';
-    return;
-  }
-  const g = analysisResult.groups;
-  const missingPKIds = new Set((g.missingPK || []).map(t => t.id));
-  const highBlended = (g.highAvgPassKBlended || []).filter(t => !missingPKIds.has(t.id));
-  const lowVerifier = (g.outlierRubrics || []).filter(t => !missingPKIds.has(t.id));
-
-  const map = {};
-  for (const t of highBlended) {
-    if (!map[t.id]) map[t.id] = { id: t.id, reasons: [], rubricCount: t.rubricCount, testCount: t.testCount };
-    map[t.id].reasons.push('high pass@k');
-    map[t.id].blended = t.avg;
-  }
-  for (const t of lowVerifier) {
-    if (!map[t.id]) map[t.id] = { id: t.id, reasons: [], rubricCount: t.rubricCount, testCount: t.testCount };
-    map[t.id].reasons.push('low verifiers');
-    map[t.id].total = t.total;
-    map[t.id].missingPK = t.missingPK;
-  }
-  const rows = Object.values(map).sort((a, b) => b.reasons.length - a.reasons.length || (b.blended || 0) - (a.blended || 0));
-
-  summary.innerHTML = `
-    <div class="stat blue"><div class="num">${rows.length}</div><div class="label">Removal Candidates</div></div>
-    <div class="stat green"><div class="num">${highBlended.length}</div><div class="label">High Blended Pass@k &gt;80%</div></div>
-    <div class="stat" style="${lowVerifier.length ? '' : 'opacity:.5'}"><div class="num" style="color:#a371f7">${lowVerifier.length}</div><div class="label">Low Verifiers (&lt;10)</div></div>
-  `;
-
-  const body = rows.map(r => {
-    const reasonTags = r.reasons.map(rs => rs === 'high pass@k'
-      ? '<span class="badge complete">HIGH PASS@K</span>'
-      : '<span class="badge low">LOW VERIFIERS</span>').join(' ');
-    const blended = (r.blended !== undefined) ? `${(r.blended * 100).toFixed(1)}%` : '—';
-    const verifiers = (r.rubricCount || 0) + (r.testCount || 0);
-    return `<tr>
-      <td style="font-family:monospace;color:#58a6ff">${escHtml(r.id)}</td>
-      <td>${reasonTags}</td>
-      <td>${blended}</td>
-      <td>${verifiers} <span style="color:#484f58;font-size:.75rem">(${r.rubricCount || 0}R+${r.testCount || 0}T)</span></td>
-    </tr>`;
-  }).join('');
-
-  table.innerHTML = `
-    <div class="validation-actions"><button class="copy-btn" onclick="copyRemoveIds(this)">Copy all IDs</button></div>
-    <table>
-      <thead><tr><th>Task ID</th><th>Reason</th><th>Blended Pass@k</th><th>Verifiers</th></tr></thead>
-      <tbody>${body || '<tr><td colspan="4" style="color:#484f58">No removal candidates</td></tr>'}</tbody>
-    </table>`;
-}
-
-function copyRemoveIds(btn) {
-  if (!analysisResult || !analysisResult.groups) return;
-  const g = analysisResult.groups;
-  const missingPKIds = new Set((g.missingPK || []).map(t => t.id));
-  const ids = [...new Set([
-    ...(g.highAvgPassKBlended || []).map(t => t.id),
-    ...(g.outlierRubrics || []).map(t => t.id)
-  ])].filter(id => !missingPKIds.has(id));
-  navigator.clipboard.writeText(ids.join('\n'));
-  btn.textContent = `Copied ${ids.length}!`;
-  btn.classList.add('copied');
-  setTimeout(() => { btn.textContent = 'Copy all IDs'; btn.classList.remove('copied'); }, 1500);
 }
 
 function renderExpandContent(sections) {
