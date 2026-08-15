@@ -128,8 +128,10 @@ for p in paths:
     try:
         with open(p) as handle:
             r = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        # A report still being written is normal mid-run, not an error.
+    except (OSError, ValueError):
+        # A report still being written is normal mid-run, not an error: a half
+        # flushed file can be truncated JSON or invalid UTF-8, and neither is
+        # worth stopping a watcher for. (ValueError covers both.)
         continue
     for t in r.get('tasks', []):
         tid = t['task_id']

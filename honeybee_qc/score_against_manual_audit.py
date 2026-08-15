@@ -243,7 +243,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     unguarded = unguarded_true_fails(rows)
-    if unguarded:
+    if not any(r.verdict == "TRUE_FAIL" for r in rows):
+        print(
+            "\nNo regression guard: the ground truth lists no true fails for the "
+            "checks scored, so this can only confirm fixes."
+        )
+    elif unguarded:
         print(
             f"\nNo regressions among the {totals['held']} true fail(s) this run scored -- "
             f"but {len(unguarded)} more went unscored, so the regression guard is "
