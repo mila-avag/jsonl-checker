@@ -1,0 +1,14 @@
+# Phase 1 needs nothing but the standard library at runtime.
+# Model stages (phase 2+) will add an HTTP client and a browser driver.
+pytest==8.3.4
+
+# Optional evidence-extraction backends for sources.py. Every import of these
+# is wrapped in try/except at the call site, so a missing package degrades an
+# attachment to "no text available" rather than breaking the run -- these
+# entries just make the intended environment explicit. PyMuPDF (`fitz`) and
+# pypdf are PDF text backends; pytesseract is the OCR backend for both the PDF
+# vector-outline fallback and image attachments, and needs the `tesseract`
+# binary installed separately (e.g. `brew install tesseract`).
+pymupdf
+pypdf
+pytesseract

@@ -2,3 +2,32 @@
 !.gitignore
 !index.html
 !jsonl_checker.html
+
+# honeybee_qc: allowlist source + tests only. The leading `*` above means git
+# will not descend into a directory unless the directory itself is re-included,
+# so each path component is listed before its contents. This is an allowlist by
+# design: anything new that is not source or a test stays ignored by default.
+!honeybee_qc/
+!honeybee_qc/*.py
+!honeybee_qc/*.sh
+!honeybee_qc/*.md
+!honeybee_qc/requirements.txt
+!honeybee_qc/sample_tasks.jsonl
+!honeybee_qc/tests/
+!honeybee_qc/tests/*.py
+
+# Run artifacts stay out: large SQLite response caches, rendered DOM/PDF
+# snapshots, and per-run reports containing real task content. Listed
+# explicitly so a future `!honeybee_qc/**` cannot accidentally pull them in.
+honeybee_qc/audit_runs/
+honeybee_qc/**/__pycache__/
+honeybee_qc/**/.pytest_cache/
+honeybee_qc/**/.DS_Store
+honeybee_qc/**/*.pyc
+honeybee_qc/**/*.db
+honeybee_qc/**/*.db-shm
+honeybee_qc/**/*.db-wal
+honeybee_qc/**/*.sqlite
+honeybee_qc/**/*.sqlite3
+honeybee_qc/**/.env
+honeybee_qc/**/*.pem
