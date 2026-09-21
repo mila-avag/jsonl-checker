@@ -31,3 +31,14 @@ honeybee_qc/**/*.sqlite
 honeybee_qc/**/*.sqlite3
 honeybee_qc/**/.env
 honeybee_qc/**/*.pem
+
+# Customer-facing Ultra Evals sample viewers (static HTML for Vercel).
+!ultra_evals_samples/
+!ultra_evals_samples/index.html
+!ultra_evals_samples/vercel.json
+!ultra_evals_samples/okonkwo-brennan/
+!ultra_evals_samples/okonkwo-brennan/index.html
+!ultra_evals_samples/sundstrom-vance/
+!ultra_evals_samples/sundstrom-vance/index.html
+!ultra_evals_samples/sequoia-root/
+!ultra_evals_samples/sequoia-root/index.html

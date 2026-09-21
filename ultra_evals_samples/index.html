@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ultra Evals · Aspirational samples</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1e222d; --border:#2a2f3c;
+    --text:#e6e8ee; --muted:#9aa3b2; --accent:#6ea8fe; --pass:#2ea043;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg);color:var(--text);line-height:1.55;font-size:15px}
+  header{padding:28px 32px 20px;border-bottom:1px solid var(--border);
+    background:linear-gradient(180deg,#1a1e29,#12141c)}
+  header h1{margin:0;font-size:22px;font-weight:650}
+  header p{margin:8px 0 0;color:var(--muted);max-width:820px}
+  main{padding:28px 32px;max-width:1100px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+  a.card{display:block;background:var(--panel);border:1px solid var(--border);border-radius:12px;
+    padding:18px 20px;color:inherit;text-decoration:none}
+  a.card:hover{border-color:var(--accent)}
+  .kicker{font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--muted)}
+  a.card h2{margin:6px 0 8px;font-size:17px}
+  a.card p{margin:0;color:var(--muted);font-size:13.5px}
+  .note{margin-top:22px;color:var(--muted);font-size:13px;max-width:820px}
+  .pill{display:inline-block;margin-top:10px;font-size:12px;font-weight:650;color:var(--pass)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Ultra Evals · Aspirational samples</h1>
+  <p>Three live-connector tasks from the 200-eval set (100 Aspirational, 100 Traffic). Aspirational complexity is set by running unaided Gemini against a pre-created weighted rubric; Gemini must score 40% or less. Traffic has no complexity bar, and prompts are often very simple asks.</p>
+</header>
+<main>
+  <div class="grid">
+    <a class="card" href="./okonkwo-brennan/">
+      <div class="kicker">Aspirational</div>
+      <h2>Okonkwo-Brennan pre-LOI file</h2>
+      <p>Interactive Gemini, Claude, and GPT, plus an unaided Gemini control on the same 30-point rubric.</p>
+      <div class="pill">Open sample</div>
+    </a>
+    <a class="card" href="./sundstrom-vance/">
+      <div class="kicker">Aspirational</div>
+      <h2>Sundstrom-Vance plan review</h2>
+      <p>Interactive Gemini, Claude, and GPT, plus an unaided Gemini control on the same rubric.</p>
+      <div class="pill">Open sample</div>
+    </a>
+    <a class="card" href="./sequoia-root/">
+      <div class="kicker">Aspirational</div>
+      <h2>Sequoia Root July campaign close-out</h2>
+      <p>Interactive Gemini, Claude, and GPT, plus an unaided Gemini control on the same rubric.</p>
+      <div class="pill">Open sample</div>
+    </a>
+  </div>
+  <p class="note">Each page includes the opening prompt, target deliverables, full trajectories, weighted pass rates, and side-by-side scores. The Overview tab has the 200-eval Sunspire vs Thorin scoreboard as HTML tables.</p>
+</main>
+</body>
+</html>
