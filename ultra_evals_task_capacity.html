@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ultra Evals task capacity / endpoint delay</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --fill: #eef0f4;
+    --border: #e4e6ec;
+    --text: #111827;
+    --muted: #6b7280;
+    --tertiary: #9ca3af;
+    --accent: #2563eb;
+    --green: #15803d;
+    --red: #b42318;
+    --info: #1d4ed8;
+    --warn: #b45309;
+    --neutral: #6b7280;
+    --mission: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111318;
+      --panel: #1b1e26;
+      --fill: #242833;
+      --border: #2e3340;
+      --text: #f3f4f6;
+      --muted: #9ca3af;
+      --tertiary: #6b7280;
+      --accent: #60a5fa;
+      --green: #4ade80;
+      --red: #f87171;
+      --info: #93c5fd;
+      --warn: #fbbf24;
+      --neutral: #9ca3af;
+      --mission: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+  }
+  main {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 28px 24px 56px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 24px;
+    line-height: 1.25;
+    font-weight: 650;
+    letter-spacing: -0.03em;
+  }
+  h2 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+  }
+  p { margin: 0; }
+  .lede { color: var(--muted); margin-top: 8px; max-width: 72ch; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .section { margin-top: 28px; }
+  .kicker { font-size: 12px; color: var(--tertiary); }
+  .date-label { font-weight: 650; }
+  input[type="range"] {
+    width: 100%;
+    height: 28px;
+    margin: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .banner {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    padding: 16px;
+    background: var(--fill);
+  }
+  .banner-dollars {
+    font-size: 24px;
+    line-height: 30px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .muted { color: var(--muted); font-size: 13px; }
+  .tertiary { color: var(--tertiary); font-size: 13px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .pill.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 700px) {
+    .grid2 { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 14px 16px 16px;
+    min-width: 0;
+  }
+  .card h3 {
+    margin: 0 0 12px;
+    font-size: 12px;
+    font-weight: 650;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+  .metrics { display: flex; flex-direction: column; gap: 12px; }
+  .metric { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .metric .label { font-size: 13px; color: var(--muted); }
+  .metric .value {
+    font-size: 18px;
+    line-height: 24px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+  .chart-wrap { overflow-x: auto; }
+  .bars {
+    display: grid;
+    grid-template-columns: repeat(9, minmax(72px, 1fr));
+    gap: 8px;
+    align-items: end;
+    min-height: 220px;
+    padding-top: 18px;
+  }
+  .bar-col { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 0; }
+  .bar-pair {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 4px;
+    width: 100%;
+    height: 180px;
+  }
+  .bar {
+    width: 18px;
+    min-height: 2px;
+    position: relative;
+    background: var(--neutral);
+  }
+  .bar.mission { background: var(--mission); }
+  .bar span {
+    position: absolute;
+    top: -16px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); }
+  .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
+  .swatch.plan { background: var(--neutral); }
+  .swatch.mission { background: var(--mission); }
+  .swatch.info { background: var(--info); }
+  .swatch.warn { background: var(--warn); }
+  svg.line-chart { width: 100%; height: 240px; display: block; }
+  .caption { font-size: 12px; color: var(--tertiary); }
+</style>
+</head>
+<body>
+<main>
+  <div class="stack">
+    <h1>Ultra Evals task capacity / endpoint delay</h1>
+    <p class="lede">Until the next endpoint shows up you only have 800 tasks (done by Sep 25). The slider is the arrival date. If it shows up 9/24, 9/25, or 9/26 you are on time and revenue lost is $0. Later arrivals cut 9/26 through 9/30. By Sep 28 is tasks through that day. By Sep 30 is 9/29 and 9/30 only. Total you can send is those two added. Cap is 3,100.</p>
+  </div>
+
+  <div class="section stack">
+    <div>
+      <div class="kicker">When the next endpoint shows up</div>
+      <div class="date-label" id="receiptLabel"></div>
+    </div>
+    <input
+      id="receiptSlider"
+      type="range"
+      min="0"
+      max="7"
+      step="1"
+      value="0"
+      aria-label="Next endpoint arrival date"
+    >
+    <div class="banner">
+      <h2>Revenue lost to endpoint delay</h2>
+      <div class="banner-dollars" id="bannerDollars"></div>
+      <p class="muted" id="bannerMissed"></p>
+      <p class="muted" id="bannerRecovered" hidden></p>
+    </div>
+    <div class="pills" id="pills"></div>
+    <p class="muted" id="sliderNote"></p>
+    <p class="muted" id="extrasNote" hidden></p>
+  </div>
+
+  <section class="section stack">
+    <h2>By Sep 28</h2>
+    <p class="muted" id="by28TasksLost"></p>
+    <p class="muted" id="by28MoneyLost"></p>
+    <div class="grid2">
+      <article class="card">
+        <h3>Plan</h3>
+        <div class="metrics" id="by28Plan"></div>
+      </article>
+      <article class="card">
+        <h3>High missions</h3>
+        <div class="metrics" id="by28Missions"></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="section stack">
+    <h2>By Sep 30</h2>
+    <p class="muted" id="inc30TasksLost"></p>
+    <p class="muted" id="inc30MoneyLost"></p>
+    <div class="grid2">
+      <article class="card">
+        <h3>Plan</h3>
+        <div class="metrics" id="inc30Plan"></div>
+      </article>
+      <article class="card">
+        <h3>High missions</h3>
+        <div class="metrics" id="inc30Missions"></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="section stack">
+    <h2>Total you can send</h2>
+    <p class="muted">By Sep 28 plus By Sep 30. What you can send. Cap 3,100.</p>
+    <div class="grid2">
+      <article class="card">
+        <h3>Plan</h3>
+        <div class="metrics" id="totalPlan"></div>
+      </article>
+      <article class="card">
+        <h3>High missions</h3>
+        <div class="metrics" id="totalMissions"></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="section stack">
+    <h2>Daily plan vs high missions</h2>
+    <p class="tertiary">Tasks each day, 9/22 through 9/30. 9/25 is 295 on the sheet. 9/26 and later are 0 until the endpoint shows up. High missions can add extra tasks from 9/26.</p>
+    <div class="legend">
+      <span><i class="swatch plan"></i>Plan (tasks/day)</span>
+      <span><i class="swatch mission"></i>High missions (tasks/day)</span>
+    </div>
+    <div class="chart-wrap">
+      <div class="bars" id="barChart"></div>
+    </div>
+  </section>
+
+  <section class="section stack">
+    <h2>Running total</h2>
+    <p class="tertiary">800 is what you have without the next endpoint. 2,050 is on-time through Sep 28. 3,100 is the cap.</p>
+    <div class="legend">
+      <span><i class="swatch plan"></i>On-time path</span>
+      <span><i class="swatch info"></i>Plan</span>
+      <span><i class="swatch mission"></i>High missions</span>
+      <span><i class="swatch warn"></i>800 / 2,050 / 3,100</span>
+    </div>
+    <svg class="line-chart" id="lineChart" viewBox="0 0 1000 240" preserveAspectRatio="none" aria-label="Cumulative tasks"></svg>
+    <p class="caption">X: Sep 22 to Sep 30. Y: cumulative tasks.</p>
+  </section>
+</main>
+
+<script>
+(function () {
+  var IN_HAND = 800;
+  var ON_TIME_PLAN = 3100;
+  var HARD_CAP = 3100;
+  var GOAL_SEP_28 = 2050;
+  var ON_TIME_ARRIVAL = "2026-09-26";
+  var GOAL_SEP_30_INCREMENT = 1050;
+  var SEP_28 = "2026-09-28";
+  var SEP_30 = "2026-09-30";
+  var REVENUE_PER_TASK = 152 * 6;
+  var MISSION_COST_PER_TASK = 200;
+  var EXTRA_RATE = 0.2;
+  var SHEET_SEP_25 = 295;
+
+  var EARLY = [
+    { date: "2026-09-22", label: "9/22", goal: 100 },
+    { date: "2026-09-23", label: "9/23", goal: 185 },
+    { date: "2026-09-24", label: "9/24", goal: 240 },
+    { date: "2026-09-25", label: "9/25", goal: 275 }
+  ];
+  var TAIL = [
+    { date: "2026-09-26", label: "9/26", goal: 350 },
+    { date: "2026-09-27", label: "9/27", goal: 410 },
+    { date: "2026-09-28", label: "9/28", goal: 470 },
+    { date: "2026-09-29", label: "9/29", goal: 530 },
+    { date: "2026-09-30", label: "9/30", goal: 520 }
+  ];
+  var CALENDAR = EARLY.concat(TAIL);
+  var RECEIPT_OPTIONS = [
+    { date: "2026-09-24", label: "9/24", short: "9/24" },
+    { date: "2026-09-25", label: "9/25", short: "9/25" }
+  ].concat(TAIL.map(function (d) {
+    return { date: d.date, label: d.label, short: d.label };
+  })).concat([{ date: "2026-10-01", label: "After 9/30", short: "10/1" }]);
+
+  function simulate(receiptDate) {
+    var staged = [];
+    var planCum = 0;
+    for (var i = 0; i < CALENDAR.length; i++) {
+      var day = CALENDAR[i];
+      var early = day.date <= "2026-09-25";
+      var planDay = early ? day.goal : (day.date >= receiptDate ? day.goal : 0);
+      planCum += planDay;
+      staged.push({
+        date: day.date,
+        label: day.label,
+        goal: day.goal,
+        planDay: planDay,
+        planCum: planCum,
+        headroom: !early && planDay > 0 ? Math.round(planDay * EXTRA_RATE) : 0
+      });
+    }
+    var p30 = staged[staged.length - 1].planCum;
+    var need = Math.max(0, HARD_CAP - p30);
+    var rows = [];
+    var missionCum = 0;
+    for (var j = 0; j < staged.length; j++) {
+      var d = staged[j];
+      var extras = Math.min(d.headroom, need);
+      need -= extras;
+      var missionDay = d.planDay + extras;
+      var chartDay = d.date === "2026-09-25" ? SHEET_SEP_25 : d.planDay;
+      missionCum += missionDay;
+      rows.push({
+        date: d.date,
+        label: d.label,
+        goal: d.goal,
+        planDay: d.planDay,
+        chartDay: chartDay,
+        extras: extras,
+        headroom: d.headroom,
+        missionDay: missionDay,
+        missionChartDay: chartDay + extras,
+        billed: extras > 0,
+        planCum: d.planCum,
+        missionCum: missionCum
+      });
+    }
+    return rows;
+  }
+
+  function moneySlice(planTasks, extras) {
+    var missionTasks = planTasks + extras;
+    return {
+      plan: {
+        tasks: planTasks,
+        extras: 0,
+        revenue: Math.round(planTasks * REVENUE_PER_TASK),
+        cost: 0
+      },
+      missions: {
+        tasks: missionTasks,
+        extras: extras,
+        revenue: Math.round(missionTasks * REVENUE_PER_TASK),
+        cost: Math.round(extras * MISSION_COST_PER_TASK)
+      }
+    };
+  }
+
+  function sliceThrough28(rows) {
+    var hit = null;
+    var extras = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].date === SEP_28) hit = rows[i];
+      if (rows[i].date <= SEP_28) extras += rows[i].extras;
+    }
+    return moneySlice(hit ? hit.planCum : IN_HAND, extras);
+  }
+
+  function sliceSep30Increment(rows) {
+    var planTasks = 0;
+    var extras = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].date > SEP_28) {
+        planTasks += rows[i].planDay;
+        extras += rows[i].extras;
+      }
+    }
+    return moneySlice(planTasks, extras);
+  }
+
+  function fmt(n) {
+    return Math.round(n).toLocaleString("en-US");
+  }
+
+  function usd(n) {
+    return "$" + Math.round(n).toLocaleString("en-US");
+  }
+
+  function missionPctOfMargin(cost, revenue) {
+    if (cost <= 0) return 0;
+    var net = revenue - cost;
+    if (net <= 0) return 0;
+    return (cost / net) * 100;
+  }
+
+  function fmtPct(n) {
+    var rounded = Math.round(n * 10) / 10;
+    if (Number.isInteger(rounded)) return rounded.toFixed(0) + "%";
+    return rounded.toFixed(1) + "%";
+  }
+
+  function cardLoss(planTasks, baseline, onTime) {
+    if (onTime) return { tasks: 0, money: 0 };
+    var tasks = Math.max(0, baseline - planTasks);
+    return { tasks: tasks, money: Math.round(tasks * REVENUE_PER_TASK) };
+  }
+
+  function metric(label, value, tone) {
+    var toneClass = tone === "green" ? " green" : tone === "red" ? " red" : "";
+    return (
+      '<div class="metric"><div class="label">' + label + '</div>' +
+      '<div class="value' + toneClass + '">' + value + "</div></div>"
+    );
+  }
+
+  function columnHtml(slice, kind, taskLabel, baseline, onTime) {
+    var loss = cardLoss(slice.tasks, baseline, onTime);
+    var html = metric(taskLabel, fmt(slice.tasks));
+    if (kind === "plan") {
+      html += metric("Tasks lost", fmt(loss.tasks), loss.tasks > 0 ? "red" : "green");
+      html += metric("Revenue lost", usd(loss.money), loss.money > 0 ? "red" : "green");
+    }
+    if (kind === "missions") {
+      html += metric("Extra tasks", fmt(slice.extras));
+      var hole = Math.max(0, baseline - slice.tasks);
+      html += metric("Still short of on-time", fmt(hole), hole > 0 ? "red" : "green");
+    }
+    html += metric("Revenue ($912/task)", usd(slice.revenue));
+    if (kind === "missions") {
+      html += metric("Extra task cost ($200 each)", usd(slice.cost), slice.cost > 0 ? "red" : undefined);
+      html += metric("Extra cost as % of leftover", fmtPct(missionPctOfMargin(slice.cost, slice.revenue)));
+    }
+    return html;
+  }
+
+  function setText(id, text) {
+    document.getElementById(id).textContent = text;
+  }
+
+  function renderBars(rows) {
+    var yMax = 530;
+    for (var i = 0; i < rows.length; i++) {
+      yMax = Math.max(yMax, rows[i].chartDay, rows[i].missionChartDay, rows[i].goal, SHEET_SEP_25);
+    }
+    var html = "";
+    for (var j = 0; j < rows.length; j++) {
+      var r = rows[j];
+      var planH = r.chartDay > 0 ? Math.max(2, Math.round((r.chartDay / yMax) * 180)) : 0;
+      var missH = r.missionChartDay > 0 ? Math.max(2, Math.round((r.missionChartDay / yMax) * 180)) : 0;
+      html +=
+        '<div class="bar-col">' +
+        '<div class="bar-pair">' +
+        '<div class="bar" style="height:' + planH + 'px"><span>' + r.chartDay + "</span></div>" +
+        '<div class="bar mission" style="height:' + missH + 'px"><span>' + r.missionChartDay + "</span></div>" +
+        "</div>" +
+        '<div class="caption">' + r.label + "</div>" +
+        "</div>";
+    }
+    document.getElementById("barChart").innerHTML = html;
+  }
+
+  function polyline(values, yMax, color) {
+    var n = values.length;
+    var pts = [];
+    for (var i = 0; i < n; i++) {
+      var x = 40 + (i * (920 / (n - 1)));
+      var y = 200 - (values[i] / yMax) * 170;
+      pts.push(x.toFixed(1) + "," + y.toFixed(1));
+    }
+    return '<polyline fill="none" stroke="' + color + '" stroke-width="2" points="' + pts.join(" ") + '" />';
+  }
+
+  function renderLine(rows) {
+    var unconstrained = [];
+    var run = 0;
+    for (var i = 0; i < CALENDAR.length; i++) {
+      run += CALENDAR[i].goal;
+      unconstrained.push(run);
+    }
+    var planCum = rows.map(function (r) { return r.planCum; });
+    var missionCum = rows.map(function (r) { return r.missionCum; });
+    var yMax = HARD_CAP;
+    for (var j = 0; j < unconstrained.length; j++) {
+      yMax = Math.max(yMax, unconstrained[j], planCum[j], missionCum[j]);
+    }
+    var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var muted = dark ? "#9ca3af" : "#6b7280";
+    var info = dark ? "#93c5fd" : "#1d4ed8";
+    var mission = dark ? "#4ade80" : "#15803d";
+    var warn = dark ? "#fbbf24" : "#b45309";
+    var text = dark ? "#9ca3af" : "#6b7280";
+    var refs = [IN_HAND, GOAL_SEP_28, HARD_CAP];
+    var labels = ["800 unlocked", "2050", "3100"];
+    var svg = "";
+    for (var k = 0; k < refs.length; k++) {
+      var y = 200 - (refs[k] / yMax) * 170;
+      svg += '<line x1="40" x2="960" y1="' + y.toFixed(1) + '" y2="' + y.toFixed(1) + '" stroke="' + warn + '" stroke-dasharray="4 4" stroke-width="1" />';
+      svg += '<text x="964" y="' + (y - 2).toFixed(1) + '" font-size="10" fill="' + text + '">' + labels[k] + "</text>";
+    }
+    svg += polyline(unconstrained, yMax, muted);
+    svg += polyline(planCum, yMax, info);
+    svg += polyline(missionCum, yMax, mission);
+    for (var x = 0; x < rows.length; x++) {
+      var px = 40 + (x * (920 / (rows.length - 1)));
+      svg += '<text x="' + px.toFixed(1) + '" y="228" text-anchor="middle" font-size="11" fill="' + text + '">' + rows[x].label + "</text>";
+    }
+    document.getElementById("lineChart").innerHTML = svg;
+  }
+
+  function render(idx) {
+    var safeIdx = Math.min(Math.max(idx, 0), RECEIPT_OPTIONS.length - 1);
+    var receipt = RECEIPT_OPTIONS[safeIdx];
+    var rows = simulate(receipt.date);
+    var by28 = sliceThrough28(rows);
+    var inc30 = sliceSep30Increment(rows);
+    var billedDays = rows.filter(function (r) { return r.billed; });
+    var planCombined = by28.plan.tasks + inc30.plan.tasks;
+    var missionsCombined = by28.missions.tasks + inc30.missions.tasks;
+    var gap = Math.max(0, HARD_CAP - planCombined);
+    var extrasBought = by28.missions.extras + inc30.missions.extras;
+    var onTime = receipt.date <= ON_TIME_ARRIVAL;
+    var tasksLost = onTime ? 0 : Math.max(0, ON_TIME_PLAN - planCombined);
+    var revenueLost = Math.round(tasksLost * REVENUE_PER_TASK);
+    var tasksRecovered = Math.max(0, missionsCombined - planCombined);
+    var recoveredRevenue = Math.round(tasksRecovered * REVENUE_PER_TASK);
+    var remainingHoleTasks = Math.max(0, ON_TIME_PLAN - missionsCombined);
+    var remainingHoleRevenue = Math.round(remainingHoleTasks * REVENUE_PER_TASK);
+    var loss28 = cardLoss(by28.plan.tasks, GOAL_SEP_28, onTime);
+    var loss30 = cardLoss(inc30.plan.tasks, GOAL_SEP_30_INCREMENT, onTime);
+
+    setText("receiptLabel", receipt.label === "After 9/30" ? "After Sep 30" : receipt.label + " / 2026");
+    document.getElementById("receiptSlider").value = String(safeIdx);
+
+    var dollars = document.getElementById("bannerDollars");
+    dollars.textContent = usd(revenueLost);
+    dollars.className = "banner-dollars " + (revenueLost > 0 ? "red" : "green");
+    setText(
+      "bannerMissed",
+      tasksLost === 0
+        ? "If the endpoint arrives by 9/26 you deliver 3,100. You do not lose any revenue."
+        : "You can send " + fmt(planCombined) + " instead of 3,100. That is " + fmt(tasksLost) +
+          " tasks you do not deliver, or " + usd(revenueLost) + " at $912 each."
+    );
+    var rec = document.getElementById("bannerRecovered");
+    if (tasksRecovered > 0) {
+      rec.hidden = false;
+      rec.textContent =
+        "High missions add " + fmt(tasksRecovered) + " extra tasks at $200 each. That brings in " +
+        usd(recoveredRevenue) + " more. Still short of 3,100: " + usd(remainingHoleRevenue) + ".";
+    } else {
+      rec.hidden = true;
+      rec.textContent = "";
+    }
+
+    var pills = "";
+    for (var p = 0; p < RECEIPT_OPTIONS.length; p++) {
+      pills +=
+        '<button type="button" class="pill' + (p === safeIdx ? " active" : "") +
+        '" data-idx="' + p + '">' + RECEIPT_OPTIONS[p].short + "</button>";
+    }
+    document.getElementById("pills").innerHTML = pills;
+
+    var sliderNote;
+    if (receipt.date > SEP_30) {
+      sliderNote = "The next endpoint does not show up this week. You can only send the 800 you already have. 9/29 and 9/30 can send 0.";
+    } else if (onTime) {
+      sliderNote = extrasBought > 0
+        ? "The endpoint is on time. You keep the 800 you have and run 9/26 through 9/30. Revenue lost is $0. High missions add 20 extra tasks at $200 each to reach 3,100."
+        : "The endpoint is on time. You keep the 800 you have and run 9/26 through 9/30. Revenue lost is $0.";
+    } else if (extrasBought < gap) {
+      sliderNote =
+        "Until " + receipt.label + " you only have 800 tasks. After that you can work again. Plan can send " +
+        fmt(planCombined) + ". High missions add every extra task they can (at most 20% more on a day you can work), " +
+        fmt(extrasBought) + " at $200 each, and you still do not reach 3,100.";
+    } else {
+      sliderNote =
+        "Until " + receipt.label + " you only have 800 tasks. After that you can work again. Plan can send " +
+        fmt(planCombined) + ". High missions add " + fmt(extrasBought) +
+        " extra tasks at $200 each (at most 20% more on a day you can work) to get to 3,100.";
+    }
+    setText("sliderNote", sliderNote);
+
+    var extrasEl = document.getElementById("extrasNote");
+    if (billedDays.length > 0) {
+      extrasEl.hidden = false;
+      extrasEl.textContent =
+        "Extra tasks at $200 each: " +
+        billedDays.map(function (d) { return d.label + " +" + fmt(d.extras); }).join(", ") + ".";
+    } else {
+      extrasEl.hidden = true;
+      extrasEl.textContent = "";
+    }
+
+    setText("by28TasksLost", "Tasks lost vs on-time: " + fmt(loss28.tasks) + " (this window is " + fmt(GOAL_SEP_28) + " of 3,100).");
+    setText("by28MoneyLost", "Revenue lost vs on-time: " + usd(loss28.money) + " ($912 each).");
+    document.getElementById("by28Plan").innerHTML = columnHtml(by28.plan, "plan", "Tasks through 9/28", GOAL_SEP_28, onTime);
+    document.getElementById("by28Missions").innerHTML = columnHtml(by28.missions, "missions", "Tasks through 9/28", GOAL_SEP_28, onTime);
+
+    setText("inc30TasksLost", "Tasks lost vs on-time: " + fmt(loss30.tasks) + " (this window is " + fmt(GOAL_SEP_30_INCREMENT) + " of 3,100).");
+    setText("inc30MoneyLost", "Revenue lost vs on-time: " + usd(loss30.money) + " ($912 each).");
+    document.getElementById("inc30Plan").innerHTML = columnHtml(inc30.plan, "plan", "Tasks on 9/29-30 only", GOAL_SEP_30_INCREMENT, onTime);
+    document.getElementById("inc30Missions").innerHTML = columnHtml(inc30.missions, "missions", "Tasks on 9/29-30 only", GOAL_SEP_30_INCREMENT, onTime);
+
+    document.getElementById("totalPlan").innerHTML = metric("Total you can send", fmt(planCombined));
+    document.getElementById("totalMissions").innerHTML = metric("Total you can send", fmt(missionsCombined));
+
+    renderBars(rows);
+    renderLine(rows);
+  }
+
+  var slider = document.getElementById("receiptSlider");
+  slider.max = String(RECEIPT_OPTIONS.length - 1);
+  slider.addEventListener("input", function () {
+    render(Number(slider.value));
+  });
+  document.getElementById("pills").addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-idx]");
+    if (!btn) return;
+    render(Number(btn.getAttribute("data-idx")));
+  });
+
+  render(0);
+})();
+</script>
+</body>
+</html>
