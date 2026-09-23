@@ -196,7 +196,7 @@
 <main>
   <div class="stack">
     <h1>Ultra Evals task capacity / endpoint delay</h1>
-    <p class="lede">Until the next endpoint shows up you only have 800 tasks (done by Sep 25). The slider is the arrival date. If it shows up 9/24, 9/25, or 9/26 you are on time and revenue lost is $0. Later arrivals cut 9/26 through 9/30. By Sep 28 is tasks through that day. By Sep 30 is 9/29 and 9/30 only. Total you can send is those two added. Cap is 3,100.</p>
+    <p class="lede">Until the next endpoint arrives, only 800 tasks are available (done by Sep 25). The slider is the arrival date. If it shows up 9/24, 9/25, or 9/26 the plan is on time and revenue lost is $0. Later arrivals cut 9/26 through 9/30. By Sep 28 is tasks through that day. By Sep 30 is 9/29 and 9/30 only. Total can send is those two added. Cap is 3,100.</p>
   </div>
 
   <div class="section stack">
@@ -257,8 +257,8 @@
   </section>
 
   <section class="section stack">
-    <h2>Total you can send</h2>
-    <p class="muted">By Sep 28 plus By Sep 30. What you can send. Cap 3,100.</p>
+    <h2>Total can send</h2>
+    <p class="muted">By Sep 28 plus By Sep 30. Combined can send. Cap 3,100.</p>
     <div class="grid2">
       <article class="card">
         <h3>Plan</h3>
@@ -285,7 +285,7 @@
 
   <section class="section stack">
     <h2>Running total</h2>
-    <p class="tertiary">800 is what you have without the next endpoint. 2,050 is on-time through Sep 28. 3,100 is the cap.</p>
+    <p class="tertiary">800 is available without the next endpoint. 2,050 is on-time through Sep 28. 3,100 is the cap.</p>
     <div class="legend">
       <span><i class="swatch plan"></i>On-time path</span>
       <span><i class="swatch info"></i>Plan</span>
@@ -578,9 +578,9 @@
     setText(
       "bannerMissed",
       tasksLost === 0
-        ? "If the endpoint arrives by 9/26 you deliver 3,100. You do not lose any revenue."
-        : "You can send " + fmt(planCombined) + " instead of 3,100. That is " + fmt(tasksLost) +
-          " tasks you do not deliver, or " + usd(revenueLost) + " at $912 each."
+        ? "If the endpoint arrives by 9/26 the plan delivers 3,100. Revenue lost is $0."
+        : "Can send " + fmt(planCombined) + " instead of 3,100. That is " + fmt(tasksLost) +
+          " tasks not delivered, or " + usd(revenueLost) + " at $912 each."
     );
     var rec = document.getElementById("bannerRecovered");
     if (tasksRecovered > 0) {
@@ -603,21 +603,21 @@
 
     var sliderNote;
     if (receipt.date > SEP_30) {
-      sliderNote = "The next endpoint does not show up this week. You can only send the 800 you already have. 9/29 and 9/30 can send 0.";
+      sliderNote = "The next endpoint does not show up this week. Can only send the 800 already in hand. 9/29 and 9/30 can send 0.";
     } else if (onTime) {
       sliderNote = extrasBought > 0
-        ? "The endpoint is on time. You keep the 800 you have and run 9/26 through 9/30. Revenue lost is $0. High missions add 20 extra tasks at $200 each to reach 3,100."
-        : "The endpoint is on time. You keep the 800 you have and run 9/26 through 9/30. Revenue lost is $0.";
+        ? "The endpoint is on time. The 800 already in hand stay, and 9/26 through 9/30 run. Revenue lost is $0. High missions add 20 extra tasks at $200 each to reach 3,100."
+        : "The endpoint is on time. The 800 already in hand stay, and 9/26 through 9/30 run. Revenue lost is $0.";
     } else if (extrasBought < gap) {
       sliderNote =
-        "Until " + receipt.label + " you only have 800 tasks. After that you can work again. Plan can send " +
-        fmt(planCombined) + ". High missions add every extra task they can (at most 20% more on a day you can work), " +
-        fmt(extrasBought) + " at $200 each, and you still do not reach 3,100.";
+        "Until " + receipt.label + " only 800 tasks are available. After that work can resume. Plan can send " +
+        fmt(planCombined) + ". High missions add every extra task they can (at most 20% more on a working day), " +
+        fmt(extrasBought) + " at $200 each, and still do not reach 3,100.";
     } else {
       sliderNote =
-        "Until " + receipt.label + " you only have 800 tasks. After that you can work again. Plan can send " +
+        "Until " + receipt.label + " only 800 tasks are available. After that work can resume. Plan can send " +
         fmt(planCombined) + ". High missions add " + fmt(extrasBought) +
-        " extra tasks at $200 each (at most 20% more on a day you can work) to get to 3,100.";
+        " extra tasks at $200 each (at most 20% more on a working day) to get to 3,100.";
     }
     setText("sliderNote", sliderNote);
 
@@ -642,8 +642,8 @@
     document.getElementById("inc30Plan").innerHTML = columnHtml(inc30.plan, "plan", "Tasks on 9/29-30 only", GOAL_SEP_30_INCREMENT, onTime);
     document.getElementById("inc30Missions").innerHTML = columnHtml(inc30.missions, "missions", "Tasks on 9/29-30 only", GOAL_SEP_30_INCREMENT, onTime);
 
-    document.getElementById("totalPlan").innerHTML = metric("Total you can send", fmt(planCombined));
-    document.getElementById("totalMissions").innerHTML = metric("Total you can send", fmt(missionsCombined));
+    document.getElementById("totalPlan").innerHTML = metric("Total can send", fmt(planCombined));
+    document.getElementById("totalMissions").innerHTML = metric("Total can send", fmt(missionsCombined));
 
     renderBars(rows);
     renderLine(rows);
