@@ -107,6 +107,30 @@ def test_a_rubric_empty_tasks_deterministic_checks_still_count(tmp_path):
     assert rate_230["denominator"] == 0
 
 
+def test_shared_aspirational_overrides_apply_on_a_mixed_clone_batch(tmp_path, capsys):
+    from dataclasses import replace
+
+    orig = replace(make_task("orig"), project_id="6a84adb9124120a0ad6fa217")
+    clone = replace(make_task("clone"), project_id="6a90995deeeca5f9655d1fb6")
+    src = write_batch(tmp_path, [orig, clone])
+    assert main([str(src), "--dry-run"]) == 0
+    err = capsys.readouterr().err
+    assert "none applied" not in err
+    assert "applied shared overrides" in err
+    assert "weight_scale" in err
+
+
+def test_mixed_l1_and_aspirational_does_not_apply_either_policy(tmp_path, capsys):
+    from dataclasses import replace
+
+    l1 = make_task("l1")
+    asp = replace(make_task("asp"), project_id="6a84adb9124120a0ad6fa217")
+    src = write_batch(tmp_path, [l1, asp])
+    assert main([str(src), "--dry-run"]) == 0
+    err = capsys.readouterr().err
+    assert "none applied" in err
+
+
 def test_dry_run_reports_the_call_count_without_touching_a_model(tmp_path, capsys):
     src = write_batch(tmp_path, [make_task("a", n_criteria=20), make_task("b", n_criteria=10)])
     assert main([str(src), "--rubric-stage", "--rating-stage", "--dry-run"]) == 0
@@ -219,6 +243,29 @@ def test_an_empty_rubric_plus_a_real_integrity_problem_still_fails_1000():
     for task in payload["tasks"]:
         assert task["verdict"] == "unauditable"
         assert 1000 in task["fail_checks"]
+
+
+def test_missing_likert_does_not_block_a_run_that_does_not_grade_ranking():
+    """Pending tasks often have a rubric and no SxS pick yet. A rubric-only
+    (or prompt-flag) run must still spend the authoring / environment calls
+    rather than roll the whole task up as unauditable."""
+    from honeybee_qc.cli import audit_batch
+    from honeybee_qc.llm import FakeModelClient
+
+    pending = make_task("pending")
+    pending.sxs.likert = None
+    client = FakeModelClient(lambda req: None)
+    payload = audit_batch(
+        [pending],
+        client=client,
+        rubric_stage=True,
+        informed_stage=True,
+        restricted_checks=(200, 210, 220, 230, 240, 250, 260, 85),
+    )
+    task = payload["tasks"][0]
+    assert task["verdict"] != "unauditable"
+    assert 1000 not in task["fail_checks"]
+    assert client.calls  # rubric / 85 / 220 were actually asked
 
 
 def test_a_structurally_unauditable_task_never_spends_a_rating_call(tmp_path):
@@ -492,3 +539,129 @@ def test_dry_run_prices_the_sample_configuration_it_was_asked_for(tmp_path, caps
     # Without a cache to price against, the dry run says so rather than printing a
     # dollar figure it cannot support.
     assert "no per-call prices available" in sampled
+
+
+# ---------------------------------------------------------------------------
+# Per-task progress. A full batch runs for hours and writes its report once, at
+# the end, so the run has to say something as it goes or an operator cannot tell
+# a slow run from a wedged one.
+# ---------------------------------------------------------------------------
+
+
+def test_progress_fires_once_per_task_with_a_verdict_as_each_finishes():
+    from honeybee_qc.cli import audit_batch
+    from honeybee_qc.llm import FakeModelClient
+
+    seen = []
+    audit_batch(
+        [make_task("one"), make_task("two"), make_task("three")],
+        client=FakeModelClient(lambda req: None),
+        on_task_done=seen.append,
+    )
+
+    assert [p.task_id for p in seen] == ["one", "two", "three"]
+    # Numbered as they complete, so the counter reads as progress through the
+    # batch rather than as an index into the input.
+    assert [p.done for p in seen] == [1, 2, 3]
+    assert {p.total for p in seen} == {3}
+    assert all(p.verdict for p in seen)
+
+
+def test_progress_reports_the_failing_checks_that_caused_a_fail():
+    """The point of a live line is to see *what* broke without opening the
+    report, so the fail list travels with it."""
+    from honeybee_qc.cli import audit_batch
+    from honeybee_qc.llm import FakeModelClient
+
+    broken = make_task("broken")
+    broken.sxs.likert = None
+
+    seen = []
+    audit_batch(
+        [broken],
+        client=FakeModelClient(lambda req: None),
+        on_task_done=seen.append,
+    )
+
+    assert seen[0].verdict == "unauditable"
+    assert seen[0].fail_checks == [1000]
+
+
+def test_a_task_that_crashes_outright_is_reported_as_errored_not_as_a_pass():
+    """A task that dies before rollup has no verdict. Reporting it as anything
+    pass-shaped would hide a pipeline bug during exactly the long run where it
+    matters most."""
+    from honeybee_qc.cli import _TaskOutcome, _progress_for, StageError
+
+    outcome = _TaskOutcome(
+        task_id="died",
+        errors=[StageError("died", "task", "RuntimeError: boom")],
+    )
+    progress = _progress_for(outcome, done=4, total=9, elapsed_s=1.5)
+
+    assert progress.verdict == "error"
+    assert progress.errored is True
+    assert progress.fail_checks == []
+
+
+def test_a_progress_callback_that_raises_does_not_lose_the_task():
+    """Progress is diagnostics. It must never be the reason a task that cost
+    real money to audit comes back empty."""
+    from honeybee_qc.cli import audit_batch
+    from honeybee_qc.llm import FakeModelClient
+
+    def explode(progress):
+        raise RuntimeError("reporting is broken")
+
+    payload = audit_batch(
+        [make_task("survivor")],
+        client=FakeModelClient(lambda req: None),
+        on_task_done=explode,
+    )
+
+    assert [t["task_id"] for t in payload["tasks"]] == ["survivor"]
+
+
+def test_the_printed_line_carries_running_totals_and_separates_errors_from_fails():
+    import io
+
+    from honeybee_qc.cli import ProgressPrinter, TaskProgress
+
+    stream = io.StringIO()
+    printer = ProgressPrinter(stream=stream)
+    printer(TaskProgress(done=1, total=3, task_id="a", verdict="clean", cost_usd=2.0))
+    printer(
+        TaskProgress(
+            done=2,
+            total=3,
+            task_id="b",
+            verdict="fail",
+            fail_checks=[300, 400],
+            cost_usd=3.5,
+        )
+    )
+    printer(
+        TaskProgress(done=3, total=3, task_id="c", verdict="error", errored=True)
+    )
+
+    lines = stream.getvalue().strip().splitlines()
+    assert "[1/3] a clean" in lines[0]
+    assert "0 failing" in lines[0]
+    assert "$2.00 spent" in lines[0]
+    assert "fails=300,400" in lines[1]
+    assert "1 failing" in lines[1]
+    # Spend accumulates across tasks rather than restating each task's own cost.
+    assert "$5.50 spent" in lines[1]
+    # The crashed task is counted apart from the one that genuinely failed
+    # policy, so a pipeline bug is never read as a defect in the audited work.
+    assert "1 failing, 1 errored" in lines[2]
+
+
+def test_progress_can_be_switched_off(tmp_path, capsys):
+    src = write_batch(tmp_path, [make_task("quiet")])
+
+    main([str(src), "--no-progress"])
+    assert "[1/1]" not in capsys.readouterr().err
+
+    main([str(src)])
+    assert "[1/1] quiet" in capsys.readouterr().err

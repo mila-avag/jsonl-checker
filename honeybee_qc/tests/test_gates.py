@@ -14,6 +14,7 @@ from honeybee_qc.findings import (
     DimensionRatingFinding,
     InversionFinding,
     Issue,
+    JustificationCoverage,
     JustificationFinding,
     LikertFinding,
     RelevantTurnFinding,
@@ -605,6 +606,88 @@ def test_relevant_turns_all_correct_is_clean(check_id):
     assert evaluate_relevant_turns(task, check_id, []).band == "clean"
 
 
+def _rubric_findings(wrong: int, items: int, check_id: int = 280):
+    """`items` audited criteria, `wrong` of them carrying one bad citation each."""
+    return [
+        RelevantTurnFinding(
+            check_id=check_id,
+            item_id=f"criterion{i}",
+            model="A",
+            incorrect_turns=[4] if i < wrong else [],
+        )
+        for i in range(items)
+    ]
+
+
+def test_280_scales_its_bar_with_the_rubric_it_is_counting_over():
+    """Three wrong citations means something different on a 34-criterion rubric
+    than on a five-criterion one, and the absolute count could not tell them apart.
+
+    280's population is the rubric, which runs 0 to 54 criteria on this corpus. Its
+    numerator correlates with rubric size at +0.61, the median `items_audited` on an
+    escalation is 34 against 0 on a non-escalation, and 10 of the 14 false fails
+    charged to the 280/310 family were 280. A big rubric gets more chances to reach
+    three; a task without a rubric can never trip the check at all.
+    """
+    task = make_task()
+
+    big = evaluate_relevant_turns(task, 280, _rubric_findings(3, 34))
+    assert big.measurement.numerator == 3
+    assert big.measurement.rate == pytest.approx(3 / 34)
+    assert big.measurement.counts["over_count_threshold"] is True
+    assert big.measurement.counts["over_rate_threshold"] is False
+    assert big.measurement.counts["held_below_rate_floor"] is True
+    assert big.band == "non_fail", "3 of 34 criteria is 9%, under the 33% floor"
+
+    small = evaluate_relevant_turns(task, 280, _rubric_findings(3, 5))
+    assert small.measurement.numerator == 3
+    assert small.measurement.counts["held_below_rate_floor"] is False
+    assert small.band == "fail", "3 of 5 criteria is 60%, and both legs hold"
+
+
+def test_280_keeps_the_absolute_count_as_well_as_the_rate():
+    """Both legs are required, so a rate alone cannot fail a task either: one wrong
+    citation out of two audited criteria is 50% and still a single mistake."""
+    task = make_task()
+    v = evaluate_relevant_turns(task, 280, _rubric_findings(1, 2))
+    assert v.measurement.rate == pytest.approx(0.5)
+    assert v.measurement.counts["over_rate_threshold"] is True
+    assert v.measurement.counts["over_count_threshold"] is False
+    assert v.band == "non_fail"
+
+
+def test_310_deliberately_has_no_rate_floor():
+    """310's population is the dimension ratings -- fourteen items on every task --
+    so it has no size to correlate with, and it measured at -0.26. A shared floor
+    would raise its effective bar from three to five for no reason anyone measured.
+    """
+    task = make_task()
+    v = evaluate_relevant_turns(task, 310, _rubric_findings(3, 14, check_id=310))
+    assert v.band == "fail"
+    assert v.measurement.rate is None
+    assert v.measurement.counts["rate_threshold"] is None
+    assert v.measurement.counts["over_rate_threshold"] is False
+
+    # And the same shape on 280 is a non-fail, which is the whole difference.
+    on_280 = evaluate_relevant_turns(task, 280, _rubric_findings(3, 14))
+    assert on_280.band == "non_fail"
+
+
+def test_280_with_no_audited_items_falls_back_to_the_count_leg_alone():
+    """A task whose rubric the check never audited has no share to clear. The floor
+    must not become an accidental amnesty for a task with no denominator."""
+    task = make_task()
+    v = evaluate_relevant_turns(task, 280, _turn_findings(280, 3))
+    assert v.measurement.counts["items_audited"] == 3
+    assert v.band == "fail"
+
+    # `missing_turn` findings carry no `item_id` population of their own, so a task
+    # that reached the count purely through them still fails.
+    only_missing = evaluate_relevant_turns(task, 280, _turn_findings(280, 0, missing=3))
+    assert only_missing.measurement.numerator == 3
+    assert only_missing.band == "fail"
+
+
 def test_280_and_310_findings_never_leak_into_each_other():
     task = make_task()
     mixed = _turn_findings(280, 3) + _turn_findings(310, 1)
@@ -664,33 +747,96 @@ def test_300_at_exactly_two_major_is_a_fail():
     assert v.band == "fail"
 
 
-def test_300_one_major_plus_three_minor_is_a_non_fail():
+def test_300_fails_on_summed_points_not_on_a_count_of_dimensions():
+    """The leg's unit. Five 1-point disagreements are not a failing task and two
+    3-point ones are, which no count of dimensions can express: the old leg scored
+    a confirmed 1-point gap exactly like a 4-point one and failed a task at two of
+    them. Of the 7 false fails on the human-QC-clean corpus, 5 were sets of gaps
+    totalling 5 points or fewer.
+    """
     task = make_task()
-    v = evaluate_check_300(task, dimension_rating_findings(n_major=1, n_minor=3))
-    assert v.measurement.counts["major_disagreements"] == 1
-    assert v.measurement.counts["total_disagreements"] == 4
-    assert v.band == "non_fail"
+    five_ones = evaluate_check_300(task, dimension_rating_findings(n_minor=5))
+    assert five_ones.measurement.counts["total_disagreements"] == 5
+    assert five_ones.measurement.counts["total_points"] == 5
+    assert five_ones.band == "non_fail"
+
+    six_ones = evaluate_check_300(task, dimension_rating_findings(n_minor=6))
+    assert six_ones.measurement.counts["total_points"] == 6
+    assert six_ones.band == "fail"
+
+    two_threes = evaluate_check_300(task, dimension_rating_findings(n_major=2))
+    assert two_threes.measurement.counts["total_points"] == 6
+    assert two_threes.band == "fail"
 
 
-def test_300_five_total_minor_is_a_fail():
+def test_300_one_confirmed_gap_is_a_non_fail_and_the_band_stays_reachable():
+    """The band below fail has to stay reachable, or the check reports every
+    disagreement as a task failure. These are confirmed gaps, not blind ones: an
+    informed reader was shown the contributor's own rating and reasoning and called
+    it indefensible, and one of those is still a single reviewer difference."""
     task = make_task()
-    v = evaluate_check_300(task, dimension_rating_findings(n_minor=5))
-    assert v.measurement.counts["major_disagreements"] == 0
-    assert v.measurement.counts["total_disagreements"] == 5
-    assert v.band == "fail"
+    one = evaluate_check_300(task, dimension_rating_findings(n_minor=1))
+    assert one.measurement.counts["total_disagreements"] == 1
+    assert one.measurement.counts["total_points"] == 1
+    assert one.band == "non_fail"
+
+    # A single major gap is 3 points, under the 6-point leg and under the 2-gap
+    # major leg, so it is a non-fail as well -- and it says why in the numbers.
+    lone_major = evaluate_check_300(task, dimension_rating_findings(n_major=1))
+    assert lone_major.measurement.counts["major_disagreements"] == 1
+    assert lone_major.measurement.counts["total_points"] == 3
+    assert lone_major.band == "non_fail"
+
+
+def test_300_publishes_the_per_item_magnitudes_the_gate_summed():
+    """Without these an offline re-score has to reconstruct the deltas from the
+    cache, which is what the last one had to do. The gate is a pure function of
+    findings and policy, so publishing its inputs makes a re-score exact."""
+    task = make_task()
+    v = evaluate_check_300(task, dimension_rating_findings(n_major=1, n_minor=2))
+    points = v.measurement.counts["points_by_item"]
+    assert sorted(points.values()) == [1, 1, 3]
+    assert sum(points.values()) == v.measurement.counts["total_points"] == 5
+    assert v.measurement.numerator == 5
+    assert v.measurement.threshold == DEFAULT_POLICY.dimension_fail_total_points
+
+
+def test_300_reports_that_the_major_leg_cannot_fire_at_the_configured_numbers():
+    """Two gaps of three points is six points, so the points leg fails the task
+    first and the major leg has no case of its own. It was dead code under the old
+    count leg for the mirror-image reason and it is dead again here -- which is
+    worth publishing rather than leaving in a comment, because the last reader of
+    `config.py` reasonably believed two 3-point gaps were what failed a task when
+    two 1-point gaps already did."""
+    task = make_task()
+    v = evaluate_check_300(task, dimension_rating_findings(n_major=2))
+    assert v.measurement.counts["major_leg_can_fire"] is False
+    assert "cannot fire on its own" in v.measurement.notes
+
+    # It is not dead in general: raise the points bar above major_count * delta and
+    # the leg starts binding again, which is the reason to keep it.
+    policy = Policy(dimension_fail_total_points=9)
+    v = evaluate_check_300(task, dimension_rating_findings(n_major=2), policy)
+    assert v.measurement.counts["major_leg_can_fire"] is True
+    assert v.band == "fail", "6 points is under 9, so only the major leg can hold"
 
 
 def test_300_bands_are_exhaustive_with_no_gap_or_overlap():
     task = make_task()
+    policy = DEFAULT_POLICY
     for major in range(0, 3):
         for minor in range(0, 6):
             if major + minor > 12:
                 continue
             v = evaluate_check_300(task, dimension_rating_findings(n_major=major, n_minor=minor))
-            total = major + minor
-            if major >= 2 or total >= 5:
+            # The fixture's majors are 3-point gaps and its minors 1-point gaps.
+            points = major * 3 + minor
+            if (
+                major >= policy.dimension_fail_major_count
+                or points >= policy.dimension_fail_total_points
+            ):
                 assert v.band == "fail", (major, minor)
-            elif total >= 1:
+            elif major + minor >= 1:
                 assert v.band == "non_fail", (major, minor)
             else:
                 assert v.band == "clean", (major, minor)
@@ -759,17 +905,166 @@ def test_400_uses_raw_deltas_not_bucket_agreement():
     assert evaluate_check_400(task, LikertFinding(2, 3)).band == "non_fail"
 
 
+def test_400_a_gap_nobody_could_judge_abstains_rather_than_passing():
+    """A dropped ranking gap is an open question, and 400 has no band below clean.
+
+    Each of these three exclusions means the comparison could not be made, not that
+    it came out even -- and reporting them as clean is what made the recorded run
+    read as though a preference had been checked and found sound.
+    """
+    task = make_task()
+
+    asymmetric = LikertFinding(
+        2, 5, turns_shown_a=8, turns_shown_b=1, turns_total_a=8, turns_total_b=20
+    )
+    truncated = LikertFinding(
+        2,
+        5,
+        truncated_a=True,
+        turns_shown_a=10,
+        turns_shown_b=10,
+        turns_total_a=20,
+        turns_total_b=10,
+        adjudication="indefensible",
+        adjudication_tail_truncated=True,
+    )
+    unadjudicated = LikertFinding(
+        2,
+        5,
+        turns_shown_a=10,
+        turns_shown_b=10,
+        turns_total_a=10,
+        turns_total_b=10,
+        adjudication_abstained=True,
+    )
+
+    for finding, reason in (
+        (asymmetric, "asymmetric_render"),
+        (truncated, "truncated_evidence"),
+        (unadjudicated, "unadjudicated"),
+    ):
+        verdict = evaluate_check_400(task, finding)
+        assert verdict.band == "not_evaluated", reason
+        assert verdict.measurement.counts["not_counted_because"] == reason
+        assert verdict.measurement.counts["unjudged"] is True
+
+
+def test_400_a_gap_an_informed_reader_called_defensible_is_clean_not_abstained():
+    """The one exclusion that is an answer: someone read both sides and decided."""
+    task = make_task()
+    finding = LikertFinding(
+        2,
+        5,
+        turns_shown_a=10,
+        turns_shown_b=10,
+        turns_total_a=10,
+        turns_total_b=10,
+        adjudication="defensible",
+    )
+
+    verdict = evaluate_check_400(task, finding)
+
+    assert verdict.band == "clean"
+    assert verdict.measurement.counts["unjudged"] is False
+
+
+def test_400_counts_a_gap_the_blind_pass_read_cut_once_a_full_render_confirms_it():
+    """Truncation of the blind comparison alone no longer suppresses the finding."""
+    task = make_task()
+    finding = LikertFinding(
+        2,
+        5,
+        truncated_a=True,
+        turns_shown_a=18,
+        turns_shown_b=20,
+        turns_total_a=20,
+        turns_total_b=20,
+        adjudication="indefensible",
+        adjudication_tail_truncated=False,
+    )
+
+    verdict = evaluate_check_400(task, finding)
+
+    assert verdict.band == "fail"
+    assert verdict.measurement.counts["counted_delta"] == 3
+
+
 # ---------------------------------------------------------------------------
 # 450 -- justifications
 # ---------------------------------------------------------------------------
 
 
-def test_450_one_bad_primary_claim_fails_but_one_bad_secondary_does_not():
+def _v5_task():
+    """A three-model, two-comparison task under the V5 justification rule."""
+    from honeybee_qc.projects import HONEYBEE_ASPIRATIONAL
+
+    task = make_task()
+    task.expected_slots = ("A", "B", "C", "S")
+    return task, HONEYBEE_ASPIRATIONAL.policy()
+
+
+def test_450_v5_rule_spares_a_task_whose_other_models_are_clean():
+    """One fabricated claim on Model A fails under our rule and not under V5's.
+
+    This is the single largest strictness difference between the two specs, so it
+    is asserted in both directions rather than described.
+    """
+    task, v5 = _v5_task()
+    fabricated = [JustificationFinding(item_id="A::Outcome quality", inaccurate_primary_claims=1)]
+
+    assert evaluate_check_450(task, fabricated).band == "fail"
+    assert evaluate_check_450(task, fabricated, v5).band == "non_fail"
+
+
+def test_450_v5_rule_fails_once_every_model_carries_a_major_issue():
+    task, v5 = _v5_task()
+    findings = [
+        JustificationFinding(item_id=f"{slot}::Outcome quality", inaccurate_primary_claims=1)
+        for slot in ("A", "B", "C")
+    ]
+    verdict = evaluate_check_450(task, findings, v5)
+    assert verdict.band == "fail"
+    assert verdict.measurement.counts["every_model_has_a_major_issue"] is True
+    assert verdict.measurement.counts["models_with_a_major_issue"] == ["A", "B", "C"]
+
+
+def test_450_v5_rule_fails_when_every_comparison_carries_a_major_issue():
+    """The second leg, which can convict while two of three models are clean."""
+    task, v5 = _v5_task()
+    pairs = [c.pair_label for c in task.comparison_list()]
+    findings = [
+        JustificationFinding(item_id=f"ranking::{label}", inaccurate_primary_claims=1)
+        for label in pairs
+    ]
+    verdict = evaluate_check_450(task, findings, v5)
+    assert verdict.band == "fail"
+    assert verdict.measurement.counts["every_comparison_has_a_major_issue"] is True
+    assert verdict.measurement.counts["models_with_a_major_issue"] == []
+
+
+def test_450_v5_rule_keeps_minor_issues_out_of_the_fail_band():
+    """"the task justifications contain only Minor Issues" is non-fail, however
+    many of them there are."""
+    task, v5 = _v5_task()
+    findings = [
+        JustificationFinding(item_id=f"{slot}::Outcome quality", misconstrued_evidence=1)
+        for slot in ("A", "B", "C")
+    ]
+    assert evaluate_check_450(task, findings, v5).band != "fail"
+
+
+def test_450_one_bad_claim_fails_on_either_branch():
+    """Both branches of `is_inaccurate` now fail at one instance.
+
+    The subordinate branch used to need two, on the spec's equivalence between
+    two subordinate errors and one load-bearing one. It fails at one here by
+    `findings.SECONDARY_INACCURACY_FLOOR`, which is ours and not the spec's.
+    """
     task = make_task()
     primary = JustificationFinding(item_id="A::Outcome quality", inaccurate_primary_claims=1)
     secondary = JustificationFinding(item_id="A::Outcome quality", inaccurate_secondary_claims=1)
     assert evaluate_check_450(task, [primary]).band == "fail"
-    assert evaluate_check_450(task, [secondary]).band == "non_fail"
+    assert evaluate_check_450(task, [secondary]).band == "fail"
 
 
 def test_450_two_bad_secondary_claims_fail():
@@ -786,26 +1081,118 @@ def test_450_one_inaccurate_quote_fails_but_one_misread_quote_does_not():
     assert evaluate_check_450(task, [misread]).band == "non_fail"
 
 
-def test_450_thresholds_are_counted_within_a_single_justification():
+def _padded(bad: list[JustificationFinding], total: int = 15):
+    clean = [
+        JustificationFinding(item_id=f"clean{i}") for i in range(total - len(bad))
+    ]
+    return bad + clean
+
+
+def test_450_a_floor_is_still_met_inside_one_justification():
     task = make_task()
     one_bad = JustificationFinding(item_id="one", unsupported_claims=2)
     assert evaluate_check_450(task, [one_bad]).band == "fail"
 
-    spread = [
-        JustificationFinding(item_id="one", unsupported_claims=1),
-        JustificationFinding(item_id="two", unsupported_claims=1),
-    ]
-    assert evaluate_check_450(task, spread).band == "non_fail"
+
+def test_450_the_same_defect_repeated_across_justifications_is_credited():
+    """One unsupported claim in each of two arguments is a pattern, not two
+    clean arguments. Each floor is read inside a justification, so before this
+    the pair scored zero failing justifications. Credit is proportionate: two
+    instances against a floor of two are worth one failing justification, not
+    two."""
+    task = make_task()
+    spread = _padded(
+        [
+            JustificationFinding(item_id="one", unsupported_claims=1),
+            JustificationFinding(item_id="two", unsupported_claims=1),
+        ]
+    )
+    v = evaluate_check_450(task, spread)
+    assert v.measurement.counts["failing_justifications"] == 1
+    assert v.measurement.counts["aggregated_conditions_by_item"] == {
+        "one": ["lacks_evidence"]
+    }
+    # One of fifteen is far under the share, and an aggregated condition may not
+    # reach the escape, so the pattern is reported without failing the task.
+    assert v.measurement.counts["failed_on_severity"] is False
+    assert v.band == "non_fail"
+
+
+def test_450_a_lone_sub_floor_defect_is_not_aggregated():
+    task = make_task()
+    lone = _padded([JustificationFinding(item_id="one", unsupported_claims=1)])
+    v = evaluate_check_450(task, lone)
+    assert v.measurement.counts["failing_justifications"] == 0
+    assert v.band == "non_fail"
+
+
+def test_450_is_inaccurate_no_longer_has_an_aggregation_route():
+    """At a floor of 1 the subordinate branch cannot be reached by aggregation.
+
+    This test used to hold the opposite and more interesting property: two
+    justifications with one subordinate error each met no floor alone, were
+    credited `is_inaccurate` by `aggregate_repeated_conditions` for the share's
+    sake, and had to be denied the severity escape -- otherwise a defect too
+    diffuse to meet any floor would outweigh a single false load-bearing claim.
+
+    `findings.SECONDARY_INACCURACY_FLOOR = 1` removes that route rather than
+    changing its handling. Each item now trips the condition on its own counts,
+    so it reaches the escape honestly and the task fails. The guard in
+    `aggregate_repeated_conditions` is untouched and still governs the two
+    conditions that keep a floor of two; neither is in
+    `justification_severe_conditions`, so nothing exercises it today.
+    """
+    task = make_task()
+    spread = _padded(
+        [
+            JustificationFinding(item_id="one", inaccurate_secondary_claims=1),
+            JustificationFinding(item_id="two", inaccurate_secondary_claims=1),
+        ]
+    )
+    v = evaluate_check_450(task, spread)
+    assert v.measurement.counts["conditions_by_item"]["one"] == ["is_inaccurate"]
+    assert v.measurement.counts["conditions_by_item"]["two"] == ["is_inaccurate"]
+    assert v.measurement.counts["aggregated_conditions_by_item"] == {}
+    assert v.measurement.counts["severe_conditions_by_item"] == {
+        "one": ["is_inaccurate"],
+        "two": ["is_inaccurate"],
+    }
+    assert v.band == "fail"
+
+    # One instance is now the whole condition, so one item is enough by itself.
+    native = _padded([JustificationFinding(item_id="one", inaccurate_secondary_claims=1)])
+    assert evaluate_check_450(task, native).band == "fail"
+
+
+def test_450_repetition_pushes_a_task_over_the_share():
+    """Ten arguments each resting once on nothing are worth five failures, a third
+    of the population and a fail. Two such arguments are worth one and are not."""
+    task = make_task()
+    ten = _padded(
+        [JustificationFinding(item_id=f"bad{i}", unsupported_claims=1) for i in range(10)]
+    )
+    v = evaluate_check_450(task, ten)
+    assert v.measurement.counts["failing_justifications"] == 5
+    assert v.band == "fail"
+
+    two = _padded(
+        [JustificationFinding(item_id=f"bad{i}", unsupported_claims=1) for i in range(2)]
+    )
+    assert evaluate_check_450(task, two).measurement.counts["failing_justifications"] == 1
+    assert evaluate_check_450(task, two).band == "non_fail"
 
 
 def test_450_pooled_scope_changes_the_outcome():
     task = make_task()
-    spread = [
-        JustificationFinding(item_id="one", unsupported_claims=1),
-        JustificationFinding(item_id="two", unsupported_claims=1),
-    ]
+    spread = _padded(
+        [
+            JustificationFinding(item_id="one", unsupported_claims=1),
+            JustificationFinding(item_id="two", unsupported_claims=1),
+        ]
+    )
     pooled = evaluate_check_450(task, spread, Policy(justification_scope="pooled"))
     assert pooled.band == "fail"
+    assert evaluate_check_450(task, spread).band == "non_fail"
 
 
 def test_450_generic_praise_fails_regardless_of_the_rating():
@@ -822,6 +1209,75 @@ def test_450_clean_justifications_are_clean():
     v = evaluate_check_450(task, findings)
     assert v.band == "clean"
     assert v.measurement.counts["justifications_audited"] == 13
+
+
+# ---------------------------------------------------------------------------
+# 450 -- the population the denominator was taken from
+# ---------------------------------------------------------------------------
+
+
+def _coverage(audited: dict[str, int]) -> JustificationCoverage:
+    """A full task's expectation, with only `audited` of each model's set judged."""
+    coverage = JustificationCoverage()
+    for model in ("A", "B"):
+        coverage.expected[model] = [f"{model}::d{i}" for i in range(7)]
+        coverage.audited[model] = coverage.expected[model][: audited.get(model, 7)]
+    coverage.expected["ranking"] = ["ranking"]
+    coverage.audited["ranking"] = ["ranking"]
+    return coverage
+
+
+def test_450_will_not_certify_a_task_a_whole_model_is_missing_from():
+    """`6a7d3a48a9485b6a031cb305`: model B's set never came back, the check
+    published clean over model A's eight with an empty condition map, and human
+    QC had failed the task for Bad Justifications. Eight of fifteen is 53% and
+    clears a per-task floor, which is why the floor is read per model."""
+    task = make_task()
+    findings = [JustificationFinding(item_id=f"A::d{i}") for i in range(7)]
+
+    assert evaluate_check_450(task, findings).band == "clean"
+
+    v = evaluate_check_450(task, findings, DEFAULT_POLICY, _coverage({"A": 7, "B": 0}))
+    assert v.band == "not_evaluated"
+    assert v.measurement.counts["coverage"]["audited"]["B"] == 0
+    assert "B" in v.measurement.notes
+
+
+def test_450_non_fail_is_as_much_a_certification_as_clean():
+    """Both say the task did not reach the bar, and neither is a statement anyone
+    can make about justifications that never arrived."""
+    task = make_task()
+    findings = _padded([JustificationFinding(item_id="A::d0", unsupported_claims=1)], 7)
+
+    assert evaluate_check_450(task, findings).band == "non_fail"
+    assert (
+        evaluate_check_450(
+            task, findings, DEFAULT_POLICY, _coverage({"A": 7, "B": 0})
+        ).band
+        == "not_evaluated"
+    )
+
+
+def test_450_a_fail_survives_a_short_population():
+    """The defect is in a justification that was read, and finding it in seven of
+    fifteen is still finding it -- the same principle that keeps one abstention
+    from taking the remaining justifications out of the check."""
+    task = make_task()
+    findings = [JustificationFinding(item_id="A::d0", inaccurate_primary_claims=1)]
+
+    v = evaluate_check_450(task, findings, DEFAULT_POLICY, _coverage({"A": 7, "B": 0}))
+    assert v.band == "fail"
+
+
+def test_450_a_thin_scattering_of_losses_still_certifies():
+    """The floor is a floor, not a demand for the whole set: a model missing one
+    justification of seven has been read, and abstaining there would trade a rare
+    silent pass for a common silent gap."""
+    task = make_task()
+    findings = [JustificationFinding(item_id=f"j{i}") for i in range(13)]
+
+    v = evaluate_check_450(task, findings, DEFAULT_POLICY, _coverage({"A": 6, "B": 6}))
+    assert v.band == "clean"
 
 
 # The Trust & grounding justification from task 6a7190c542368ece68aa26a0, which
@@ -927,10 +1383,16 @@ def test_450_one_bad_justification_among_fifteen_does_not_fail_the_task():
 
 
 def test_450_fails_once_the_share_reaches_the_threshold():
+    """At the recalibrated share of 0.10, one of ten is exactly the bar.
+
+    The share came down from 0.20 with the aggregation change and must not be read
+    on its own: unanimity across five draws cuts the population of surviving
+    defects hard, and a share calibrated against a bare majority stops firing once
+    it is applied to what survives 5-of-5.
+    """
     task = make_task()
-    # 5 of 15 is exactly 33%, the first reachable rate at or above 30%.
-    assert evaluate_check_450(task, _justifications(15, 4)).band == "non_fail"
-    assert evaluate_check_450(task, _justifications(15, 5)).band == "fail"
+    assert evaluate_check_450(task, _justifications(11, 1)).band == "non_fail"
+    assert evaluate_check_450(task, _justifications(10, 1)).band == "fail"
 
 
 def test_450_the_threshold_is_inclusive_like_every_other_rate_gate():
@@ -939,11 +1401,11 @@ def test_450_the_threshold_is_inclusive_like_every_other_rate_gate():
 
 
 def test_450_the_share_is_taken_over_the_population_not_a_fixed_count():
-    """Proportional, not a disguised absolute: the same three failing
-    justifications decide differently in a small population and a large one."""
+    """Proportional, not a disguised absolute: the same single failing
+    justification decides differently in a small population and a large one."""
     task = make_task()
-    assert evaluate_check_450(task, _justifications(6, 3)).band == "fail"
-    assert evaluate_check_450(task, _justifications(15, 3)).band == "non_fail"
+    assert evaluate_check_450(task, _justifications(6, 1)).band == "fail"
+    assert evaluate_check_450(task, _justifications(15, 1)).band == "non_fail"
 
 
 def test_450_sub_threshold_triggers_are_still_reported_as_non_clean():
@@ -953,13 +1415,10 @@ def test_450_sub_threshold_triggers_are_still_reported_as_non_clean():
     what keeps the check's recall against the human sheet where it was.
     """
     task = make_task()
-    v = evaluate_check_450(task, _justifications(15, 2))
+    v = evaluate_check_450(task, _justifications(15, 1))
     assert v.band == "non_fail"
-    assert v.measurement.counts["conditions_by_item"] == {
-        "j0": ["is_generic"],
-        "j1": ["is_generic"],
-    }
-    assert v.contributing_items == ["j0", "j1"]
+    assert v.measurement.counts["conditions_by_item"] == {"j0": ["is_generic"]}
+    assert v.contributing_items == ["j0"]
 
 
 def test_450_reports_the_threshold_as_ours_rather_than_the_specs():
@@ -1003,6 +1462,154 @@ def test_450_an_empty_population_is_clean_and_does_not_divide_by_zero():
     v = evaluate_check_450(task, [])
     assert v.band == "clean"
     assert v.measurement.rate == 0.0
+
+
+def _with_one(total: int, **kwargs) -> list[JustificationFinding]:
+    """One justification carrying `kwargs`, the rest of `total` clean."""
+    return [
+        JustificationFinding(item_id="j0", **kwargs),
+        *(JustificationFinding(item_id=f"j{i}") for i in range(1, total)),
+    ]
+
+
+def test_450_one_fabricated_citation_in_fifteen_fails_on_severity():
+    """The spec's own wording for `inaccurate_evidence` is "one is enough to
+    fail", and one of fifteen is 6.7%, which no share gate set above a
+    fifteenth can ever reach. A run of 53 tasks passed one that tripped this
+    condition on 27% of its justifications."""
+    task = make_task()
+    v = evaluate_check_450(task, _with_one(15, inaccurate_evidence=1))
+    assert v.band == "fail"
+    assert v.measurement.rate == pytest.approx(1 / 15)
+    assert v.measurement.counts["severe_conditions_by_item"] == {
+        "j0": ["cites_incorrect_evidence"]
+    }
+
+
+def test_450_one_inaccurate_load_bearing_claim_in_fifteen_fails_on_severity():
+    task = make_task()
+    v = evaluate_check_450(task, _with_one(15, inaccurate_primary_claims=1))
+    assert v.band == "fail"
+    assert v.measurement.counts["severe_conditions_by_item"] == {"j0": ["is_inaccurate"]}
+
+
+def test_450_the_softer_conditions_below_the_share_still_do_not_fail():
+    """The severity escape is a second route to fail, not a return to the
+    any-trigger gate the share was introduced to replace."""
+    task = make_task()
+    assert evaluate_check_450(task, _with_one(15, unsupported_claims=2)).band == "non_fail"
+    assert evaluate_check_450(task, _with_one(15, misconstrued_evidence=2)).band == "non_fail"
+    assert evaluate_check_450(task, _with_one(15, is_skewed=True)).band == "non_fail"
+    assert evaluate_check_450(task, _with_one(15, is_generic=True)).band == "non_fail"
+    # And one severe justification in the same population does fail, so the
+    # three above are the gate discriminating rather than the escape being dead.
+    assert evaluate_check_450(task, _with_one(15, inaccurate_evidence=1)).band == "fail"
+
+
+def test_450_a_severe_condition_is_reported_as_what_decided_the_band():
+    task = make_task()
+    on_severity = evaluate_check_450(task, _with_one(15, inaccurate_evidence=1))
+    assert on_severity.measurement.counts["failed_on_severity"] is True
+    on_share = evaluate_check_450(task, _justifications(15, 5))
+    assert on_share.band == "fail"
+    assert on_share.measurement.counts["failed_on_severity"] is False
+    assert on_share.measurement.counts["severe_conditions_by_item"] == {}
+
+
+def test_450_the_severe_set_is_the_conditions_the_spec_calls_one_is_enough():
+    assert DEFAULT_POLICY.justification_severe_conditions == (
+        "is_inaccurate",
+        "cites_incorrect_evidence",
+    )
+
+
+def test_450_an_empty_severe_set_restores_the_pure_share_gate():
+    """The escape is a policy, and a run that wants the old behaviour back gets
+    it by emptying the field rather than by editing the gate."""
+    task = make_task()
+    pure_share = Policy(justification_severe_conditions=())
+    assert evaluate_check_450(task, _with_one(15, inaccurate_evidence=1), pure_share).band == (
+        "non_fail"
+    )
+    assert evaluate_check_450(task, _justifications(15, 5), pure_share).band == "fail"
+
+
+def _severe_of(draws: int, named_by: int, total: int = 15):
+    """One severe justification of `total`, carrying a draw record."""
+    findings = _with_one(total, inaccurate_primary_claims=1)
+    findings[0].condition_draws = {"is_inaccurate": named_by}
+    findings[0].draws_combined = draws
+    return findings
+
+
+def test_450_a_severe_condition_only_one_draw_named_does_not_escape():
+    """The escape needs no corroboration from the other fourteen justifications.
+    It does need more than one draw of the judge: a group that lost four of five
+    calls arrives as one opinion, and two sheet22 tasks failed on exactly that."""
+    task = make_task()
+    lone = evaluate_check_450(task, _severe_of(draws=1, named_by=1))
+    assert lone.band == "non_fail"
+    assert lone.measurement.counts["severe_conditions_by_item"] == {}
+    assert lone.measurement.counts["severe_withheld_too_few_draws"] == {
+        "j0": ["is_inaccurate"]
+    }
+    # The defect is still a defect and keeps its place in the share's numerator.
+    assert lone.measurement.counts["failing_justifications"] == 1
+
+    corroborated = evaluate_check_450(task, _severe_of(draws=5, named_by=2))
+    assert corroborated.band == "fail"
+    assert corroborated.measurement.counts["failed_on_severity"] is True
+    assert corroborated.measurement.counts["severe_draws_by_condition"] == {
+        "j0::is_inaccurate": 2
+    }
+
+
+def test_450_the_draw_bar_exempts_findings_nothing_sampled():
+    """`draws_combined` of 0 is "never sampled", not "no draw agreed". A
+    single-sample run and a synthesised empty-justification finding both carry no
+    draw record, and denying them the escape would make this field a switch on
+    `samples_by_check` rather than a bar on evidence."""
+    task = make_task()
+    unsampled = evaluate_check_450(task, _with_one(15, inaccurate_primary_claims=1))
+    assert unsampled.band == "fail"
+    assert unsampled.measurement.counts["severe_draws_by_condition"] == {
+        "j0::is_inaccurate": None
+    }
+
+
+def test_450_the_draw_bar_at_one_reproduces_the_unbounded_escape():
+    """Behaviour equivalence, so a run scored before the field existed stays
+    reproducible by setting it back."""
+    task = make_task()
+    at_one = Policy(justification_severe_min_draws=1)
+    v = evaluate_check_450(task, _severe_of(draws=1, named_by=1), at_one)
+    assert v.band == "fail"
+    assert v.measurement.counts["failed_on_severity"] is True
+
+
+def test_450_the_share_floor_withholds_one_severe_justification_of_fifteen():
+    """The policy question, held apart from the draw question: here all five draws
+    agree, so there is nothing noisy to filter, and the only issue is whether one
+    argument of fifteen should fail a task."""
+    task = make_task()
+    floored = Policy(justification_severe_min_share=0.10)
+    one_of_fifteen = evaluate_check_450(task, _severe_of(draws=5, named_by=5), floored)
+    assert one_of_fifteen.band == "non_fail"
+    assert one_of_fifteen.measurement.counts["failed_on_severity"] is False
+    assert one_of_fifteen.measurement.counts["severe_withheld_below_share_floor"] == {
+        "j0": ["is_inaccurate"]
+    }
+    # One of eight clears a 10% floor where one of fifteen does not, which is the
+    # reason this is a share and not a count of two.
+    one_of_eight = evaluate_check_450(
+        task, _severe_of(draws=5, named_by=5, total=8), floored
+    )
+    assert one_of_eight.band == "fail"
+
+
+def test_450_the_share_floor_is_off_by_default_because_the_spec_says_one_is_enough():
+    assert DEFAULT_POLICY.justification_severe_min_share == 0.0
+    assert DEFAULT_POLICY.justification_severe_min_draws == 2
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,8 @@ from honeybee_qc.ingest import (
     STEP_RUBRIC,
     STEP_RUN_A,
     STEP_RUN_B,
+    STEP_TURN_MANIFEST_A,
+    STEP_TURN_MANIFEST_B,
     ingest_attempt,
     ingest_rows,
 )
@@ -207,6 +209,106 @@ def test_attachments_come_through_as_plain_public_urls():
     assert task is not None
     assert task.model_a.attachments == ["https://s3.test/a.mp4", "https://s3.test/b.png"]
     assert task.model_a.transcript_pdf == "https://s3.test/chat.pdf"
+
+
+def _manifest_turn(number: int, uploads: list[dict] | None = None) -> dict:
+    return {
+        "id": str(number),
+        "title": f"turn {number} prompt",
+        "annotations": {
+            "turn_number_a": number,
+            "turn_attachment_a": uploads or [],
+        },
+    }
+
+
+def test_files_attached_per_turn_are_part_of_the_upload_manifest():
+    """The turn-list taxonomy files most deliverables against the turn that
+    produced them, leaving `final_outputs_a` holding only what was filed at the
+    end. Reading that field alone made six of seven real uploads invisible to
+    check 95, which then read the model's deliveries as never preserved."""
+    before = {
+        STEP_RUN_A: _step({
+            "final_outputs_a": [{"s3Url": "https://s3.test/final", "name": "digest_v3.pdf"}],
+        }),
+        STEP_TURN_MANIFEST_A: _step({"criteria": [
+            _manifest_turn(1, [{"s3Url": "https://s3.test/t1", "name": "digest_v1.pdf"}]),
+            _manifest_turn(2, [{"s3Url": "https://s3.test/t2", "name": "digest_v2.pdf"}]),
+        ]}),
+    }
+    task = ingest_attempt(_row(before)).task
+    assert task is not None
+    assert task.model_a.attachments == [
+        "https://s3.test/final",
+        "https://s3.test/t1",
+        "https://s3.test/t2",
+    ]
+    assert task.model_a.attachment_names == {
+        "https://s3.test/final": "digest_v3.pdf",
+        "https://s3.test/t1": "digest_v1.pdf",
+        "https://s3.test/t2": "digest_v2.pdf",
+    }
+
+
+def test_a_per_turn_upload_with_no_url_still_lands_under_its_name():
+    """The name is the whole of what check 95 compares on, so an entry the
+    manifest recorded without an `s3Url` is still an upload."""
+    before = {
+        STEP_RUN_A: _step({"final_outputs_a": []}),
+        STEP_TURN_MANIFEST_A: _step({"criteria": [
+            _manifest_turn(1, [{"name": "workflow.png"}]),
+        ]}),
+    }
+    task = ingest_attempt(_row(before)).task
+    assert task is not None
+    assert task.model_a.attachments == ["workflow.png"]
+    assert task.model_a.attachment_names == {"workflow.png": "workflow.png"}
+
+
+def test_a_file_filed_both_per_turn_and_as_a_final_output_counts_once():
+    """One file, two manifests. Counting it twice would let a single upload
+    account for two claimed deliverables, which is the arithmetic check 95's
+    match already exists to prevent."""
+    before = {
+        STEP_RUN_A: _step({
+            "final_outputs_a": [
+                {"s3Url": "https://s3.test/x", "name": "digest.pdf",
+                 "mimeType": "application/pdf"},
+            ],
+        }),
+        STEP_TURN_MANIFEST_A: _step({"criteria": [
+            _manifest_turn(1, [{"s3Url": "https://s3.test/x", "name": "digest.pdf"}]),
+            # Same file, recorded without the URL this time.
+            _manifest_turn(2, [{"name": "digest.pdf"}]),
+        ]}),
+    }
+    task = ingest_attempt(_row(before)).task
+    assert task is not None
+    assert task.model_a.attachments == ["https://s3.test/x"]
+    assert task.model_a.attachment_mime_types == {
+        "https://s3.test/x": "application/pdf"
+    }
+
+
+def test_the_per_turn_manifest_is_read_for_the_slot_it_belongs_to():
+    """`turn_attachment_a` on B's manifest step would be A's uploads credited to
+    B, which is a preserved artifact on the model that never produced it."""
+    before = {
+        STEP_RUN_B: _step({"final_outputs_b": []}),
+        STEP_TURN_MANIFEST_B: _step({"criteria": [{
+            "id": "1",
+            "title": "turn 1 prompt",
+            "annotations": {
+                "turn_number_b": 1,
+                "turn_attachment_b": [{"name": "b_only.png"}],
+                "turn_attachment_a": [{"name": "a_only.png"}],
+            },
+        }]}),
+    }
+    task = ingest_attempt(_row(before)).task
+    assert task is not None
+    assert task.model_b.attachments == ["b_only.png"]
+    assert task.model_a.attachments == []
 
 
 # ---------------------------------------------------------------------------
@@ -427,10 +529,14 @@ def test_an_opaque_cdn_upload_still_abstains_after_ingestion():
     assert evaluate_check_85(task, scan.findings, scan).band == "not_evaluated"
 
 
-def test_a_file_the_prompt_names_and_the_task_does_not_have_fails_once_ingested():
+def test_a_file_the_prompt_names_and_the_task_does_not_have_is_reported_once_ingested():
     """The half's whole point, and it could not fire before: with a manifest that
     names something, a reference to a file nobody supplied is now a violation
-    rather than an unverified claim."""
+    rather than an unverified claim.
+
+    Reported in the non-fail band while 85 is demoted; what this test is about is
+    that the violation is found at all, which is a property of ingestion.
+    """
     before = {STEP_PROMPT: _step({
         "final_hardened_prompt": "Reconcile q3_actuals.csv against the plan.",
         "input_artifacts_a": [_upload("market_sizing_assumptions.xlsx")],
@@ -442,7 +548,7 @@ def test_a_file_the_prompt_names_and_the_task_does_not_have_fails_once_ingested(
     assert [f.reference for f in scan.findings] == ["q3_actuals.csv"]
 
     verdict = evaluate_check_85(task, scan.findings, scan)
-    assert verdict.band == "fail"
+    assert verdict.band == "non_fail"
     assert verdict.measurement.counts["file_half_ran"] is True
     assert "market_sizing_assumptions.xlsx" in scan.findings[0].checked_against[0]
 
@@ -547,7 +653,25 @@ def test_memory_is_marked_not_applicable_rather_than_missing():
     assert memory.not_applicable and memory.rating is None
 
 
-def test_collaboration_quality_is_carried_even_though_nothing_audits_it():
+def test_not_applicable_written_in_the_score_cell_is_n_a_not_a_missing_rating():
+    """Aspirational's form puts the token in the score field, not memory_applicable_*."""
+    before = {"step-ResponseTextCollection-cb06a191fca3": _step({"annotations": {
+        "outcome_quality_a": 4,
+        "memory_personalization_a": "not-applicable",
+        "memory_personalization_justif_a": "no prior-session memory was used",
+        "tool_connector_reliability_a": "not-applicable",
+        "tool_connector_reliability_justif_a": "no tools in this run",
+    }})}
+    task = ingest_attempt(_row(before)).task
+    assert task is not None
+    by_dim = {d.dimension: d for d in task.dimension_ratings}
+    assert by_dim["Memory & personalization"].not_applicable
+    assert by_dim["Memory & personalization"].rating is None
+    assert by_dim["Tool & connector reliability"].not_applicable
+    assert by_dim["Tool & connector reliability"].rating is None
+
+
+def test_collaboration_quality_is_carried_and_audited_by_check_305():
     before = {"step-ResponseTextCollection-cb06a191fca3": _step({
         "annotations": {"collaboration_quality_a": 5}
     })}

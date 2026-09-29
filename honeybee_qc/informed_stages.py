@@ -22,23 +22,58 @@ import difflib
 from dataclasses import dataclass, field
 
 from .config import DEFAULT_POLICY, Policy
+from .context import render_conversation
 from .env_context import (
     FileReferenceScan,
     prompt_texts,
     scan_file_references,
     universe_materials,
 )
+from .fixer_invariants import empty_turns_ok
 from .findings import (
     ArtifactFinding,
     AutofailFinding,
     DomainRelevanceFinding,
     EnvironmentContextFinding,
+    JustificationCoverage,
     JustificationFinding,
     KeyTurnJustificationFinding,
     PromptConsistencyFinding,
     RelevantTurnFinding,
     TargetOutcomeFinding,
     VerdictFinding,
+)
+from .v5_prompt import (
+    CONSTRAINTS_SCHEMA,
+    FINAL_OUTCOME_SCHEMA,
+    KNOWN_INFO_SCHEMA,
+    PROMPT_CLARITY_SCHEMA,
+    PROMPT_REQUEST_SCHEMA,
+    REASONING_REQUIREMENT_SCHEMA,
+    ConstraintsFinding,
+    FinalOutcomeClaimFinding,
+    KnownInfoFinding,
+    PromptClarityFinding,
+    PromptRequestFinding,
+    ReasoningRequirementFinding,
+    build_constraints_prompt,
+    build_final_outcome_claim_prompt,
+    build_known_info_prompt,
+    build_prompt_clarity_prompt,
+    build_prompt_request_prompt,
+    build_reasoning_requirement_prompt,
+    evaluate_check_60,
+    evaluate_check_71,
+    evaluate_check_72,
+    evaluate_check_76,
+    evaluate_check_82,
+    evaluate_check_86,
+    parse_constraints,
+    parse_final_outcome_claim,
+    parse_known_info,
+    parse_prompt_clarity,
+    parse_prompt_request,
+    parse_reasoning_requirement,
 )
 from .gates import (
     evaluate_check_70,
@@ -81,7 +116,8 @@ from .informed_prompts import (
     build_verdict_prompt,
 )
 from .llm import ModelClient, ModelRequest, ModelResponse, run_requests
-from .models import Task
+from .models import COMPARISON_SLOTS, ModelSlot, Task
+from .projects import disabled_checks_for, drop_disabled
 from .sampling import (
     AgreementLog,
     aggregate_justifications,
@@ -92,13 +128,19 @@ from .sampling import (
 )
 from .scoring import CheckVerdict, Measurement, build_verdict
 
-INFORMED_CHECKS = (70, 75, 80, 85, 95, 110, 220, 280, 310, 450, 470)
+INFORMED_CHECKS = (
+    60, 70, 71, 72, 75, 76, 80, 82, 85, 86, 95, 110, 220, 280, 281, 310, 450, 470
+)
 
 
 @dataclass
 class InformedStageResult:
     task_id: str
     domain_relevance: DomainRelevanceFinding | None = None
+    prompt_clarity: PromptClarityFinding | None = None
+    reasoning_requirement: ReasoningRequirementFinding | None = None
+    constraints: ConstraintsFinding | None = None
+    prompt_request: PromptRequestFinding | None = None
     prompt_consistency: PromptConsistencyFinding | None = None
     environment_context: list[EnvironmentContextFinding] = field(default_factory=list)
     # None until the deterministic half has been computed, which distinguishes
@@ -106,8 +148,12 @@ class InformedStageResult:
     file_scan: FileReferenceScan | None = None
     entity_half_ran: bool = False
     target_outcome: list[TargetOutcomeFinding] = field(default_factory=list)
+    final_outcome_claims: list[FinalOutcomeClaimFinding] = field(default_factory=list)
+    known_info: KnownInfoFinding | None = None
     artifacts: list[ArtifactFinding] = field(default_factory=list)
-    key_turn_justification: KeyTurnJustificationFinding | None = None
+    key_turn_justifications: list[KeyTurnJustificationFinding] = field(
+        default_factory=list
+    )
     autofails: list[AutofailFinding] = field(default_factory=list)
     relevant_turns: list[RelevantTurnFinding] = field(default_factory=list)
     justifications: list[JustificationFinding] = field(default_factory=list)
@@ -119,12 +165,32 @@ class InformedStageResult:
     unverifiable_justifications: list[JustificationFinding] = field(
         default_factory=list
     )
-    verdict: VerdictFinding | None = None
+    # Filled when the verdicts are built, which is the point at which the task's
+    # own dimension ratings -- the only statement of how many justifications
+    # there were supposed to be -- are in hand alongside the findings.
+    justification_coverage: JustificationCoverage = field(
+        default_factory=JustificationCoverage
+    )
+    # One per comparison whose justification was audited.
+    verdict_findings: list[VerdictFinding] = field(default_factory=list)
 
     verdicts: list[CheckVerdict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     calls: int = 0
     cached_calls: int = 0
+
+    @property
+    def verdict(self) -> VerdictFinding | None:
+        """The primary comparison's finding, for readers written when a task
+        had exactly one comparison."""
+        return self.verdict_findings[0] if self.verdict_findings else None
+
+    @property
+    def key_turn_justification(self) -> KeyTurnJustificationFinding | None:
+        """The first (or only) key-turn finding, for readers written when a
+        task had a single task-level justification."""
+        return self.key_turn_justifications[0] if self.key_turn_justifications else None
+
     cost_usd: float = 0.0
     # Which per-item claims the repeated draws split on. Empty when every check
     # ran at one sample, which is the single-sample configuration's whole report.
@@ -237,6 +303,10 @@ class InformedStageResult:
                 {"item": f.item_id, "why": f.why_unverifiable}
                 for f in self.unverifiable_justifications
             ],
+            # A denominator on its own cannot say whether a task carried eight
+            # justifications or lost seven, which is the whole of check 450's
+            # short-population bug; this is the missing half of that number.
+            "justification_coverage": self.justification_coverage.to_dict(),
             "states_preference": (
                 self.verdict.states_preference if self.verdict else None
             ),
@@ -275,6 +345,21 @@ def _best_fuzzy_match(name: str, candidates: list[str]) -> tuple[str | None, flo
     return best_name, best_ratio
 
 
+def _is_placeholder_name(name: str) -> bool:
+    """A description of a file standing in for its name, which cannot be compared.
+
+    Image-generation turns have no filenames in them, so the extraction describes
+    what it saw instead: `[unnamed image - cardiac emergency workflow, initial
+    version]`. Six of those went into one task's missing-file list and failed it.
+    The check compares names against a manifest of names; a bracketed description
+    matches nothing there and never could, so counting it is the same error as
+    guessing at a name -- a missing file the audit invented. It belongs in
+    `unverifiable_files`, which is what that list is for.
+    """
+    stripped = name.strip()
+    return stripped.startswith("[") or stripped.startswith("(")
+
+
 def _is_opaque(name: str) -> bool:
     """A CDN path segment that is a content ID rather than a filename.
 
@@ -299,17 +384,48 @@ def can_judge_environment_context(task: Task) -> bool:
     )
 
 
+def key_turn_justification_targets(task: Task) -> list[ModelSlot | None]:
+    """Slots whose key-turn justification will be audited.
+
+    Named slots are the V5 path: one call per competing model that recorded a
+    justification, S excluded. `[None]` is the L1 single-call path that reads
+    `task.key_turn` against model A's conversation. Empty means nothing to audit.
+    """
+    per = sorted(
+        slot
+        for slot, kt in task.key_turns().items()
+        if (
+            slot in COMPARISON_SLOTS
+            and task.in_audit_scope(slot)
+            and (kt.justification or "").strip()
+        )
+    )
+    if per:
+        return list(per)
+    if (task.key_turn.justification or "").strip():
+        return [None]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Request construction
 # ---------------------------------------------------------------------------
 
 
 def build_informed_requests(
-    task: Task, policy: Policy = DEFAULT_POLICY
+    task: Task,
+    policy: Policy = DEFAULT_POLICY,
+    checks: set[int] | None = None,
 ) -> list[ModelRequest]:
     requests: list[ModelRequest] = []
+    disabled = disabled_checks_for(task.project_id)
 
     def add(key: str, prompt: str, schema: dict, metadata: dict) -> None:
+        check_id = metadata.get("check_id")
+        if check_id in disabled:
+            return
+        if checks is not None and check_id not in checks:
+            return
         requests.append(
             ModelRequest(
                 key=f"{task.task_id}::{key}",
@@ -328,6 +444,36 @@ def build_informed_requests(
             build_domain_relevance_prompt(task, policy),
             DOMAIN_RELEVANCE_SCHEMA,
             {"check_id": 70},
+        )
+
+    has_prompt = bool(
+        (task.seeded_prompt or "").strip()
+        or any((t.text or "").strip() for t in task.prompts)
+    )
+    if has_prompt:
+        add(
+            "prompt_clarity",
+            build_prompt_clarity_prompt(task, policy),
+            PROMPT_CLARITY_SCHEMA,
+            {"check_id": 60},
+        )
+        add(
+            "reasoning_requirement",
+            build_reasoning_requirement_prompt(task, policy),
+            REASONING_REQUIREMENT_SCHEMA,
+            {"check_id": 71},
+        )
+        add(
+            "constraints",
+            build_constraints_prompt(task, policy),
+            CONSTRAINTS_SCHEMA,
+            {"check_id": 72},
+        )
+        add(
+            "prompt_request",
+            build_prompt_request_prompt(task, policy),
+            PROMPT_REQUEST_SCHEMA,
+            {"check_id": 76},
         )
 
     # No pre-seeded prompt means nothing to compare the submission against; the
@@ -349,6 +495,25 @@ def build_informed_requests(
             {"check_id": 80},
         )
 
+    for sub in task.trajectories():
+        if sub.produced_final_outcome is not None:
+            add(
+                f"final_outcome::{sub.model}",
+                build_final_outcome_claim_prompt(task, sub, policy),
+                FINAL_OUTCOME_SCHEMA,
+                {"check_id": 82, "model": sub.model},
+            )
+
+    if (task.known_information or "").strip() or (
+        task.not_known_information or ""
+    ).strip():
+        add(
+            "known_info",
+            build_known_info_prompt(task, policy),
+            KNOWN_INFO_SCHEMA,
+            {"check_id": 86},
+        )
+
     # Absence has to be establishable before it is worth asking about: with no
     # prompt text, or nothing at all to check a reference against, every answer
     # would be unfalsifiable.
@@ -360,7 +525,7 @@ def build_informed_requests(
             {"check_id": 85},
         )
 
-    for sub in task.submissions():
+    for sub in task.submissions_in_scope():
         add(
             f"artifacts::{sub.model}",
             build_artifact_prompt(task, sub, policy),
@@ -368,13 +533,15 @@ def build_informed_requests(
             {"check_id": 95, "model": sub.model},
         )
 
-    if (task.key_turn.justification or "").strip():
-        add(
-            "key_turn_justification",
-            build_key_turn_justification_prompt(task, policy),
-            KEY_TURN_JUSTIFICATION_SCHEMA,
-            {"check_id": 110},
-        )
+    if (task.key_turn.justification or "").strip() or key_turn_justification_targets(task):
+        for slot in key_turn_justification_targets(task):
+            suffix = f"::{slot}" if slot else ""
+            add(
+                f"key_turn_justification{suffix}",
+                build_key_turn_justification_prompt(task, policy, slot),
+                KEY_TURN_JUSTIFICATION_SCHEMA,
+                {"check_id": 110, "model": slot},
+            )
 
     if task.rubric:
         add(
@@ -384,7 +551,7 @@ def build_informed_requests(
             {"check_id": 220},
         )
 
-    for sub in task.submissions():
+    for sub in task.submissions_in_scope():
         # 280's population is the contributor's own score-0 set, which is often
         # empty for a model that passed everything.
         if any(r.model == sub.model and r.score == 0 for r in task.criterion_ratings):
@@ -393,6 +560,13 @@ def build_informed_requests(
                 build_criterion_turns_prompt(task, sub, policy),
                 RELEVANT_TURNS_SCHEMA,
                 {"check_id": 280, "model": sub.model},
+            )
+        if any(r.model == sub.model and r.score == 1 for r in task.criterion_ratings):
+            add(
+                f"passing_criterion_turns::{sub.model}",
+                build_criterion_turns_prompt(task, sub, policy, score=1),
+                RELEVANT_TURNS_SCHEMA,
+                {"check_id": 281, "model": sub.model},
             )
         if any(d.model == sub.model for d in task.dimension_ratings):
             add(
@@ -408,18 +582,27 @@ def build_informed_requests(
                 {"check_id": 450, "model": sub.model},
             )
 
-    if (task.sxs.justification or "").strip():
+    # One pair of comparison calls per recorded comparison. Item ids carry the
+    # pair only when there is more than one, so a single-comparison task keeps
+    # the "ranking" and "verdict" ids that the coverage map, the parsers and the
+    # existing cached runs all key off.
+    comparisons = task.comparison_list()
+    multi = len(comparisons) > 1
+    for pair in comparisons:
+        if not (pair.justification or "").strip():
+            continue
+        suffix = f"::{pair.pair_label}" if multi else ""
         add(
-            "ranking_justification",
-            build_ranking_justification_prompt(task, policy),
+            f"ranking_justification{suffix}",
+            build_ranking_justification_prompt(task, policy, pair),
             JUSTIFICATION_SCHEMA,
-            {"check_id": 450, "model": None},
+            {"check_id": 450, "model": None, "pair": pair.pair_label},
         )
         add(
-            "verdict",
-            build_verdict_prompt(task, policy),
+            f"verdict{suffix}",
+            build_verdict_prompt(task, policy, pair),
             VERDICT_SCHEMA,
-            {"check_id": 470},
+            {"check_id": 470, "pair": pair.pair_label},
         )
     return requests
 
@@ -503,8 +686,14 @@ def parse_environment_context(
                     "the model conversation(s) rendered to the judge",
                 ],
                 why_outside_universe=summary,
-                presented_as_existing=True,
-                required_to_complete=True,
+                # Asked, not assumed. Hardcoding these made every file the judge
+                # listed a violation the moment the two upload questions came back
+                # false, which is the expected answer for any file the model itself
+                # produced. The same judge, in one response, answered
+                # `required_to_complete=False` for a reference on the `references`
+                # path and had it forced to True here.
+                presented_as_existing=bool(entry.get("presented_as_existing", True)),
+                required_to_complete=bool(entry.get("required_to_complete", True)),
                 real_world_public_entity=False,
                 basis="model",
                 confidence=conf,
@@ -513,6 +702,13 @@ def parse_environment_context(
     for entry in data.get("references", []):
         reference = str(entry.get("reference", "")).strip()
         if not reference:
+            continue
+        # The judge is asked to show what it checked, so `references` carries rows
+        # for things it looked for and found. Those are worksheet entries, not
+        # allegations, and the three booleans answered literally about an
+        # in-universe reference -- yes it exists, yes the work needs it, no it is
+        # not a public entity -- spell violation.
+        if bool(entry.get("found_in_materials", False)):
             continue
         kind = str(entry.get("kind", "other")).lower()
         findings.append(
@@ -571,13 +767,39 @@ def parse_artifacts(
         for f in data.get("claimed_files", [])
         if f.get("produced") and str(f.get("filename", "")).strip()
     ]
+    # V5: "every output file mentioned in the final response was uploaded".
+    # Files whose `turn` is an earlier integer than the last assistant turn
+    # are dropped from the comparison; files whose turn is unknown stay, because
+    # dropping an unplaced delivery would excuse a missing file. Uploads stay
+    # the union of every turn -- a file named in the last turn may have been
+    # uploaded earlier.
+    out_of_scope: list[str] = []
+    last_turn = (
+        sub.final_response_turn()
+        if policy.artifact_scope == "final_response"
+        else None
+    )
+    if last_turn is not None:
+        kept = []
+        for f in produced:
+            turn = f.get("turn")
+            if isinstance(turn, int) and turn < last_turn:
+                name = str(f.get("filename", "")).strip()
+                if name:
+                    out_of_scope.append(name)
+                continue
+            kept.append(f)
+        produced = kept
     claimed = [
         str(f.get("filename", "")).strip()
         for f in produced
         if not f.get("unverifiable")
+        and not _is_placeholder_name(str(f.get("filename", "")))
     ]
     unverifiable = [
-        str(f.get("filename", "")).strip() for f in produced if f.get("unverifiable")
+        str(f.get("filename", "")).strip()
+        for f in produced
+        if f.get("unverifiable") or _is_placeholder_name(str(f.get("filename", "")))
     ]
     why = "; ".join(
         str(f.get("why_unverifiable", "")).strip()
@@ -595,32 +817,54 @@ def parse_artifacts(
     ]
     confidence = _confidence(data)
 
-    if uploaded and all(_is_opaque(a) for a in uploaded):
+    # Two ways to arrive at a comparison with no names in it. The manifest can
+    # carry uploads whose names are all content IDs, and there can be no uploads
+    # at all -- the same state seen from the other side, and the one where a
+    # count is most conclusive rather than least: nothing was preserved, so
+    # every delivery is short, whatever any of them was called.
+    #
+    # Zero uploads only lands here once `claimed` is empty. A readable claimed
+    # name is worth more than a count, because it survives to the confirming
+    # pass, and that pass is what separates a file the model never delivered
+    # from a code block it printed inline.
+    unnamed_manifest = bool(uploaded) and all(_is_opaque(a) for a in uploaded)
+    nothing_to_compare = not uploaded and not claimed
+
+    if unnamed_manifest or nothing_to_compare:
+        # Unverifiable deliveries are counted in the one state where the count is
+        # unambiguous, and nowhere else.
+        #
+        # Counting them cannot reintroduce the invented-missing-file problem the
+        # exclusion above was added for: that exclusion keeps a name the judge
+        # could not read out of a subtraction against a manifest of names, and
+        # this branch subtracts no names. It reports a quantity, which
+        # `evaluate_check_95` publishes as a bare shortfall with no filename
+        # attached, so nothing is ever guessed at.
+        #
+        # What it can do is overcount drafts. An iterative session hands the user
+        # twelve revisions of one image and the contributor is asked to preserve
+        # the work product, not every round of it -- which is why the confirming
+        # pass has a `superseded` verdict, and why this branch, which never
+        # reaches that pass, must not assume twelve deliveries are twelve
+        # deliverables. With an empty manifest that ambiguity disappears: no
+        # collapsing of drafts into finals explains away a session that preserved
+        # nothing at all, so every delivery is short whatever it was called.
+        countable = len(claimed) + (len(unverifiable) if nothing_to_compare else 0)
         return ArtifactFinding(
             model=sub.model,
             claimed_files=claimed,
             uploaded_files=uploaded,
             basis="count",
-            shortfall=max(0, len(claimed) - len(uploaded)),
+            shortfall=max(0, countable - len(uploaded)),
             unverifiable_files=unverifiable,
             why_unverifiable=why,
             # Counting cannot see a swap: the right number of wrong files passes.
-            confidence="low" if claimed else confidence,
+            confidence="low" if claimed or unverifiable else confidence,
+            out_of_scope_files=out_of_scope,
+            final_response_turn=last_turn,
         )
 
-    uploaded_norm = [_norm_filename(a) for a in uploaded]
-    uploaded_norm_set = set(uploaded_norm)
-    missing: list[str] = []
-    fuzzy_matched: list[tuple[str, str]] = []
-    for c in claimed:
-        c_norm = _norm_filename(c)
-        if c_norm in uploaded_norm_set:
-            continue
-        best, ratio = _best_fuzzy_match(c_norm, uploaded_norm)
-        if best is not None and ratio >= policy.filename_fuzzy_match_threshold:
-            fuzzy_matched.append((c, best))
-        else:
-            missing.append(c)
+    missing, fuzzy_matched, unmatched_uploads = _match_uploads(claimed, uploaded, policy)
 
     return ArtifactFinding(
         model=sub.model,
@@ -629,10 +873,64 @@ def parse_artifacts(
         missing_files=missing,
         basis="filename",
         fuzzy_matched_files=fuzzy_matched,
+        unmatched_uploads=unmatched_uploads,
         unverifiable_files=unverifiable,
         why_unverifiable=why,
         confidence=confidence,
+        out_of_scope_files=out_of_scope,
+        final_response_turn=last_turn,
     )
+
+
+def _match_uploads(
+    claimed: list[str], uploaded: list[str], policy: Policy
+) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+    """Assign each claimed file to at most one upload, and say what is left over.
+
+    One upload cannot account for two claimed files, and letting it do so is how a
+    real defect was cleared: a task delivered four documents, uploaded one, and
+    passed -- three of the four claims fuzzy-matched the same `... V3 (1).docx` and
+    the fourth was cleared as a rename of it. Four claims against one upload cannot
+    be a task with nothing missing, whatever the names look like.
+
+    Exact matches are assigned before fuzzy ones so a near-miss cannot take the
+    upload an exact match needed, and the fuzzy pass takes the closest surviving
+    candidate rather than the first over the threshold.
+
+    `unmatched_uploads` is the other half of the same fact, and the confirming pass
+    needs it: an upload already spoken for is not a candidate for a rename either.
+    """
+    uploaded_norm = [_norm_filename(a) for a in uploaded]
+    consumed: set[int] = set()
+
+    unresolved: list[str] = []
+    for name in claimed:
+        target = _norm_filename(name)
+        index = next(
+            (i for i, u in enumerate(uploaded_norm) if u == target and i not in consumed),
+            None,
+        )
+        if index is None:
+            unresolved.append(name)
+        else:
+            consumed.add(index)
+
+    missing: list[str] = []
+    fuzzy_matched: list[tuple[str, str]] = []
+    for name in unresolved:
+        target = _norm_filename(name)
+        candidates = [
+            (i, u) for i, u in enumerate(uploaded_norm) if i not in consumed
+        ]
+        best, ratio = _best_fuzzy_match(target, [u for _, u in candidates])
+        if best is not None and ratio >= policy.filename_fuzzy_match_threshold:
+            consumed.add(next(i for i, u in candidates if u == best))
+            fuzzy_matched.append((name, best))
+        else:
+            missing.append(name)
+
+    unmatched = [name for i, name in enumerate(uploaded) if i not in consumed]
+    return missing, fuzzy_matched, unmatched
 
 
 def parse_key_turn_justification(
@@ -743,6 +1041,11 @@ def missing_turn_findings(task: Task, check_id) -> list[RelevantTurnFinding]:
     out: list[RelevantTurnFinding] = []
     if check_id == 280:
         for r in task.criterion_ratings:
+            # Simplified has no turn attributions by design (1-3 turns, gate
+            # only). Counting empty S score-0 lists as incorrect citations
+            # fails every Aspirational task for a field that does not exist.
+            if r.model == "S" or not task.in_audit_scope(r.model):
+                continue
             if r.score == 0 and not r.relevant_turns:
                 out.append(
                     RelevantTurnFinding(
@@ -754,7 +1057,11 @@ def missing_turn_findings(task: Task, check_id) -> list[RelevantTurnFinding]:
                 )
     else:
         for d in task.dimension_ratings:
-            if not d.not_applicable and not d.relevant_turns:
+            if d.model == "S" or not task.in_audit_scope(d.model):
+                continue
+            if empty_turns_ok(d):
+                continue
+            if not d.relevant_turns:
                 out.append(
                     RelevantTurnFinding(
                         check_id=310,
@@ -909,6 +1216,104 @@ def carry_unverifiable_reasons(
     return merged
 
 
+def _item_key(item_id: str) -> str:
+    """Compare item ids without being defeated by spacing or case.
+
+    The judge is told to echo the dimension name back verbatim and does, but the
+    coverage accounting below turns an id it renders differently into a
+    justification nobody audited, and a spurious abstention is a worse trade
+    than a missed one here.
+    """
+    return " ".join(str(item_id).split()).casefold()
+
+
+def ranking_item_id(task: Task, pair_label: str) -> str:
+    """Item id for one comparison's ranking justification.
+
+    Bare `ranking` while a task has a single comparison, which is every task in
+    the corpora this check was measured on and every cached judgment already
+    stored; `ranking::AC` and the like only once a task records more than one,
+    where the ids have to be distinct to be counted separately.
+    """
+    return "ranking" if len(task.comparison_list()) < 2 else f"ranking::{pair_label}"
+
+
+def justification_coverage(
+    task: Task,
+    findings: list[JustificationFinding],
+    abstained: list[JustificationFinding],
+) -> JustificationCoverage:
+    """What 450's population was supposed to be, grouped by the call that fills it.
+
+    Derived from the task's own `dimension_ratings` rather than from the ~15 a
+    full task usually carries: the population is 13 where two dimensions are
+    marked N/A and 14 where one is, and a hardcoded expectation would report
+    those perfectly-audited tasks as short.
+
+    Dimensions the contributor marked not-applicable are left out, matching
+    `empty_justification_findings`, which synthesises a finding for every other
+    dimension whether or not a justification was written. An N/A dimension that
+    carries a justification anyway is still audited -- it is in the prompt -- and
+    arrives as an item nothing expected, which is why coverage intersects the two
+    sets rather than comparing their sizes.
+    """
+    coverage = JustificationCoverage()
+    for d in task.dimension_ratings:
+        if d.not_applicable:
+            continue
+        coverage.expected.setdefault(d.model, []).append(f"{d.model}::{d.dimension}")
+    # One expected ranking justification per comparison. Named `ranking` on a
+    # single-comparison task -- the id the prompt asks for and every cached run
+    # already carries -- and namespaced per pair only when there is more than
+    # one, where two items both called `ranking` would collide and each would
+    # report the other as covered.
+    for pair in task.comparison_list():
+        if (pair.justification or "").strip():
+            item = ranking_item_id(task, pair.pair_label)
+            coverage.expected.setdefault(item, []).append(item)
+
+    by_key = {
+        _item_key(item): (group, item)
+        for group, items in coverage.expected.items()
+        for item in items
+    }
+    for source, bucket in ((findings, coverage.audited), (abstained, coverage.abstained)):
+        for f in source:
+            hit = by_key.get(_item_key(f.item_id))
+            if hit is None:
+                continue
+            group, item = hit
+            bucket.setdefault(group, []).append(item)
+    return coverage
+
+
+def rendered_evidence_by_group(
+    task: Task, policy: Policy = DEFAULT_POLICY
+) -> dict[str, bool]:
+    """Whether each model's conversation reached the judge at all, by 450's groups.
+
+    Asked of the renderer rather than of `sub.conversation`, because what matters is
+    what the prompt carried: a submission whose share page died still reaches the
+    judge in full when the contributor uploaded an exported transcript, and on ten
+    of the twelve failed hydrations across three corpora that is what happened.
+    Reading the raw field instead would report those ten as blind.
+
+    Read off the profile rather than off the rendered string, for a reason worth
+    stating because it is a trap: since the absent-conversation marker landed, a
+    blank conversation renders as a non-empty block -- the marker itself. Testing
+    the string for content would report every such submission as evidenced, which is
+    the opposite of what the marker exists to say.
+
+    Keyed the way `justification_coverage` groups items, so `evaluate_check_450` can
+    look a triggering item's model up directly.
+    """
+    out: dict[str, bool] = {}
+    for sub in task.submissions():
+        _, profile = render_conversation(sub, policy)
+        out[sub.model] = profile.turns_rendered > 0 or profile.pdf_fallback_used
+    return out
+
+
 def empty_justification_findings(task: Task) -> list[JustificationFinding]:
     """A dimension rated without any justification at all.
 
@@ -922,7 +1327,9 @@ def empty_justification_findings(task: Task) -> list[JustificationFinding]:
             is_generic=True,
         )
         for d in task.dimension_ratings
-        if not d.not_applicable and not (d.justification or "").strip()
+        if task.in_audit_scope(d.model)
+        and not d.not_applicable
+        and not (d.justification or "").strip()
     ]
 
 
@@ -945,6 +1352,7 @@ def run_informed_stage(
     client: ModelClient,
     policy: Policy = DEFAULT_POLICY,
     workers: int = 6,
+    checks: set[int] | None = None,
 ) -> InformedStageResult:
     """Run the informed pass.
 
@@ -960,7 +1368,7 @@ def run_informed_stage(
     result = InformedStageResult(task_id=task.task_id)
     subs = {s.model: s for s in task.submissions()}
 
-    requests = build_informed_requests(task, policy)
+    requests = build_informed_requests(task, policy, checks=checks)
     # One flat batch of every draw of every judgment, so the global throttle still
     # sees the true number of calls in flight and the worker pool stays full;
     # `fanout.groups` puts the draws back together by judgment afterwards.
@@ -991,6 +1399,14 @@ def run_informed_stage(
 
         if check_id == 70:
             result.domain_relevance = parse_domain_relevance(first, task)
+        elif check_id == 60:
+            result.prompt_clarity = parse_prompt_clarity(first)
+        elif check_id == 71:
+            result.reasoning_requirement = parse_reasoning_requirement(first)
+        elif check_id == 72:
+            result.constraints = parse_constraints(first)
+        elif check_id == 76:
+            result.prompt_request = parse_prompt_request(first)
         elif check_id == 75:
             result.prompt_consistency = parse_prompt_consistency(first)
         elif check_id == 85:
@@ -998,16 +1414,28 @@ def run_informed_stage(
             result.entity_half_ran = True
         elif check_id == 80:
             result.target_outcome = parse_target_outcome(first)
+        elif check_id == 82:
+            sub = {s.model: s for s in task.trajectories()}.get(meta["model"])
+            if sub is not None:
+                result.final_outcome_claims.append(
+                    parse_final_outcome_claim(first, sub)
+                )
+        elif check_id == 86:
+            result.known_info = parse_known_info(first)
         elif check_id == 95:
             result.artifacts.append(parse_artifacts(first, subs[meta["model"]], policy))
         elif check_id == 110:
             parsed = [parse_key_turn_justification(r) for r in drawn]
             finding, records = aggregate_key_turn_justification(parsed, policy)
-            result.key_turn_justification = apply_key_turn_abstention(finding, parsed)
+            finding = apply_key_turn_abstention(finding, parsed)
+            slot = meta.get("model")
+            if slot:
+                finding.model = str(slot)
+            result.key_turn_justifications.append(finding)
             result.agreement.extend(records, policy)
         elif check_id == 220:
             result.autofails = parse_autofails(first)
-        elif check_id in (280, 310):
+        elif check_id in (280, 281, 310):
             last = _last_turn(subs[meta["model"]])
             parsed_turns = [
                 parse_relevant_turns(r, check_id, meta["model"], last) for r in drawn
@@ -1022,11 +1450,23 @@ def run_informed_stage(
                 [parse_justifications(r) for r in drawn]
             )
             findings, records = aggregate_justifications(kept, policy)
+            # The prompt asks every ranking call to use the item id "ranking",
+            # so on a task with two comparisons both come back under the same
+            # id. Relabelled here, from the request's own pair, rather than by
+            # asking the judge to construct a compound id it has no reason to
+            # get right.
+            pair_label = meta.get("pair")
+            if pair_label:
+                for finding in [*findings, *abstained]:
+                    if finding.item_id == "ranking":
+                        finding.item_id = ranking_item_id(task, str(pair_label))
             result.justifications += findings
             result.unverifiable_justifications += abstained
             result.agreement.extend(records, policy)
         elif check_id == 470:
-            result.verdict = parse_verdict(first)
+            finding = parse_verdict(first)
+            finding.pair = str(meta.get("pair") or "AB")
+            result.verdict_findings.append(finding)
 
     result.relevant_turns += missing_turn_findings(task, 280)
     result.relevant_turns += missing_turn_findings(task, 310)
@@ -1083,7 +1523,12 @@ def _confirm_missing_artifacts(
         ModelRequest(
             key=f"{task.task_id}::artifact_confirm::{f.model}",
             prompt=build_artifact_confirmation_prompt(
-                task, subs[f.model], f.missing_files, f.uploaded_files, policy
+                task,
+                subs[f.model],
+                f.missing_files,
+                f.uploaded_files,
+                policy,
+                f.unmatched_uploads,
             ),
             schema=ARTIFACT_CONFIRMATION_SCHEMA,
             system=INFORMED_SYSTEM_PROMPT,
@@ -1116,9 +1561,37 @@ def apply_artifact_confirmation(finding: ArtifactFinding, data: dict) -> None:
     volunteers an opinion about some other file cannot add to or subtract from the
     count. An unreadable assessment is left out entirely, which leaves that name
     counted -- the conservative direction, and the same one a failed call takes.
+
+    A rename and a supersession are the two verdicts checked against arithmetic
+    rather than taken on trust, because they are the two that assert the file
+    survived in some form. `not_a_file` and `unverifiable` need no arithmetic:
+    the first says nothing was ever attached and the second says the judge could
+    not tell, and neither claims anything about the manifest.
+
+    A rename has to name an upload nothing else already accounts for. On the
+    scored run a genuinely undelivered document was cleared as a rename of an
+    upload three other claimed files had already been matched to, and that single
+    clearance turned a real fail into a pass -- the judge's reading of the
+    content was reasonable, but four deliverables cannot be one file no matter
+    how the names read.
+
+    A supersession is held to a weaker but differently-shaped test, because it
+    asserts something different. It says this draft was carried forward into a
+    later version that *is* in the manifest, and the judge is told to leave
+    `matched_upload` empty for it, so there is no name to check and no upload to
+    consume -- twelve rounds of edits legitimately collapse into one preserved
+    final. What it still cannot be is a draft of nothing: it is only available
+    once some delivery of this model's is in the manifest. Unguarded it was an
+    unconditional clearance, and on one task it waved through three files that
+    were simply never uploaded.
     """
     finding.confirmation_ran = True
     allowed = {name.strip().lower(): name for name in finding.missing_files}
+    available = {_norm_filename(u) for u in finding.unmatched_uploads}
+    # How many of this model's deliveries are in the manifest at all, which is
+    # what a supersession has to be measured against. A rename accepted below
+    # adds one, since it establishes another delivery that was preserved.
+    preserved = len(finding.claimed_files) - len(finding.missing_files)
     for entry in data.get("files", []):
         if not isinstance(entry, dict):
             continue
@@ -1126,13 +1599,48 @@ def apply_artifact_confirmation(finding: ArtifactFinding, data: dict) -> None:
         if name is None:
             continue
         assessment = str(entry.get("assessment", "")).strip()
-        if assessment not in ("missing", "renamed", "not_a_file", "unverifiable"):
+        if assessment not in (
+            "missing",
+            "renamed",
+            "superseded",
+            "not_a_file",
+            "unverifiable",
+        ):
             continue
-        finding.confirmations[name] = assessment
         reason = " ".join(str(entry.get("why", "")).split())[:300]
         matched = " ".join(str(entry.get("matched_upload", "")).split())
-        if assessment == "renamed" and matched:
-            reason = f"matched upload {matched}: {reason}" if reason else f"matched upload {matched}"
+
+        if assessment == "renamed":
+            target = _norm_filename(matched)
+            if not target or target not in available:
+                # Recorded as the judge's own reasoning, under the verdict the
+                # manifest supports: there is no upload left for this to be.
+                finding.confirmations[name] = "missing"
+                finding.confirmation_reasons[name] = (
+                    f"read as a rename of {matched or '(no upload named)'}, but no "
+                    "upload is unaccounted for, so it cannot be one: "
+                    + (reason or "(no reason given)")
+                )[:300]
+                continue
+            available.discard(target)
+            preserved += 1
+            reason = (
+                f"matched upload {matched}: {reason}"
+                if reason
+                else f"matched upload {matched}"
+            )
+
+        if assessment == "superseded" and not preserved:
+            finding.confirmations[name] = "missing"
+            finding.confirmation_reasons[name] = (
+                "read as an earlier state of a later deliverable, but no file this "
+                "model delivered is in the upload manifest at all, so there is no "
+                "final state for it to be an earlier state of: "
+                + (reason or "(no reason given)")
+            )[:300]
+            continue
+
+        finding.confirmations[name] = assessment
         if reason:
             finding.confirmation_reasons[name] = reason
 
@@ -1178,16 +1686,25 @@ def _confirm_autofails(
 def _build_informed_verdicts(
     task: Task, result: InformedStageResult, policy: Policy
 ) -> list[CheckVerdict]:
+    result.justification_coverage = justification_coverage(
+        task, result.justifications, result.unverifiable_justifications
+    )
     verdicts = [
         # 70's own gate decides not_evaluated from the absent domain, so it is
         # called unconditionally rather than guarded here.
         evaluate_check_70(task, result.domain_relevance, policy),
+        evaluate_check_60(task, result.prompt_clarity, policy),
+        evaluate_check_71(task, result.reasoning_requirement, policy),
+        evaluate_check_72(task, result.constraints, policy),
+        evaluate_check_76(task, result.prompt_request, policy),
         # 75's own gate decides not_evaluated from the absent pre-seed, the same
         # way 70's does.
         evaluate_check_75(task, result.prompt_consistency, policy),
         evaluate_check_80(task, result.target_outcome, policy)
         if result.target_outcome
         else _not_evaluated(task, 80, "no target outcome list was recorded", policy),
+        evaluate_check_82(task, result.final_outcome_claims, policy),
+        evaluate_check_86(task, result.known_info, policy),
         # 85's own gate decides not_evaluated from which of its two halves ran.
         evaluate_check_85(
             task,
@@ -1199,7 +1716,7 @@ def _build_informed_verdicts(
         evaluate_check_95(task, result.artifacts, policy)
         if result.artifacts
         else _not_evaluated(task, 95, "no model submissions to scan", policy),
-        evaluate_check_110(task, result.key_turn_justification, policy),
+        evaluate_check_110(task, result.key_turn_justifications, policy),
         evaluate_check_220(task, result.autofails, policy)
         if task.rubric
         else _not_evaluated(task, 220, "rubric is empty", policy),
@@ -1208,10 +1725,21 @@ def _build_informed_verdicts(
         else _not_evaluated(
             task, 280, "no criterion was scored 0, so no turns were required", policy
         ),
+        evaluate_relevant_turns(task, 281, result.relevant_turns, policy)
+        if any(r.score == 1 for r in task.criterion_ratings)
+        else _not_evaluated(
+            task, 281, "no criterion was scored 1, so no passing turns were required", policy
+        ),
         evaluate_relevant_turns(task, 310, result.relevant_turns, policy)
         if task.dimension_ratings
         else _not_evaluated(task, 310, "no dimension ratings were recorded", policy),
-        evaluate_check_450(task, result.justifications, policy)
+        evaluate_check_450(
+            task,
+            result.justifications,
+            policy,
+            result.justification_coverage,
+            rendered_evidence_by_group(task, policy),
+        )
         if result.justifications
         else _not_evaluated(
             task,
@@ -1222,9 +1750,9 @@ def _build_informed_verdicts(
             else "no justifications were recorded",
             policy,
         ),
-        evaluate_check_470(task, result.verdict, policy),
+        evaluate_check_470(task, result.verdict_findings, policy),
     ]
-    return verdicts
+    return drop_disabled(verdicts, task.project_id)
 
 
 def _not_evaluated(
@@ -1243,7 +1771,12 @@ def _not_evaluated(
 def not_evaluated_informed_verdicts(
     task: Task, reason: str, policy: Policy = DEFAULT_POLICY
 ) -> list[CheckVerdict]:
-    return [_not_evaluated(task, cid, reason, policy) for cid in INFORMED_CHECKS]
+    disabled = disabled_checks_for(task.project_id)
+    return [
+        _not_evaluated(task, cid, reason, policy)
+        for cid in INFORMED_CHECKS
+        if cid not in disabled
+    ]
 
 
 def informed_calls_by_check(task: Task) -> dict[int, int]:
@@ -1261,29 +1794,52 @@ def informed_calls_by_check(task: Task) -> dict[int, int]:
     estimate, one a few tasks pay does not.
     """
     counts: dict[int, int] = {}
+    disabled = disabled_checks_for(task.project_id)
 
     def add(check_id: int, n: int = 1) -> None:
-        if n:
+        if n and check_id not in disabled:
             counts[check_id] = counts.get(check_id, 0) + n
 
     add(70, 1 if (task.assigned_domain or "").strip() else 0)
+    has_prompt = bool(
+        (task.seeded_prompt or "").strip()
+        or any((t.text or "").strip() for t in task.prompts)
+    )
+    add(60, 1 if has_prompt else 0)
+    add(71, 1 if has_prompt else 0)
+    add(72, 1 if has_prompt else 0)
+    add(76, 1 if has_prompt else 0)
     add(75, 1 if (task.pre_seeded_prompt or "").strip() else 0)
     add(80, 1 if task.target_outcome else 0)
+    add(
+        82,
+        sum(1 for s in task.trajectories() if s.produced_final_outcome is not None),
+    )
+    add(
+        86,
+        1
+        if (task.known_information or "").strip()
+        or (task.not_known_information or "").strip()
+        else 0,
+    )
     # 85's file half is free; only its entity half is a call, and only when there
     # is something to check a reference against.
     add(85, 1 if can_judge_environment_context(task) else 0)
-    add(95, len(task.submissions()))
-    add(110, 1 if (task.key_turn.justification or "").strip() else 0)
+    add(95, len(task.submissions_in_scope()))
+    add(110, len(key_turn_justification_targets(task)))
     add(220, 1 if task.rubric else 0)
-    for sub in task.submissions():
+    for sub in task.submissions_in_scope():
         if any(r.model == sub.model and r.score == 0 for r in task.criterion_ratings):
             add(280)
+        if any(r.model == sub.model and r.score == 1 for r in task.criterion_ratings):
+            add(281)
         if any(d.model == sub.model for d in task.dimension_ratings):
             add(310)
             add(450)
-    if (task.sxs.justification or "").strip():
-        add(450)
-        add(470)
+    for pair in task.comparison_list():
+        if (pair.justification or "").strip():
+            add(450)
+            add(470)
     return counts
 
 
@@ -1292,13 +1848,20 @@ def informed_calls_by_check(task: Task) -> dict[int, int]:
 # configuration off the real per-call spend of a completed run instead of a guess.
 CALL_NAME_TO_CHECK = {
     "domain_relevance": 70,
+    "prompt_clarity": 60,
+    "reasoning_requirement": 71,
+    "constraints": 72,
+    "prompt_request": 76,
     "prompt_consistency": 75,
     "target_outcome": 80,
+    "final_outcome": 82,
+    "known_info": 86,
     "environment_context": 85,
     "artifacts": 95,
     "key_turn_justification": 110,
     "autofail": 220,
     "criterion_turns": 280,
+    "passing_criterion_turns": 281,
     "dimension_turns": 310,
     "dimension_justifications": 450,
     "ranking_justification": 450,

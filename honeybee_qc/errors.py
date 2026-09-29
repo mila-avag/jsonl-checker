@@ -18,6 +18,10 @@ everywhere else and only the emitted label collides.
 from __future__ import annotations
 
 ERROR_CODES: dict[int, dict[str, str]] = {
+    60: {
+        "fail": "[Fail - Major Clarity / Specificity Issues Prompt]",
+        "non_fail": "[Non-Fail - Minor Clarity / Specificity Issues Prompt]",
+    },
     # 70 is net-new, so its strings come from the auditors' own usage in the QC
     # export rather than from a tab-2 cell. The asymmetry is theirs: the fail
     # string carries a trailing "Prompt", the non-fail string does not.
@@ -35,12 +39,36 @@ ERROR_CODES: dict[int, dict[str, str]] = {
         "fail": "[Fail - Pre-seeded/Opening Prompts Inconsistency]",
         "non_fail": "[Non-Fail - Pre-seeded/Opening Prompt Inconsistency]",
     },
+    71: {
+        "fail": "[Fail - Reasoning Requirement Prompt]",
+        "non_fail": "[Non-Fail - Reasoning Requirement Prompt]",
+    },
+    72: {
+        "fail": "[Fail - Bad Constraints]",
+        "non_fail": "[Non-Fail - Basic Constraints]",
+    },
+    76: {"fail": "[Fail - No Request]"},
     80: {"non_fail": "[Non-Fail - Misaligned Target Outcome]"},
     # Not from the Dimension Definition tab. The audit workflow tab requires the
     # prompt to reference "only the entities and events in the task's universe"
-    # without giving it a row or a code, and human QC cites it under this string.
-    85: {"fail": "[Fail - Environment Context Violation]"},
+    # without giving it a row or a code, and human QC cites the FAIL string below.
+    #
+    # PROVISIONAL and ours, for the same reason 96's is: human QC's precedent
+    # covers this requirement's FAIL string, which 85 no longer emits. It reports
+    # non-fail until the prompt and parser fixes landing beside it are validated on
+    # a scored run -- 11 of 13 escalations across three corpora sat on tasks whose
+    # entire "declared supplied" list was model output, which is a defect in what
+    # the judge was told rather than a threshold. The customer must confirm this
+    # string before anything joins on it. The fail string human QC does write is in
+    # `RETIRED_CODES`, because it is still the join key for a QC citation.
+    85: {"non_fail": "[Non-Fail - Environment Context Violation]"},
+    82: {"non_fail": "[Non-Fail - Final Outcome Claim]"},
+    86: {"non_fail": "[Non-Fail - Known / Not-Known Accuracy]"},
     90: {"fail": "[Fail - Missing/Invalid Links]"},
+    91: {
+        "fail": "[Fail - Missing/Invalid Links]",
+        "non_fail": "[Non-Fail - Missing/Invalid Links]",
+    },
     95: {"fail": "[Fail - Artifacts Not Preserved]"},
     # PROVISIONAL. Also not from the Dimension Definition tab -- the audit
     # workflow tab requires "at least 7 turns" without giving it a row or a code
@@ -50,6 +78,7 @@ ERROR_CODES: dict[int, dict[str, str]] = {
     # nearest existing label is "[Fail - Insufficient Trajectory]", which the
     # export uses for something else; adopting it on a guess would corrupt that.
     96: {"fail": "[Fail - Insufficient Turns]"},
+    97: {"fail": "[Fail - No Model Failure]"},
     100: {
         "fail": "[Fail - First Turn is Key Turn]",
         "non_fail": "[Non-Fail - Misidentified Key Turn]",
@@ -81,14 +110,17 @@ ERROR_CODES: dict[int, dict[str, str]] = {
         "fail": "[Fail - Egregious Rating Disagreement]",
         "non_fail": "[Non-Fail - Minor Rating Disagreement]",
     },
+    271: {"non_fail": "[Non-Fail - Simplified Rubric Evaluation]"},
     280: {
         "fail": "[Fail - Incorrect Relevant Turns]",
         "non_fail": "[Non-Fail - Incorrect Relevant Turns]",
     },
+    281: {"non_fail": "[Non-Fail - Passing Criteria Relevant Turns]"},
     300: {
         "fail": "[Fail - Dimension Rating Disagreement]",
         "non_fail": "[Non-Fail - Dimension Rating Disagreement]",
     },
+    305: {"non_fail": "[Non-Fail - Collaboration Quality Rating]"},
     310: {
         "fail": "[Fail - Incorrect Relevant Turns]",
         "non_fail": "[Non-Fail - Incorrect Relevant Turns]",
@@ -111,6 +143,22 @@ CLEAN_STATE_TEXT: dict[int, str] = {
     230: "No major issues",
     240: "No major or moderate issues",
     250: "No major, moderate, or minor issues",
+}
+
+
+# Labels a check no longer emits but human QC still writes.
+#
+# Kept apart from `ERROR_CODES` so the shape invariant holds -- a check must not
+# carry a code for a band its shape cannot produce -- while `score_against_qc`
+# can still recognise the citation. Reading a QC row is a different problem from
+# emitting one: the customer's spreadsheets are full of labels written before we
+# moved anything, and a label that stops resolving does not go missing loudly, it
+# just quietly stops counting as ground truth for the check it belongs to.
+RETIRED_CODES: dict[int, dict[str, str]] = {
+    # 85's fail band, demoted to non-fail while the fixes to what its judge is
+    # asked await validation on a scored run. Restore it to `ERROR_CODES` and set
+    # `registry`'s shape back to "A" together, or neither.
+    85: {"fail": "[Fail - Environment Context Violation]"},
 }
 
 

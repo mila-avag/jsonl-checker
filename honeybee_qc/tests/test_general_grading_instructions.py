@@ -29,13 +29,18 @@ from __future__ import annotations
 from honeybee_qc.config import DEFAULT_POLICY, Policy
 from honeybee_qc.findings import DimensionRatingFinding
 from honeybee_qc.gates import evaluate_check_300
-from honeybee_qc.informed_prompts import INFORMED_SYSTEM_PROMPT, JUSTIFICATION_RUBRIC
+from honeybee_qc.informed_prompts import (
+    INFORMED_SYSTEM_PROMPT,
+    JUSTIFICATION_RUBRIC,
+    build_dimension_turns_prompt,
+)
 from honeybee_qc.llm import ModelResponse
 from honeybee_qc.models import Task
 from honeybee_qc.prompts import SYSTEM_PROMPT as RUBRIC_SYSTEM_PROMPT
 from honeybee_qc.rating_prompts import CONTRIBUTOR_MARKERS, RATING_SYSTEM_PROMPT
 from honeybee_qc.rating_stages import _thin_evidence_verdict, parse_dimension_rating
 from honeybee_qc.rollup import build_batch_report, roll_up_task
+from honeybee_qc.tests.fixtures import make_submission, make_task
 
 TASK_ID = "t-general-grading"
 
@@ -221,6 +226,89 @@ def test_rubric_charity_is_not_scoped_to_the_contributors_wording():
     assert "the criterion admits a reasonable interpretation" in text
 
 
+def test_a_user_turn_is_not_evidence_of_what_the_model_did():
+    """The contributor writes the user side, so a complaint is not proof.
+
+    On 6a7190c...aa2711 the judge cleared a fabricated "repeated verbatim"
+    claim in four justifications by quoting the user turns complaining about
+    the repetition -- turns the contributor wrote themselves -- while the model
+    turns they referred to answered the question in full. No gate can recover
+    from this: the judge reports the claim true, so the count is zero.
+    """
+    rubric = " ".join(JUSTIFICATION_RUBRIC.lower().split())
+    assert "written by" in rubric and "contributor" in rubric
+    assert "never evidence of what the model actually did" in rubric
+    # The escape hatches, so the rule cannot be read as "flag every complaint".
+    assert "model turn immediately before" in rubric
+    assert "unverifiable_claims" in rubric
+    assert "verbatim" in rubric
+
+
+def test_abstention_is_bounded_by_what_the_render_omits():
+    """Over-abstention was the second suppression channel.
+
+    Across 121 tasks the judge reached `unverifiable_claims` 395 times against
+    279 justifications flagged with any issue. On 6a7f7ca...c7210d the
+    contributor claimed "GitHub was connected and smoke tested" in a
+    conversation about Nginx, DNS and Jellyfin; the auditor failed it as
+    unsupported and we abstained. Absence from a complete transcript is a
+    finding, not a reason to withhold one.
+    """
+    rubric = " ".join(JUSTIFICATION_RUBRIC.lower().split())
+    assert "the conversation in front of you is the whole conversation" in rubric
+    assert "is a finding, not an abstention" in rubric
+    # The licence itself must survive: truncation still routes here.
+    assert "truncation line" in rubric
+
+
+def test_primary_versus_secondary_is_decided_by_deletion():
+    """The misses were routing, not detection.
+
+    On five tasks the customer failed for bad justifications, the judge found
+    the very claim the auditor named and filed it as one
+    `inaccurate_secondary_claims` -- which trips nothing, since that condition
+    needs two inside a single justification. The auditor called the same claims
+    "the central basis" (6a800beb...3e4af8) and "the principal reason"
+    (6a800beb...3e4abb) for their ratings, which is primary, and primary fails
+    at any share.
+    """
+    rubric = " ".join(JUSTIFICATION_RUBRIC.lower().split())
+    assert "strike the false claim out" in rubric
+    assert "reason for departing from full marks" in rubric
+    # The judge must not grade down to avoid the consequence.
+    assert "the weight of the consequence is the gate's business" in rubric
+    # And the incidental case still has somewhere to go.
+    assert "genuinely incidental" in rubric
+
+
+def test_a_sweeping_claim_that_the_rest_is_clean_must_be_tested():
+    """Three of eight justification misses in one batch were this shape.
+
+    The customer failed 6a7f7ca...c72123 for "does not make any false claims in
+    the conversation" (the model had treated fictional characters as real),
+    6a800beb...3e4af8 for "otherwise faithful" apart from turn 20, and
+    6a800beb...3e4a28 for "everywhere else it was unusually honest" (citations
+    in turns 1-3 and 10 were hallucinated). We passed all three: the judge read
+    the concession as candour and never went looking for a second instance.
+    """
+    rubric = " ".join(JUSTIFICATION_RUBRIC.lower().split())
+    assert "sweeping negative" in rubric
+    assert "conceding one error is a claim that there are no others" in rubric
+    # The bounds, so a broad phrase alone is not a fail.
+    assert "same kind of defect the claim denies" in rubric
+    assert "decoration rather than support" in rubric
+
+
+def test_the_citation_judge_carries_the_same_rule():
+    """310 zeroed on the same task by the same reasoning, so the rule has to
+    reach the prompt that check actually sends -- not just 450's rubric."""
+    task = make_task()
+    sub = make_submission()
+    prompt = " ".join(build_dimension_turns_prompt(task, sub).lower().split())
+    assert "the user side was written by the contributor" in prompt
+    assert "model text at that turn" in prompt
+
+
 # ---------------------------------------------------------------------------
 # Rule 3: "the prompt or task instructions", both sources
 # ---------------------------------------------------------------------------
@@ -247,3 +335,34 @@ def test_the_blind_system_prompt_still_trips_no_contributor_marker():
     lowered = RATING_SYSTEM_PROMPT.lower()
     for marker in CONTRIBUTOR_MARKERS:
         assert marker not in lowered, marker
+
+
+def test_fabricated_evidence_is_distinguished_from_a_numbering_shift():
+    """The severe route's precision problem, measured on the first blind batch.
+
+    `cites_incorrect_evidence` fails a task on one instance and ran 43% precision
+    across 14 tasks. An independent re-judgment of ten of those found no defect in
+    140 justifications, and named renumbering as the mechanism: a render that
+    groups a multi-message reply differently shifts later turn numbers, so a sound
+    citation resolves to the wrong turn. Check 310's prompt already tolerated this;
+    450's did not, and 450 is the one that kills on a single instance.
+    """
+    rubric = " ".join(JUSTIFICATION_RUBRIC.lower().split())
+    assert "read the turns immediately either side of it" in rubric
+    assert "numbering artefact" in rubric
+    # Ordering claims genuinely do depend on the number, so the escape is bounded.
+    assert "claim depends on that specific turn" in rubric
+
+
+def test_a_paraphrased_quote_is_not_fabricated_evidence():
+    """The closest call in the same re-judgment: a user message rendered as
+    "i think it might be 1 hour early" against an original of "I think the digest
+    is scheduled an hour too early". A string comparison books fabricated
+    evidence and one is enough to fail, but the turn reference was right and the
+    turn said what was attributed to it.
+    """
+    rubric = " ".join(JUSTIFICATION_RUBRIC.lower().split())
+    assert "whether the support is invented, not" in rubric
+    assert "rendered it loosely" in rubric
+    # Real fabrication must still be reachable.
+    assert "words attributed to a speaker who never said them" in rubric

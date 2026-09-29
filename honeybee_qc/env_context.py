@@ -55,9 +55,6 @@ _URL = re.compile(r"https?://\S+")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 
 # Phrasings that name a file to report its absence rather than to present it.
-# Over-matching here is the safe direction: it only withholds one sentence's
-# exemption, and a file that really was delivered is almost always also named
-# in a sentence that presents it.
 _DISCLAIMER = re.compile(
     r"\b(?:"
     r"do(?:es)?n['’]?t\s+(?:have|see|appear|exist|contain)"
@@ -77,6 +74,24 @@ _DISCLAIMER = re.compile(
     r"|please\s+(?:re-?)?(?:upload|attach|provide|share|send|resend)"
     r"|(?:can|could|would)\s+you\s+(?:please\s+)?(?:mind\s+)?"
     r"(?:re-?)?(?:upload|attach|provide|share|send|resend)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Phrasings that hand a file over. Needed as a counterweight because one
+# sentence routinely does both -- "here is report.pdf, though the appendix is
+# missing" delivers a file and disclaims something else in the same breath.
+_PRESENTS = re.compile(
+    r"\b(?:"
+    r"here(?:\s+is|\s+are|['’]s)"
+    r"|below\s+(?:is|are)"
+    r"|(?:i\s+)?(?:have\s+|['’]ve\s+)?"
+    r"(?:attached|created|generated|produced|built|written|wrote|made|saved|exported|"
+    r"prepared|drafted|updated|delivered|added|compiled)"
+    r"|(?:has|have)\s+been\s+"
+    r"(?:attached|created|generated|produced|built|written|saved|exported|updated)"
+    r"|(?:is|are)\s+(?:attached|ready|included|below|enclosed)"
+    r"|see\b|find\b"
     r")",
     re.IGNORECASE,
 )
@@ -111,6 +126,15 @@ class InputManifest:
     named: list[str] = field(default_factory=list)
     opaque: list[str] = field(default_factory=list)
     source: str = ""
+    # The subset of `named` that came from `ModelSubmission.attachments` rather
+    # than `Task.input_artifacts`. On this export that is where PRODUCED files
+    # land -- `turn 14.pdf`, `gemini-code-1786727907414.txt`, `chatgpt.pdf` --
+    # and on 134 of the 191 tasks with an 85 verdict it is the whole of `named`.
+    # Merging it into `named` is correct for the deterministic half, which only
+    # ever uses the list to CLEAR a reference. It is wrong for the model half,
+    # which is handed the same list under the heading "files the task declares
+    # were supplied" and reads it as the population to audit.
+    produced: list[str] = field(default_factory=list)
     # Filenames neither supplied nor uploaded, but mentioned somewhere in an
     # assistant turn of either model's conversation -- the model's own earlier
     # output ("here's report.pdf") or its own earlier hallucination, quoted back
@@ -132,6 +156,19 @@ class InputManifest:
 
     def basenames(self) -> set[str]:
         return {_basename(n) for n in self.named}
+
+    def supplied_basenames(self) -> set[str]:
+        """Only the files an input manifest actually recorded as supplied.
+
+        What the judge must be shown when it is told a file was supplied to the
+        models. `basenames()` is the union with what the models produced, which is
+        right for clearing a reference and wrong for stating a fact.
+        """
+        produced = self.produced_basenames()
+        return {b for b in self.basenames() if b not in produced}
+
+    def produced_basenames(self) -> set[str]:
+        return {_basename(n) for n in self.produced}
 
     def known_basenames(self) -> set[str]:
         """Every basename a reference can be cleared against: uploaded/supplied
@@ -216,7 +253,14 @@ def input_manifest(task: Task) -> InputManifest:
             # the old (wrong) behaviour forward for the tasks the manifest
             # itself left this blank on.
             text = sub.attachment_names.get(url) or url
-            (manifest.named if _names_a_file(text) else manifest.opaque).append(text)
+            if _names_a_file(text):
+                manifest.named.append(text)
+                # Recorded twice on purpose: `named` is the set a reference is
+                # cleared against and must stay a union, while `produced` is what
+                # keeps an output from being described to the judge as an input.
+                manifest.produced.append(text)
+            else:
+                manifest.opaque.append(text)
 
     manifest.conversation_mentioned = assistant_mentioned_filenames(task)
     return manifest
@@ -233,7 +277,7 @@ def prompt_texts(task: Task) -> list[str]:
     turns = [t.text for t in task.prompts if (t.text or "").strip()]
     if turns:
         return turns
-    for sub in (task.model_a, task.model_b):
+    for sub in task.submissions():
         fetched = [
             t.text
             for t in ((sub.conversation if sub else None) or [])
@@ -247,7 +291,7 @@ def prompt_texts(task: Task) -> list[str]:
 def prompt_source(task: Task) -> str:
     if any((t.text or "").strip() for t in task.prompts):
         return "recorded prompt turns"
-    for sub in (task.model_a, task.model_b):
+    for sub in task.submissions():
         if any(
             t.role == "user" and (t.text or "").strip()
             for t in ((sub.conversation if sub else None) or [])
@@ -307,16 +351,46 @@ def _dedupe_on_basename(references: Iterable[str]) -> list[str]:
     return out
 
 
-def _disclaims_file(sentence: str) -> bool:
-    """The sentence names a file in order to say it is *not* here.
+def _established_in_sentence(sentence: str) -> list[str]:
+    """Filenames this sentence puts on the table, ignoring ones it disclaims.
 
-    Distinguishing this from a claim is the whole point of the caller: "here is
-    report.pdf" puts a name on the table, while "I can't find report.pdf"
-    names it only to report its absence. Judged per sentence rather than per
-    turn because a single reply routinely does both -- delivering one file and
-    asking for another.
+    Distinguishing the two readings is the whole point: "here is report.pdf"
+    establishes a name, while "I can't find report.pdf" names it only to report
+    its absence. Neither a per-turn nor a per-sentence verdict is enough,
+    because one sentence commonly does both -- "here is report.pdf, though the
+    tax records are missing" delivers a file and disclaims something else.
+
+    So each filename is governed by the cue *nearest* it, in either direction.
+    That is what a reader does, and it lands every common shape correctly:
+    "ledger.xlsx was not provided" is disclaimed by the phrase after it, while
+    in "I don't have ledger.xlsx, but here is a draft" the disclaimer sits
+    closer than the delivery and still wins.
     """
-    return bool(_DISCLAIMER.search(sentence or ""))
+    text = _URL.sub(" ", sentence or "")
+    cues = [(m.start(), m.end(), False) for m in _DISCLAIMER.finditer(text)]
+    cues += [(m.start(), m.end(), True) for m in _PRESENTS.finditer(text)]
+    out: list[str] = []
+    for match in _FILE_REFERENCE.finditer(text):
+        if _nearest_cue_presents(cues, match.start(), match.end()):
+            out.append(match.group(0))
+    return out
+
+
+def _nearest_cue_presents(
+    cues: list[tuple[int, int, bool]], start: int, end: int
+) -> bool:
+    """Whether the cue closest to this span presents the file rather than denies it.
+
+    With no cue either way the name is taken at face value, which keeps the
+    plain "report.pdf is attached to this reply" working without having to
+    enumerate every way a file can be handed over.
+    """
+    best: tuple[int, bool] | None = None
+    for cue_start, cue_end, presents in cues:
+        distance = cue_start - end if cue_start >= end else start - cue_end
+        if best is None or distance < best[0]:
+            best = (max(distance, 0), presents)
+    return True if best is None else best[1]
 
 
 def assistant_mentioned_filenames(task: Task) -> list[str]:
@@ -341,16 +415,12 @@ def assistant_mentioned_filenames(task: Task) -> list[str]:
     first.
     """
     out: list[str] = []
-    for sub in (task.model_a, task.model_b):
-        if sub is None:
-            continue
+    for sub in task.trajectories():
         for turn in sub.conversation:
             if turn.role != "assistant" or not (turn.text or "").strip():
                 continue
             for sentence in _SENTENCE_SPLIT.split(turn.text or ""):
-                if _disclaims_file(sentence):
-                    continue
-                out.extend(file_references(sentence))
+                out.extend(_established_in_sentence(sentence))
     return _dedupe_on_basename(out)
 
 

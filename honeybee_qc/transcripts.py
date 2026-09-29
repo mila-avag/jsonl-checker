@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
 Role = Literal["user", "assistant"]
-SourceKind = Literal["link", "pdf"]
+SourceKind = Literal["link", "pdf", "html"]
 
 # Page furniture a browser print adds that is not conversation content.
 _PDF_FURNITURE = re.compile(

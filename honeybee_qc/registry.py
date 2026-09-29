@@ -76,6 +76,13 @@ def _spec(*args, **kwargs) -> CheckSpec:
 
 
 REGISTRY: dict[int, CheckSpec] = {
+    60: _spec(
+        60, "Prompt", "Clarity and Specificity / Unique Ground Truth", "C", 4, False,
+        ("prompts", "golden_answer"),
+        "Prompt is clear, specific, and has a unique ground-truth final answer.",
+        notes="Net-new: V5 fails when the prompt is unclear/vague, major details "
+              "are missing, or it has multiple valid final answers / is subjective.",
+    ),
     70: _spec(
         70, "Prompt", "Domain Relevance", "C", 4, False,
         ("assigned_domain", "prompts"),
@@ -100,6 +107,29 @@ REGISTRY: dict[int, CheckSpec] = {
               "when no pre-seeded prompt was recorded, which most tasks "
               "project-wide will not have.",
     ),
+    71: _spec(
+        71, "Prompt", "Reasoning Requirement", "C", 4, False,
+        ("prompts",),
+        "Prompt requires real reasoning, not factual lookup.",
+        notes="Net-new: V5 fails when the prompt needs only factual lookup or "
+              "definition; non-fail when reasoning is trivial for the assigned "
+              "expertise.",
+    ),
+    72: _spec(
+        72, "Prompt", "Constraints", "C", 4, False,
+        ("prompts",),
+        "Prompt constraints are natural rather than contrived or stacked.",
+        notes="Net-new: V5 fails when constraints are contrived/unrealistic or "
+              "unrealistically stacked (its example: 3+ formatting constraints); "
+              "non-fail when basic or overused.",
+    ),
+    76: _spec(
+        76, "Prompt", "Prompt Request", "A", 4, False,
+        ("prompts",),
+        "At least one prompt asks for a deliverable of any kind.",
+        notes="Net-new: V5 fail-only. Fail when no prompt in the conversation "
+              "asks for a deliverable.",
+    ),
     80: _spec(
         80, "Target Outcome", "", "B", 4, False,
         ("prompts", "target_outcome"),
@@ -109,7 +139,7 @@ REGISTRY: dict[int, CheckSpec] = {
               "removals before comparing. Never diff against turn 1 alone.",
     ),
     85: _spec(
-        85, "Prompt", "Environment Context", "A", 4, False,
+        85, "Prompt", "Environment Context", "B", 4, False,
         ("prompts", "input_artifacts", "target_outcome"),
         "Prompt references only entities, files, and events in the task's universe.",
         notes="Net-new: the audit workflow tab states the requirement ('references "
@@ -117,8 +147,33 @@ REGISTRY: dict[int, CheckSpec] = {
               "it no row, so 85 is a local id placed with the other input checks. "
               "Two halves: named files are compared against the input manifest with "
               "no model call, and entities/people/events are judged by the informed "
-              "stage. Fail-only, and both halves abstain rather than guess when the "
-              "manifest or the prompt text is missing.",
+              "stage. Both halves abstain rather than guess when the manifest or the "
+              "prompt text is missing. "
+              "DEMOTED to non-fail (band B) from the fail-only band the requirement "
+              "implies, and the demotion is temporary. Measured across three "
+              "corpora, 11 of 13 escalations sat on tasks whose entire declared-"
+              "supplied file list was model OUTPUT described to the judge as "
+              "contributor input, and the parser hardcoded the two questions that "
+              "decide whether a missing file is a violation. Those defects are fixed "
+              "beside this line, but the fix changes what the judge is asked and so "
+              "cannot be trusted on the strength of review alone; reporting rather "
+              "than failing is what makes a wrong finding cost a note instead of a "
+              "task. Restore band 'A' once a scored run shows the escalations that "
+              "survive are real.",
+    ),
+    82: _spec(
+        82, "Conversation", "Final Outcome Claim", "B", 4, False,
+        ("conversations",),
+        "Contributor's produced_final_outcome claim matches the conversation.",
+        blocks_task=False,
+        notes="Net-new, report-only. V5 does not fail the task on this dimension.",
+    ),
+    86: _spec(
+        86, "Prompt", "Known / Not-Known Accuracy", "B", 4, False,
+        ("prompts", "known_information"),
+        "Known / not-known split matches what the prompt supplies and withholds.",
+        blocks_task=False,
+        notes="Net-new, report-only.",
     ),
     90: _spec(
         90, "User Input", "Valid Links", "A", 1, True,
@@ -126,12 +181,26 @@ REGISTRY: dict[int, CheckSpec] = {
         "Valid final trajectory links present for both Model A and Model B.",
         notes="Fully deterministic. Validate the FINAL link specifically.",
     ),
+    91: _spec(
+        91, "User Input", "Unique Links", "C", 1, True,
+        ("turn_manifest",),
+        "Gemini turns carry unique share links.",
+        notes="Net-new: V5 fails at 4+ Gemini turns missing or not unique, "
+              "non-fails at 1-3. Source is the criteria-builder turn manifest. "
+              "Empty manifest is not_evaluated.",
+    ),
     95: _spec(
         95, "Conversation", "Output Artifacts Preserved", "A", 4, False,
         ("conversations", "uploaded_artifacts"),
         "Every output file mentioned in a response was uploaded.",
         notes="Never test embedded link liveness; expired links are expected. "
-              "No artifacts mentioned at all is a clean 5.",
+              "No artifacts mentioned at all is a clean 5, but only where the "
+              "extraction had something to read: a submission whose files were "
+              "uploaded and whose conversation yielded no filename, or one whose "
+              "model replies were never fetched, is reported not_evaluated "
+              "instead, because the comparison had nothing in it. "
+              "V5 scopes extraction to the final response via "
+              "policy.artifact_scope.",
     ),
     96: _spec(
         96, "Conversation", "Minimum Turns", "A", 1, True,
@@ -144,6 +213,14 @@ REGISTRY: dict[int, CheckSpec] = {
               "past the last turn the fetch retrieved is set aside rather than "
               "counted short, so an incomplete fetch abstains instead of "
               "manufacturing a fail.",
+    ),
+    97: _spec(
+        97, "Conversation", "Valid Model Failure", "A", 1, True,
+        ("simplified", "criterion_ratings"),
+        "Simplified trajectory fails: weighted pass rate at or under the "
+        "project ceiling, turn count in bounds.",
+        notes="Net-new, hard fail. Customer-confirmed 50% weighted ceiling "
+              "against V5's 40% text. Turn bounds 1-3. not_evaluated without S.",
     ),
     100: _spec(
         100, "Key Turn", "Key Turn Identification", "C", 1, True,
@@ -208,6 +285,13 @@ REGISTRY: dict[int, CheckSpec] = {
         "Contributor's per-criterion ratings agree with an independent rating.",
         notes="One call per (criterion, model). Batching destroys independence.",
     ),
+    271: _spec(
+        271, "Rating", "Simplified Rubric Evaluation", "B", 5, True,
+        ("rubric", "criterion_ratings", "simplified"),
+        "Independent rating of the simplified trajectory's per-criterion scores.",
+        blocks_task=False,
+        notes="Net-new, report-only. V5's Rubric Evaluation covers A/B/C only.",
+    ),
     280: _spec(
         280, "Rubric Ratings", "Relevant Turns", "C", 5, True,
         ("criterion_ratings", "conversations"),
@@ -215,11 +299,26 @@ REGISTRY: dict[int, CheckSpec] = {
         notes="Work list is built from the CONTRIBUTOR's score-0 set, not from "
               "hypothetical corrected ratings.",
     ),
+    281: _spec(
+        281, "Rubric Ratings", "Passing Criteria Relevant Turns", "B", 5, True,
+        ("criterion_ratings", "conversations"),
+        "Turns cited for score-1 criteria are genuinely relevant.",
+        blocks_task=False,
+        notes="Net-new, report-only. Distinct error strings from 280/310.",
+    ),
     300: _spec(
         300, "Rating", "Correctness/Accuracy - Major Rating", "C", 5, True,
         ("dimension_ratings", "conversations"),
         "Contributor's per-dimension ratings agree with an independent rating.",
         notes="N/A dimensions are excluded from the denominator.",
+    ),
+    305: _spec(
+        305, "Rating", "Collaboration Quality", "B", 5, True,
+        ("dimension_ratings", "conversations"),
+        "Independent rating of Collaboration quality.",
+        blocks_task=False,
+        notes="Net-new, report-only. V5's Major Rating lists six dimensions and "
+              "collaboration is not among them.",
     ),
     310: _spec(
         310, "Dimension Ratings", "Relevant Turns", "C", 5, True,
@@ -269,14 +368,27 @@ REGISTRY: dict[int, CheckSpec] = {
 
 # Natural blocks worth preserving in the pipeline.
 BLOCKS: dict[str, tuple[int, ...]] = {
-    "setup_and_inputs": (75, 80, 85, 90, 95, 96, 100, 110),
+    "setup_and_inputs": (60, 70, 71, 72, 75, 76, 80, 82, 85, 86, 90, 91, 95, 96, 97, 100, 110),
     "rubric_authoring": (200, 210, 220, 230, 240, 250, 260),
-    "rating_accuracy": (270, 280, 300, 310),
+    "rating_accuracy": (270, 271, 280, 281, 300, 305, 310),
     "comparison": (400, 450, 460, 470),
     "escape_hatch": (1000,),
 }
 
 ORDER: tuple[int, ...] = tuple(sorted(REGISTRY))
+
+
+def check_name(check_id: int) -> str:
+    """The QC dimension name, for logs and reports that a person reads.
+
+    Sub-dimension when the check has one (`Unique Links`), otherwise the
+    parent (`Unauditable`). Unknown ids stay as `check N` rather than crashing
+    a progress line.
+    """
+    spec = REGISTRY.get(check_id)
+    if spec is None:
+        return f"check {check_id}"
+    return spec.sub_dimension or spec.dimension
 
 # The three checks that read one shared per-criterion census, so their
 # numerators are guaranteed monotonic.

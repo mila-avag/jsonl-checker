@@ -181,6 +181,32 @@ def test_guard_catches_a_justification_leaking_through_any_field():
     assert any("justification leaked" in m for m in report.leaked)
 
 
+def test_guard_does_not_fire_on_wording_the_justification_shares_with_the_turns():
+    """Contributors describe the conversation in the conversation's own words.
+
+    On 6a7190c...aa2672 the B tool-reliability justification opened "The
+    image-generation workflow was used consistently...", whose first 30
+    characters appear seven times in that task's own transcript. The guard read
+    the collision as a leak and the task lost its entire rating stage, so the
+    canary has to be a fingerprint rather than a phrase.
+    """
+    task = make_task(n_criteria=2, exchanges=2)
+    shared = "The image-generation workflow was used consistently"
+    for d in task.dimension_ratings:
+        d.justification = (
+            f"{shared}, with no unsupported claims that an external connector "
+            "action had been completed, and the model disclosed the limitation "
+            "instead of fabricating a result."
+        )
+    # The transcript legitimately contains the same opening phrase.
+    prompt = f"## Conversation\n\n[turn 1] MODEL: {shared} across every turn.\n"
+    assert assert_blind(prompt, task).clean
+
+    # A genuine leak still fires: the whole justification is present.
+    leaked = prompt + "\n" + task.dimension_ratings[0].justification
+    assert not assert_blind(leaked, task).clean
+
+
 def test_guard_catches_contributor_framing_phrases():
     task = make_task(n_criteria=2, exchanges=2)
     report = assert_blind("The contributor rated this 7 out of 10.", task)
@@ -618,7 +644,7 @@ def test_a_task_with_no_submissions_is_not_evaluated_without_spending_calls():
     result = run_rating_stage(task, client)
 
     assert client.calls == []
-    assert {v.check_id for v in result.verdicts} == {270, 300, 400}
+    assert {v.check_id for v in result.verdicts} == {270, 271, 300, 305, 400}
     assert all(v.band == "not_evaluated" for v in result.verdicts)
 
 
@@ -776,22 +802,125 @@ def test_an_abstained_adjudication_leaves_the_gap_uncounted_and_labelled():
     assert counts["blind_disagreement_only"] is True
 
 
-def test_a_gap_read_from_a_truncated_conversation_is_not_counted():
+def test_a_gap_read_from_a_truncated_conversation_is_counted_once_a_full_render_confirms_it():
+    """A cut blind render is no longer enough to suppress a gap.
+
+    It used to be, and that is how five real defects stopped being reported: the
+    blind pass reads twelve conversations per task under a budget that has to be
+    affordable twelve times over, so it is cut often, and every gap it found from a
+    cut render was dropped. The adjudication pass reads one conversation and asks
+    one question, so it runs at a budget wide enough to see the whole thing -- and
+    once a reader who saw the whole thing says the rating is not supported, the
+    blind pass's earlier blind spot is beside the point.
+    """
     task = make_task(n_criteria=2, exchanges=6, dimension_rating_a=5, dimension_rating_b=5)
-    # A budget this small cuts every conversation, which is the condition the
-    # recorded batch-9 fails were produced under and never disclosed.
     policy = dataclasses.replace(DEFAULT_POLICY, max_conversation_chars=200)
+    client = _adjudicating_responder(dimension=lambda req: 1, adjudication="indefensible")
+
+    result = run_rating_stage(task, client, policy=policy)
+    verdict = _verdict(result, 300)
+    counts = verdict.measurement.counts
+
+    assert all(f.truncated for f in result.dimension_findings)
+    assert not any(f.adjudication_tail_truncated for f in result.dimension_findings)
+    assert counts["counted_disagreements"] > 0
+    assert counts["truncated_evidence_not_counted"] == 0
+    assert verdict.band == "fail"
+    # The blind pass's cut is still on the record; it just no longer decides.
+    for item in counts["reasons_by_item"].values():
+        assert "blind_render_truncated" in item
+
+
+def test_a_gap_still_truncated_at_the_adjudication_budget_is_not_counted():
+    """The other direction: a cut nobody could read past still suppresses."""
+    task = make_task(n_criteria=2, exchanges=6, dimension_rating_a=5, dimension_rating_b=5)
+    policy = dataclasses.replace(
+        DEFAULT_POLICY,
+        max_conversation_chars=200,
+        adjudication_max_conversation_chars=200,
+    )
     client = _adjudicating_responder(dimension=lambda req: 1, adjudication="indefensible")
 
     result = run_rating_stage(task, client, policy=policy)
     counts = _verdict(result, 300).measurement.counts
 
-    # Even with the informed pass agreeing: both passes read the same cut
-    # conversation, so the second does not independently check the first.
+    assert all(f.adjudication_tail_truncated for f in result.dimension_findings)
     assert counts["counted_disagreements"] == 0
     assert counts["truncated_evidence_not_counted"] > 0
     for item in counts["truncated_evidence_items"]:
         assert "truncated_evidence" in counts["reasons_by_item"][item]
+
+
+def test_a_check_300_whose_every_gap_was_truncated_abstains_rather_than_passing():
+    """The false pass this whole change exists to close.
+
+    On the scored run one task had all six of its rating gaps dropped for
+    truncation, considered no evidence at all, and published `clean` -- which reads
+    to every downstream consumer exactly like a task whose ratings were checked and
+    found sound. A check that judged nothing has to say it judged nothing.
+    """
+    task = make_task(n_criteria=2, exchanges=6, dimension_rating_a=5, dimension_rating_b=5)
+    policy = dataclasses.replace(
+        DEFAULT_POLICY,
+        max_conversation_chars=200,
+        adjudication_max_conversation_chars=200,
+    )
+    client = _adjudicating_responder(dimension=lambda req: 1, adjudication="indefensible")
+
+    verdict = _verdict(run_rating_stage(task, client, policy=policy), 300)
+
+    assert verdict.band == "not_evaluated"
+    assert verdict.band != "clean"
+    assert verdict.measurement.counts["unjudged_gaps"] > 0
+    assert "NOT EVALUATED" in verdict.measurement.notes
+
+
+def test_a_check_300_whose_every_gap_went_unadjudicated_abstains_rather_than_passing():
+    """Same property through the other unjudged channel.
+
+    An adjudication that abstained, or a confirming call that never came back, is
+    an open question about that rating. Reporting it as clean answers a question
+    nobody answered.
+    """
+    task = make_task(n_criteria=2, exchanges=4, dimension_rating_a=5, dimension_rating_b=5)
+    client = _adjudicating_responder(
+        dimension=lambda req: 1, adjudication="cannot_determine"
+    )
+
+    verdict = _verdict(run_rating_stage(task, client), 300)
+
+    assert verdict.band == "not_evaluated"
+    assert verdict.measurement.counts["unadjudicated_not_counted"] > 0
+
+
+def test_an_adjudicator_that_clears_everything_cannot_produce_a_clean_task_silently():
+    """An adjudicator that never says `indefensible` is a broken adjudicator.
+
+    This is the shape of the overcorrection: replace the informed pass with one that
+    returns `defensible` for every gap and check 300 fails nothing, whatever the
+    blind deltas were. That is a defensible *result* only if the clearing was
+    itself a judgment, so the two channels are held to different bands on purpose --
+    a cleared gap must land in `blind_only_items` with its verdict recorded and the
+    notes must say every gap was judged, never that none was found.
+    """
+    task = make_task(n_criteria=2, exchanges=4, dimension_rating_a=5, dimension_rating_b=5)
+    clears_everything = _adjudicating_responder(
+        dimension=lambda req: 1, adjudication="defensible"
+    )
+
+    verdict = _verdict(run_rating_stage(task, clears_everything), 300)
+    counts = verdict.measurement.counts
+
+    assert verdict.band == "clean"
+    # ... but not silently: every gap it cleared is named, with the verdict that
+    # cleared it, and the basis note says a judgment was made rather than that
+    # there was nothing to judge.
+    assert counts["rating_gaps_found"] > 0
+    assert counts["blind_only_not_counted"] == counts["rating_gaps_found"]
+    assert counts["blind_disagreement_only"] is True
+    assert "no rating gaps between" not in verdict.measurement.notes
+    for item in counts["blind_only_items"]:
+        assert "adjudicated_defensible" in counts["reasons_by_item"][item]
 
 
 def test_truncation_reaches_the_finding_at_all():

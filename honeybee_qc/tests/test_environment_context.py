@@ -1,12 +1,23 @@
 """Check 85: prompt references against the task's universe.
 
-The risk this check carries is almost entirely false positives. It is shape A, so
-a finding fails the task outright with no middle band, and the two things it
-compares are both routinely unreadable on the live export: `Task.prompts` is empty
-there and the file manifest arrives as opaque CDN paths. Most of what is tested
-here is therefore the refusal to conclude anything -- an unreadable manifest, an
-unquoted allegation, and a prompt nobody recorded all have to come back
-`not_evaluated` or clean rather than as a violation.
+The risk this check carries is almost entirely false positives, and the two things
+it compares are both routinely unreadable on the live export: `Task.prompts` is
+empty there and the file manifest arrives as opaque CDN paths. Most of what is
+tested here is therefore the refusal to conclude anything -- an unreadable
+manifest, an unquoted allegation, and a prompt nobody recorded all have to come
+back `not_evaluated` or clean rather than as a violation.
+
+The requirement is stated as a flat fail with no middle band, and the check is
+nonetheless running as shape B. That is a temporary demotion, and the reason is
+measured rather than cautious: across three corpora 11 of 13 escalations sat on
+tasks whose entire "declared supplied" file list was model OUTPUT, described to
+the judge as contributor input. Three defects behind that are fixed here -- the
+supplied/produced split, the parser no longer hardcoding the two questions that
+decide whether a missing file is a violation, and a `found_in_materials` field for
+a judge that looked and found the thing -- but they change what the judge is asked,
+so their output is unvalidated on a scored run. Until it is, a wrong finding costs
+a note instead of a task. `test_the_demotion_is_temporary_and_says_so` pins the
+restore condition.
 """
 
 from __future__ import annotations
@@ -37,11 +48,14 @@ from honeybee_qc.informed_stages import (
     run_informed_stage,
 )
 from honeybee_qc.llm import FakeModelClient, ModelResponse
-from honeybee_qc.models import Turn
+from honeybee_qc.models import InputArtifact, Turn
 from honeybee_qc.registry import REGISTRY
 from honeybee_qc.tests.fixtures import make_task
 
+# What human QC writes, and what 85 emitted before the demotion.
 SPEC_LABEL = "[Fail - Environment Context Violation]"
+# What it emits now. Provisional, and ours: QC has no non-fail precedent here.
+REPORTED_LABEL = "[Non-Fail - Environment Context Violation]"
 
 
 def _task(prompt: str, attachments_a=None, attachments_b=None):
@@ -79,25 +93,49 @@ def _response(data: dict) -> ModelResponse:
 def test_85_is_registered_so_it_reports_rather_than_vanishing():
     spec = REGISTRY[85]
     assert (spec.dimension, spec.sub_dimension) == ("Prompt", "Environment Context")
-    # Fail-only: the audit workflow tab states the requirement and gives it no
-    # middle band, and the label human QC cites is a Fail label.
-    assert spec.shape == "A"
+    # Shape B, against a requirement the audit workflow tab states with no middle
+    # band. See the module docstring and the test below.
+    assert spec.shape == "B"
     assert 85 in INFORMED_CHECKS
 
 
-def test_the_error_string_is_the_one_human_qc_cites():
-    """This is the join key against the QC sheet. A paraphrase makes every claim
-    citing it invisible to the recall scorer, which is how the dimension went
-    unnoticed in the first place."""
-    assert ERROR_CODES[85] == {"fail": SPEC_LABEL}
+def test_the_demotion_is_temporary_and_says_so():
+    """A band that moved for a reason has to carry the reason and the way back.
+
+    The failure mode this guards is a demotion becoming permanent by being
+    forgotten: 85 reports instead of failing because the fixes to what its judge is
+    asked are unvalidated, not because the requirement softened. Two edits restore
+    it -- the registry shape and the gate's band -- and both are named in the notes
+    so whoever validates the fixes can find them without reading the history.
+    """
+    notes = REGISTRY[85].notes
+    assert "DEMOTED" in notes
+    assert "Restore band 'A'" in notes
+    assert "11 of 13" in notes, "the measurement that justifies it must travel too"
+
+    task = _task("Use the numbers in q3_actuals.csv.", ["budget.xlsx"])
+    scan = scan_file_references(task)
+    verdict = evaluate_check_85(task, scan.findings, scan, entity_half_ran=False)
+    assert "Reported rather than failed" in verdict.measurement.notes
+
+
+def test_the_error_strings_keep_the_join_key_human_qc_writes():
+    """The fail label is the join key against the QC sheet, and it must survive the
+    demotion even though 85 no longer emits it. Dropping it would not fail loudly:
+    a QC row citing this requirement would simply stop counting as ground truth for
+    85, which reads as the customer never having raised it."""
+    from honeybee_qc.errors import RETIRED_CODES
+
+    assert ERROR_CODES[85] == {"non_fail": REPORTED_LABEL}
+    assert RETIRED_CODES[85] == {"fail": SPEC_LABEL}
 
 
 def test_a_violation_is_reported_under_the_spec_label():
     task = _task("Use the numbers in q3_actuals.csv.", ["budget.xlsx"])
     scan = scan_file_references(task)
     verdict = evaluate_check_85(task, scan.findings, scan, entity_half_ran=False)
-    assert verdict.band == "fail"
-    assert verdict.error_code == SPEC_LABEL
+    assert verdict.band == "non_fail"
+    assert verdict.error_code == REPORTED_LABEL
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +164,7 @@ def test_a_prompt_naming_a_file_absent_from_the_manifest_fails():
     assert [f.reference for f in scan.findings] == ["market_sizing_assumptions.xlsx"]
 
     verdict = evaluate_check_85(task, scan.findings, scan)
-    assert verdict.band == "fail"
+    assert verdict.band == "non_fail"
     assert verdict.measurement.counts["file_violations"] == 1
     # The finding carries its own evidence: the prompt's words, and the manifest
     # it was compared against.
@@ -218,8 +256,8 @@ def test_a_prompt_inventing_a_person_fails():
     task = _task("Send the signed copy to Priya Nair, who approved it last Tuesday.")
     scan = scan_file_references(task)
     verdict = evaluate_check_85(task, [_finding()], scan, entity_half_ran=True)
-    assert verdict.band == "fail"
-    assert verdict.error_code == SPEC_LABEL
+    assert verdict.band == "non_fail"
+    assert verdict.error_code == REPORTED_LABEL
     assert verdict.measurement.counts["entity_violations"] == 1
 
 
@@ -232,7 +270,7 @@ def test_a_prompt_inventing_an_event_fails():
         quote="the decisions from the March offsite",
     )
     verdict = evaluate_check_85(task, [finding], scan, entity_half_ran=True)
-    assert verdict.band == "fail"
+    assert verdict.band == "non_fail"
 
 
 def test_a_real_world_entity_the_task_legitimately_involves_does_not_fail():
@@ -562,7 +600,7 @@ def test_a_declared_file_never_evidenced_in_conversation_can_still_fail():
         basis="model",
     )
     verdict = evaluate_check_85(task, [finding], scan, entity_half_ran=True)
-    assert verdict.band == "fail"
+    assert verdict.band == "non_fail"
     assert verdict.measurement.counts["file_violations"] == 1
 
 
@@ -630,7 +668,7 @@ def test_the_stage_runs_both_halves_and_scores_them_as_one_dimension():
     assert result.file_scan is not None and result.file_scan.ran
     kinds = sorted(f.kind for f in result.environment_context)
     assert kinds == ["file", "person"]
-    assert verdict.band == "fail"
+    assert verdict.band == "non_fail"
     assert verdict.measurement.counts["file_violations"] == 1
     assert verdict.measurement.counts["entity_violations"] == 1
 
@@ -642,7 +680,7 @@ def test_the_file_half_still_runs_when_the_model_call_fails():
     verdict = next(v for v in result.verdicts if v.check_id == 85)
 
     assert not result.entity_half_ran
-    assert verdict.band == "fail"
+    assert verdict.band == "non_fail"
     assert verdict.measurement.counts["file_half_ran"] is True
 
 
@@ -659,6 +697,180 @@ def test_the_manifest_reads_both_slots():
     manifest = input_manifest(task)
     assert manifest.basenames() == {"a.pdf", "b.pdf"}
     assert manifest.source == "ModelSubmission.attachments"
+
+
+# ---------------------------------------------------------------------------
+# Supplied files and produced files are not the same population. Conflating
+# them accounted for 11 of the 13 escalations measured across three corpora.
+# ---------------------------------------------------------------------------
+
+
+def _artifact(name: str) -> InputArtifact:
+    return InputArtifact(name=name, origin="upload")
+
+
+def test_the_manifest_keeps_produced_files_apart_from_supplied_ones():
+    """`named` stays the union and `produced` names the half that is output.
+
+    Both are needed and for opposite reasons. The deterministic half only ever uses
+    the list to CLEAR a reference, so it wants everything anyone has seen -- reading
+    an output file as if it had never existed would fail a callback. The model half
+    is told the same list was "supplied", and it reads that as the population to
+    audit, so it needs the half that actually was.
+    """
+    task = _task("Summarise budget.xlsx.")
+    task.input_artifacts = [_artifact("budget.xlsx")]
+    task.model_a.attachments = ["turn 14.pdf"]
+    task.model_b.attachments = ["gemini-code-1786727907414.txt"]
+
+    manifest = input_manifest(task)
+    assert manifest.basenames() == {
+        "budget.xlsx",
+        "turn 14.pdf",
+        "gemini-code-1786727907414.txt",
+    }
+    assert manifest.supplied_basenames() == {"budget.xlsx"}
+    assert manifest.produced_basenames() == {
+        "turn 14.pdf",
+        "gemini-code-1786727907414.txt",
+    }
+    # And the clearing set is still the union, so a callback to an output stays
+    # clean.
+    assert "turn 14.pdf" in manifest.known_basenames()
+
+
+def test_the_judge_is_not_told_the_models_own_output_was_supplied_to_them():
+    """The prompt-level half of the same fix, and the one that was doing the damage.
+
+    On 134 of the 191 tasks carrying an 85 verdict, every name under "files the task
+    DECLARES were supplied" was a model attachment. A judge told a file was supplied
+    and then asked to find evidence it was uploaded finds none, because it never
+    was: it came out of the conversation rather than into it.
+    """
+    task = _task("Review the attached deck and update it.")
+    task.input_artifacts = [_artifact("deck.pptx")]
+    task.model_a.attachments = ["turn 14.pdf"]
+
+    prompt = build_environment_context_prompt(task)
+    declared = prompt.split("DECLARES were supplied", 1)[1].split("Files the models", 1)[0]
+    assert "deck.pptx" in declared
+    assert "turn 14.pdf" not in declared, "an output must not be described as an input"
+
+    produced = prompt.split("Files the models PRODUCED", 1)[1]
+    assert "turn 14.pdf" in produced
+    assert "They are listed so you can recognise them, not" in produced
+    assert "never belongs in `declared_file_checks`" in produced
+
+
+def test_a_task_with_no_supplied_files_says_so_rather_than_listing_outputs():
+    task = _task("Build me a chart.")
+    task.model_a.attachments = ["chart.png"]
+    prompt = build_environment_context_prompt(task)
+    declared = prompt.split("DECLARES were supplied", 1)[1].split("Files the models", 1)[0]
+    assert "(none with a readable name)" in declared
+    assert "chart.png" in prompt.split("Files the models PRODUCED", 1)[1]
+
+
+def test_the_file_path_asks_the_two_violation_questions_instead_of_assuming_them():
+    """The parser hardcoded `presented_as_existing` and `required_to_complete` to
+    True on this path, so a file became a violation the moment the two upload
+    questions came back false -- the expected answer for anything the model itself
+    produced. The same judge, in one response, answered `required_to_complete=False`
+    for a reference on the `references` path and had it forced to True here.
+    """
+    asked = _response(
+        {
+            "declared_file_checks": [
+                {
+                    "filename": "office_template.docx",
+                    "prompt_quote": "use the formatting we use in office",
+                    "prompt_treats_as_available_to_read": True,
+                    "conversation_shows_attachment_or_upload": False,
+                    "conversation_shows_independent_content": False,
+                    "presented_as_existing": True,
+                    "required_to_complete": False,
+                    "evidence_summary": "The model can write around the template.",
+                }
+            ],
+            "references": [],
+            "confidence": "high",
+        }
+    )
+    findings = parse_environment_context(asked)
+    assert len(findings) == 1
+    assert findings[0].required_to_complete is False
+    assert not findings[0].is_violation, "an unnecessary file is not a violation"
+
+    # A judge that answers both questions true still gets its violation, so the
+    # change is a question asked rather than a leg removed.
+    data = dict(asked.data)
+    data["declared_file_checks"][0]["required_to_complete"] = True
+    findings = parse_environment_context(_response(data))
+    assert findings[0].is_violation
+
+    # And an older cached response with neither field keeps the old reading, so a
+    # replay of a run scored before this is unchanged.
+    legacy = dict(asked.data)
+    del legacy["declared_file_checks"][0]["presented_as_existing"]
+    del legacy["declared_file_checks"][0]["required_to_complete"]
+    findings = parse_environment_context(_response(legacy))
+    assert findings[0].is_violation
+
+
+def test_a_reference_the_judge_looked_for_and_found_is_not_an_allegation():
+    """The judge is asked to show its work, so `references` carries rows for things
+    it searched for and located. Answered literally about an in-universe reference,
+    the three booleans spell violation -- it exists, the work needs it, it is not a
+    public entity -- and the only place the judge could say "I found it" was
+    free-text prose nothing reads. One live row said "Nothing about Straxon requires
+    consulting an external, undisclosed source" and failed the task.
+    """
+    found = _response(
+        {
+            "declared_file_checks": [],
+            "references": [
+                {
+                    "reference": "Straxon",
+                    "kind": "organisation",
+                    "quote": "our Straxon deployment",
+                    "checked_against": ["the model conversation(s)"],
+                    "found_in_materials": True,
+                    "why_outside_universe": (
+                        "Nothing about Straxon requires consulting an external, "
+                        "undisclosed source."
+                    ),
+                    "presented_as_existing": True,
+                    "required_to_complete": True,
+                    "real_world_public_entity": False,
+                }
+            ],
+            "confidence": "high",
+        }
+    )
+    assert parse_environment_context(found) == []
+
+    # The same row with the field false is still an allegation, so the fix does not
+    # disarm the check.
+    data = dict(found.data)
+    data["references"][0]["found_in_materials"] = False
+    findings = parse_environment_context(_response(data))
+    assert len(findings) == 1 and findings[0].is_violation
+
+    # And a cached response from before the field existed reads as before.
+    legacy = dict(found.data)
+    del legacy["references"][0]["found_in_materials"]
+    assert len(parse_environment_context(_response(legacy))) == 1
+
+
+def test_the_prompt_tells_the_judge_that_found_is_the_common_answer():
+    """A field the judge does not know to set true is a field that does nothing.
+    The instruction has to say so explicitly, because the judge's default posture
+    is to write rows only for things it is alleging."""
+    prompt = build_environment_context_prompt(_task("Check our Straxon deployment."))
+    assert "`found_in_materials`" in prompt
+    assert "Answer TRUE whenever you did" in prompt
+    assert "is not a violation no matter how the other three answers come out" in prompt
+    assert "answer four questions about it" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +1003,46 @@ def test_one_reply_can_establish_one_file_while_disclaiming_another():
     assert [f.reference.lower() for f in scan.findings] == ["ledger.xlsx"]
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Here is report.pdf -- note the appendix is missing.",
+        "I created report.pdf, though I could not find the tax records.",
+        "Here is report.pdf. Please upload ledger.xlsx for the rest.",
+        "report.pdf is attached to this reply.",
+    ],
+)
+def test_delivering_one_file_while_noting_another_is_absent_still_establishes_it(reply):
+    """The guard must not swing back into the false fails it was added beside.
+    A reply that hands over report.pdf and in the same sentence mentions
+    something else missing has still handed over report.pdf, so the nearest cue
+    to the name -- not the mere presence of absence-language -- decides."""
+    task = _task("Update report.pdf with the totals.", ["budget.xlsx"])
+    task.prompts = []
+    task.model_a.conversation = [
+        Turn(index=1, role="user", text="Update report.pdf with the totals."),
+        Turn(index=1, role="assistant", text=reply),
+    ]
+    scan = scan_file_references(task)
+    assert scan.ran
+    assert [f.reference.lower() for f in scan.findings if f.reference.lower() == "report.pdf"] == []
+
+
+def test_a_disclaimer_beats_a_delivery_that_sits_further_from_the_name():
+    """"I don't have report.pdf, but here is a draft" delivers something, just
+    not report.pdf. The disclaimer is the closer cue, so the name stays
+    unestablished."""
+    task = _task("Update report.pdf with the totals.", ["budget.xlsx"])
+    task.prompts = []
+    task.model_a.conversation = [
+        Turn(index=1, role="user", text="Update report.pdf with the totals."),
+        Turn(index=1, role="assistant", text="I don't have report.pdf, but here is a draft."),
+    ]
+    scan = scan_file_references(task)
+    assert scan.ran
+    assert [f.reference.lower() for f in scan.findings] == ["report.pdf"]
+
+
 def test_a_file_disclaimed_once_but_delivered_later_is_still_established():
     """The union is taken across the whole trajectory, so an early "I couldn't
     find it" does not permanently poison a name the model later produces."""
@@ -835,5 +1087,5 @@ def test_the_verdict_survives_a_round_trip_to_the_report():
     scan = scan_file_references(task)
     payload = evaluate_check_85(task, scan.findings, scan).to_dict()
     assert payload["check_id"] == 85
-    assert payload["error_code"] == SPEC_LABEL
+    assert payload["error_code"] == REPORTED_LABEL
     assert dataclasses.asdict(scan.findings[0])["basis"] == "deterministic"

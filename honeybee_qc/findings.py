@@ -239,10 +239,18 @@ class DimensionRatingFinding:
     contributor_na: bool = False
     auditor_na: bool = False
     confidence: str = "high"
-    # Whether the conversation this judgment read was cut before its final turn.
+    # Whether whole turns were missing from the conversation this blind judgment
+    # read. A turn whose middle was elided is not this: the turn was shown, the cut
+    # was labelled in place, and treating that as evidence loss is what made three
+    # tasks report clean on conversations the pipeline had rendered end to end.
     truncated: bool = False
     adjudication: Literal["defensible", "indefensible"] | None = None
     adjudication_reasoning: str = ""
+    # The same question about the *adjudication's* render, which runs at a far
+    # wider budget. This is the one the gate acts on, because the adjudication
+    # verdict is what gets counted: a blind rating made from a cut conversation is
+    # still checkable, provided the reader that checked it saw the whole thing.
+    adjudication_tail_truncated: bool = False
     # What the informed pass would have to have been shown to decide, set only
     # when it declined to. An adjudication that abstains leaves the disagreement
     # unconfirmed, which under the default policy means uncounted.
@@ -261,6 +269,19 @@ class DimensionRatingFinding:
         if self.adjudication is None:
             return not self.adjudication_abstained
         return self.adjudication == "indefensible"
+
+    @property
+    def evidence_incomplete(self) -> bool:
+        """Whether the judgment that decides this item was made from a cut render.
+
+        Which render that is depends on which judgment decides the item. Once an
+        adjudication has run, its verdict is what the gate counts, so its render is
+        the one that has to have been complete -- the blind pass's cut is recorded
+        and reported, but it is no longer what the count rests on.
+        """
+        if self.adjudication is not None or self.adjudication_abstained:
+            return self.adjudication_tail_truncated
+        return self.truncated
 
     def __post_init__(self) -> None:
         # N/A and a rating are mutually exclusive: a dimension that does not apply
@@ -298,6 +319,28 @@ class DimensionRatingFinding:
         if self.contributor_rating is None or self.auditor_rating is None:
             return None
         return abs(self.auditor_rating - self.contributor_rating)
+
+
+# How many wrong subordinate claims in one justification trip `is_inaccurate`.
+#
+# THIS NUMBER IS OURS, NOT THE SPEC'S, and it is the one floor in
+# `triggered_conditions` that departs from the auditor instructions. The spec
+# says two, on the stated equivalence that two subordinate errors are worth one
+# load-bearing one, and this build ran at two until a QC comparison run argued
+# otherwise: over 14 human-labelled tasks, secondary inaccuracies were the modal
+# defect the judge reported and the modal defect a human failed a task for, and
+# pairing them inside a single justification is what the two-floor requires.
+# Nothing about the defect gets less serious for arriving alone.
+#
+# Set back to 2 to restore the spec's reading. `COUNTED_CONDITION_FLOORS` reads
+# this, so the cross-justification aggregation follows automatically: at 1 there
+# is no sub-floor residue left to aggregate and that branch goes inert on its
+# own, which is correct rather than a gap.
+#
+# What this does not change is who decides. The judge is told to bucket by how
+# much the rating leans on a claim and is deliberately not told what either
+# bucket costs, so this floor moves the consequence without moving the counting.
+SECONDARY_INACCURACY_FLOOR = 1
 
 
 @dataclass
@@ -342,6 +385,37 @@ class JustificationFinding:
     unverifiable: bool = False
     why_unverifiable: str = ""
     confidence: str = "high"
+    # How many independent draws named each condition on this justification, and
+    # how many draws were combined to reach the counts above.
+    #
+    # 450's severe route -- `policy.justification_severe_conditions`, where one
+    # justification fails the whole task at any share -- reads a merged finding
+    # and so has no way to ask how much of the judge was behind it. That was
+    # invisible rather than absent: the aggregator's own threshold bounds it, so
+    # the escape has always needed a majority of the draws. It bounds it only
+    # where there were draws to combine. `aggregate_justifications` returns a
+    # lone draw verbatim when a group lost the rest, and on the sheet22 corpus
+    # two tasks failed on a severe condition exactly one stored draw ever named.
+    #
+    # `draws_combined` of 0 means nothing sampled this finding -- a synthesised
+    # empty-justification finding, a single-sample run, a replay building
+    # findings by hand -- and is the signal for the gate to leave the severe
+    # route alone rather than deny an escape for want of a record.
+    condition_draws: dict[str, int] = field(default_factory=dict)
+    draws_combined: int = 0
+
+    def condition_support(self, condition: str) -> int | None:
+        """Draws that named `condition`, or None where no draw record was kept.
+
+        None and 0 are different answers and the gate treats them differently:
+        None is "this finding was never sampled, do not judge it on draws", 0 is
+        "it was sampled and no draw named this", which for a condition the merged
+        counts do trigger can only mean the condition came from somewhere other
+        than a draw's own judgment.
+        """
+        if not self.draws_combined:
+            return None
+        return self.condition_draws.get(condition, 0)
 
     @property
     def generic(self) -> bool:
@@ -361,7 +435,10 @@ class JustificationFinding:
             out.append("is_generic")
         if self.is_skewed:
             out.append("is_skewed")
-        if self.inaccurate_primary_claims >= 1 or self.inaccurate_secondary_claims >= 2:
+        if (
+            self.inaccurate_primary_claims >= 1
+            or self.inaccurate_secondary_claims >= SECONDARY_INACCURACY_FLOOR
+        ):
             out.append("is_inaccurate")
         if self.unsupported_claims >= 2:
             out.append("lacks_evidence")
@@ -387,10 +464,107 @@ class JustificationFinding:
 
 
 @dataclass
+class JustificationCoverage:
+    """How much of check 450's intended population actually reached a judgment.
+
+    450 is the one check whose population is invisible in its own output: the
+    denominator is however many findings came back, so a call that returned
+    nothing for a model looks identical to a task with fewer dimensions. On the
+    sheet22 run three tasks audited 8 justifications against the 15 their own
+    `dimension_ratings` carry, all three reported zero failing justifications,
+    and one of them (6a7d3a48a9485b6a031cb305) was a task human QC had failed
+    for Bad Justifications -- replayed with model B's set present it fails at
+    3/15 with three severe items.
+
+    Counted by group, where a group is the unit of one model call: each model's
+    batched dimension justifications, and the ranking justification on its own.
+    A per-task ratio does not see the failure -- 8 of 15 is 53%, over
+    `min_judged_ratio` -- because the loss is a whole side of the task rather
+    than a thin scattering across it.
+
+    `abstained` is held apart from `audited` deliberately. An abstention is a
+    judgment ("the transcript does not contain what this defends") and is
+    already excluded from the gate's numerator and denominator by design, but it
+    is not evidence that the contributor's argument holds, so it cannot count
+    toward coverage either. `missing` is the third thing: expected, neither
+    judged nor abstained on, which is silent loss.
+    """
+
+    expected: dict[str, list[str]] = field(default_factory=dict)
+    audited: dict[str, list[str]] = field(default_factory=dict)
+    abstained: dict[str, list[str]] = field(default_factory=dict)
+
+    @property
+    def missing(self) -> list[str]:
+        seen = {i for ids in self.audited.values() for i in ids} | {
+            i for ids in self.abstained.values() for i in ids
+        }
+        return sorted(
+            i for ids in self.expected.values() for i in ids if i not in seen
+        )
+
+    def undercovered(self, min_ratio: float) -> dict[str, float]:
+        """Groups whose judged share falls below the floor, with the share.
+
+        The ranking justification is one item and is left out: a group of one
+        is either judged or not, and abstaining a whole check because a single
+        justification of fifteen could not be read would trade a rare silent
+        pass for a common silent gap.
+        """
+        out: dict[str, float] = {}
+        for group, expected in self.expected.items():
+            if group == "ranking" or not expected:
+                continue
+            judged = len(set(expected) & set(self.audited.get(group, [])))
+            ratio = judged / len(expected)
+            if ratio < min_ratio:
+                out[group] = round(ratio, 3)
+        return out
+
+    def to_dict(self) -> dict:
+        # Keyed on `expected` throughout, so a group nothing came back for
+        # reports a zero rather than dropping out of the record. An absent key is
+        # the shape of this bug, not a way to report it.
+        return {
+            "expected": {k: len(v) for k, v in sorted(self.expected.items())},
+            "audited": {
+                k: len(set(v) & set(self.audited.get(k, [])))
+                for k, v in sorted(self.expected.items())
+            },
+            "abstained": {
+                k: len(set(v) & set(self.abstained.get(k, [])))
+                for k, v in sorted(self.expected.items())
+            },
+            "missing": self.missing,
+        }
+
+
+# The 450 conditions whose floors are counted, and the count each reads. A
+# contributor who makes the same bad move once in each of five justifications
+# trips none of these, because every floor is counted inside a single
+# justification; see `aggregate_repeated_conditions`.
+#
+# An entry whose floor is 1 has nothing to aggregate -- one instance already
+# trips it where it stands -- and drops out of that pass without needing to be
+# removed from here. `is_inaccurate` is in that position today.
+COUNTED_CONDITION_FLOORS: dict[str, tuple[str, int]] = {
+    "is_inaccurate": ("inaccurate_secondary_claims", SECONDARY_INACCURACY_FLOOR),
+    "lacks_evidence": ("unsupported_claims", 2),
+    "misconstrues_evidence": ("misconstrued_evidence", 2),
+}
+
+
+@dataclass
 class LikertFinding:
     contributor_likert: int
     auditor_likert: int
     confidence: str = "high"
+
+    # Which comparison this is about, e.g. "AB" or "AC". A task may record more
+    # than one, and they are separate judgments: the same contributor can be
+    # right about A-vs-B and wrong about A-vs-C. Defaults to the single-
+    # comparison case so existing callers and fixtures are unaffected.
+    pair: str = "AB"
 
     # Populated only under the direction_magnitude encoding, where the winner is
     # a separate field and the Likert is a bare margin. Left None under the
@@ -414,10 +588,19 @@ class LikertFinding:
     adjudication_reasoning: str = ""
     adjudication_abstained: bool = False
     why_unadjudicated: str = ""
+    # Whether the adjudication's own, much wider render still could not show both
+    # conversations in full. See `DimensionRatingFinding.evidence_incomplete`.
+    adjudication_tail_truncated: bool = False
 
     @property
     def truncated(self) -> bool:
         return self.truncated_a or self.truncated_b
+
+    @property
+    def evidence_incomplete(self) -> bool:
+        if self.adjudication is not None or self.adjudication_abstained:
+            return self.adjudication_tail_truncated
+        return self.truncated
 
     @property
     def asymmetric_render(self) -> bool:
@@ -593,6 +776,11 @@ class ArtifactFinding:
     # near-miss stays visible instead of disappearing silently into a clean
     # verdict.
     fuzzy_matched_files: list[tuple[str, str]] = field(default_factory=list)
+    # Uploads no claimed file was assigned to. Each upload accounts for one claimed
+    # file at most, so this is what a rename still has left to point at -- and an
+    # empty list means every upload is already spoken for, which is what makes "the
+    # same file under another name" impossible rather than merely unlikely.
+    unmatched_uploads: list[str] = field(default_factory=list)
     # Deliveries the transcript records without recording what was delivered: the
     # turn is labelled as producing a file whose content is absent, or it sits
     # past the render budget's cut. The name is then unreadable, so comparing it
@@ -611,15 +799,31 @@ class ArtifactFinding:
     #   `missing`   -- genuinely absent; stays counted.
     #   `renamed`   -- the same file under another name, which string distance
     #                  could not bridge (a capture tool's screenshot name against
-    #                  the contributor's own name for the same image).
+    #                  the contributor's own name for the same image). Only
+    #                  accepted against an upload no other claimed file was
+    #                  assigned to: one upload cannot be two deliverables.
+    #   `superseded`-- an earlier state of a deliverable the model went on to
+    #                  revise, whose final state *is* in the manifest. What the
+    #                  check asks is whether the work product was preserved, and an
+    #                  iterative session's intermediate revisions are not each a
+    #                  separate work product. Counting them made a contributor who
+    #                  uploaded the final image of a twelve-round editing session
+    #                  responsible for eleven files nobody wanted.
     #   `not_a_file`-- never a claimed attachment at all: a fenced code block, an
     #                  inline table, a path the model proposed rather than
-    #                  delivered.
+    #                  delivered, or an image the chat UI rendered inline with a
+    #                  download button of its own.
     #   `unverifiable` -- the judge could not tell, which leaves it uncounted for
     #                  the same reason every other abstention in this build does.
     confirmations: dict[str, str] = field(default_factory=dict)
     confirmation_reasons: dict[str, str] = field(default_factory=dict)
     confirmation_ran: bool = False
+    # Files the extraction listed from an earlier turn, held out of
+    # `claimed_files` when `policy.artifact_scope == "final_response"`. V5
+    # excuses them; they are published so a reviewer can see what was dropped.
+    out_of_scope_files: list[str] = field(default_factory=list)
+    # The turn treated as the final response when the scope is last-turn-only.
+    final_response_turn: int | None = None
 
     @property
     def confirmed_missing(self) -> list[str]:
@@ -709,6 +913,8 @@ class EnvironmentContextFinding:
 class KeyTurnJustificationFinding:
     """Check 110. The bar is 'contains any issues', so one flag is enough."""
 
+    # Which model's justification this is. Empty on the L1 single-call path.
+    model: str = ""
     describes_selected_turn: bool = True
     claims_are_accurate: bool = True
     connects_to_core_value: bool = True
@@ -757,6 +963,13 @@ class VerdictFinding:
     states_preference: bool
     quote: str = ""
     confidence: str = "high"
+    # Which comparison's justification this is about. See `LikertFinding.pair`.
+    pair: str = "AB"
+
+
+# A direction names a slot or declines to name one. Widened past A/B because a
+# comparison's right-hand side is C in half of Honeybee Aspirational's pairs.
+Direction = Literal["A", "B", "C", "neutral"]
 
 
 @dataclass
@@ -764,10 +977,12 @@ class InversionFinding:
     """Check 460. The contradiction is detected deterministically; only the
     adequacy of the justification is a model judgment."""
 
-    dimension_direction: Literal["A", "B", "neutral"]
-    likert_direction: Literal["A", "B", "neutral"]
+    dimension_direction: Direction
+    likert_direction: Direction
     justification_explains_inversion: bool = False
     confidence: str = "high"
+    # Which comparison this is about. See `LikertFinding.pair`.
+    pair: str = "AB"
 
     @property
     def contradicts(self) -> bool:

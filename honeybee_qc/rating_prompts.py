@@ -20,8 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import DEFAULT_POLICY, Policy
-from .context import EvidenceProfile, render_comparison, render_conversation
-from .models import ModelSubmission, RubricCriterion, Task
+from .context import EvidenceProfile, golden_answer_block, render_comparison, render_conversation
+from .models import ModelSubmission, RubricCriterion, Sxs, Task
 from .taxonomies import L1_DEFINITIONS, RATING_DIMENSIONS
 
 RATING_SYSTEM_PROMPT = (
@@ -124,10 +124,11 @@ def build_criterion_rating_prompt_with_evidence(
     half a transcript reach a gate looking like any other.
     """
     conversation, profile = render_conversation(sub, policy)
+    golden = golden_answer_block(task)
     return f"""## The user's goal
 
 {task.user_goal or '(not stated)'}
-
+{golden}
 ## Conversation with {"Model " + sub.model}
 
 {conversation}
@@ -157,6 +158,25 @@ Return JSON matching the schema. Set `criterion_id` to "{criterion.criterion_id}
 # 300 - dimension ratings, one call per (model, dimension)
 # ---------------------------------------------------------------------------
 
+COLLABORATION_RATING_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "dimension": {"type": "string", "enum": ["Collaboration quality"]},
+        "rating": {"type": ["integer", "null"]},
+        "not_applicable": {"type": "boolean"},
+        "cannot_determine": {"type": "boolean"},
+        "why_unverifiable": {"type": "string"},
+        "evidence_turns": {"type": "array", "items": {"type": "integer"}},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+    },
+    "required": [
+        "dimension", "rating", "not_applicable", "cannot_determine",
+        "why_unverifiable", "evidence_turns", "reasoning", "confidence",
+    ],
+    "additionalProperties": False,
+}
+
 DIMENSION_RATING_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -183,18 +203,35 @@ DIMENSION_GUIDANCE: dict[str, str] = {
     "Interaction efficiency": L1_DEFINITIONS["Interaction Efficiency"],
     # The only dimension whose text is not the customer's. Tab 2 row 67 names it as
     # a rating dimension but row 58 does not define it, so there is no spec wording
-    # to restore. This is a second, independently worded definition of the same
-    # dimension -- L1_DEFINITIONS["Tool and Connector Reliability"] scopes it to the
-    # four named connectors, this one to any tool or integration -- and the customer
-    # has to settle which. Kept broader here deliberately: the rating dimension is
-    # scored on conversations whose only tool use is web search or code execution,
-    # and the narrower text would make those unrateable.
+    # to restore, and this build ran a deliberately broader definition -- any tool
+    # or integration, rather than L1_DEFINITIONS' four named connectors -- while
+    # noting the customer had to settle which.
+    #
+    # They since have, in their own QC. An auditor failing a task wrote, of both
+    # models: "No Gmail, Drive, Calendar, Github or other external connector was
+    # requested or invoked. Since no such request was ever required or failed, the
+    # dimension should be a 5. There is no applicable model failure that would
+    # reduce the rating in this dimension." That is the narrow reading, and it
+    # settles both halves: scope is external connectors, and their absence is a 5
+    # rather than a middling score. The worry that narrowing makes web-search and
+    # code-execution conversations unrateable was misplaced -- they are rateable,
+    # and the answer is 5.
     "Tool & connector reliability": (
-        "Whether tools, connectors, and integrations the model invoked actually "
-        "worked: calls succeeded, results were used correctly, failures were "
-        "recovered from rather than ignored."
+        "Whether external connectors the model invoked -- Gmail, Drive, Calendar, "
+        "GitHub and their like -- executed end to end and returned real results, "
+        "rather than erroring, timing out, or coming back empty, and whether "
+        "failures were recovered from rather than ignored. Scope is external "
+        "connectors to systems of record. A model's own built-in facilities, such "
+        "as web search, code execution, or file generation, are not connectors "
+        "for this dimension; where they fail, the cost lands on Outcome quality "
+        "or Trust & grounding instead.\n\n"
+        "Where no external connector was requested, required, or invoked, there is "
+        "no failure available to this dimension and the rating is 5. Absence of "
+        "connector activity is not evidence of unreliability, and a middling score "
+        "on that ground is wrong."
     ),
     "Memory & personalization": L1_DEFINITIONS["Personalization and Memory"],
+    "Collaboration quality": L1_DEFINITIONS["Collaboration Quality"],
 }
 
 
@@ -270,32 +307,46 @@ LIKERT_SCHEMA: dict = {
 }
 
 
-def build_likert_prompt(task: Task, policy: Policy = DEFAULT_POLICY) -> str:
-    return build_likert_prompt_with_evidence(task, policy)[0]
+def build_likert_prompt(
+    task: Task, policy: Policy = DEFAULT_POLICY, comparison: Sxs | None = None
+) -> str:
+    return build_likert_prompt_with_evidence(task, policy, comparison)[0]
 
 
 def build_likert_prompt_with_evidence(
-    task: Task, policy: Policy = DEFAULT_POLICY
+    task: Task, policy: Policy = DEFAULT_POLICY, comparison: Sxs | None = None
 ) -> tuple[str, list[EvidenceProfile]]:
-    comparison, profiles = render_comparison(task.model_a, task.model_b, policy)
+    """The blind Likert prompt for one comparison.
+
+    `comparison` names which pair to render; it defaults to the task's primary
+    one so that a single-comparison task and every existing caller are
+    unaffected. The scale anchors are written from the pair's own slots, because
+    an A-vs-C comparison whose anchors say "Model B is much better" asks the
+    judge about a model that is not in front of it.
+    """
+    pair = comparison or task.comparison_list()[0]
+    left, right = pair.left, pair.right
+    rendered, profiles = render_comparison(
+        task.submission(left), task.submission(right), policy
+    )
     lo, hi = policy.likert_scale
     return f"""## The user's goal
 
 {task.user_goal or '(not stated)'}
 
-{comparison}
+{rendered}
 
 ## Your task
 
 Compare the two conversations and place your preference on a {lo}-{hi} scale:
 
-  1 = Model A is much better
-  2 = Model A is better
-  3 = Model A is slightly better
+  1 = Model {left} is much better
+  2 = Model {left} is better
+  3 = Model {left} is slightly better
   4 = the two are equivalent
-  5 = Model B is slightly better
-  6 = Model B is better
-  7 = Model B is much better
+  5 = Model {right} is slightly better
+  6 = Model {right} is better
+  7 = Model {right} is much better
 
 Judge which conversation better served the user's goal overall. Set
 `cannot_determine` true with `likert` null only if neither transcript contains
@@ -349,35 +400,52 @@ ADJUDICATION_SCHEMA: dict = {
 ADJUDICATION_SYSTEM_PROMPT = (
     "You are adjudicating a disagreement between two evaluators who rated the same "
     "conversation. You are not being asked for your own rating and you must not "
-    "produce one. You are being asked a narrower question: is the rating under "
-    "review one a careful reviewer could defend against this conversation? "
-    "Ratings on a 1-5 scale are judgments, and two careful reviewers routinely "
-    "land a point or two apart on the same evidence -- that is a difference of "
-    "opinion, not an error, and it is `defensible`. Reserve `indefensible` for a "
-    "rating the conversation actually contradicts: it credits something that did "
-    "not happen, penalises something that plainly did, or rests on a claim the "
-    "transcript refutes. When the transcript does not contain what you would need "
-    "in order to tell -- the deliverable's content, or a stretch of the "
-    "conversation you were not shown -- answer `cannot_determine`. Abstaining is "
-    "correct and useful; guessing is not."
+    "produce one. You are being asked a narrower question: does this conversation "
+    "support the rating under review? "
+    "Answer it from the conversation, not from the distance between the two "
+    "numbers. How far apart the evaluators landed is not evidence of anything -- a "
+    "rating one point from another evaluator's can still rest on a claim the "
+    "transcript refutes, and a rating three points away can still be exactly what "
+    "the conversation shows. "
+    "`defensible` means you can point to what in the conversation holds the rating "
+    "up: the behaviour it credits happened, the shortcoming it penalises is there, "
+    "and the reasoning given for it describes this conversation. "
+    "`indefensible` means the conversation does not support it: it credits "
+    "something that did not happen, ignores or denies something that plainly did, "
+    "or the reasoning given for it rests on a claim the transcript refutes -- "
+    "whether or not the number itself is close to the other evaluator's. "
+    "When the transcript does not contain what you would need in order to tell -- "
+    "the deliverable's content, or a stretch of the conversation you were not "
+    "shown -- answer `cannot_determine`. Abstaining is correct and useful; "
+    "guessing is not, and neither is defaulting to `defensible` because the "
+    "question is hard."
 )
 
 _ADJUDICATION_TASK = """
 ## Your task
 
-Decide whether the rating under review is defensible against this conversation.
+Decide whether this conversation supports the rating under review.
 
-  - "defensible": a careful reviewer could hold this rating on this evidence, even
-    if you would have chosen a different number. A one- or two-point difference of
-    emphasis is defensible by default.
-  - "indefensible": the conversation contradicts the rating. Say in `why` what it
-    credits that did not happen, or what it ignores that plainly did, and cite the
-    turns in `evidence_turns`.
+  - "defensible": you can name what in the conversation holds this rating up. Say
+    in `why` what that is and cite the turns in `evidence_turns`. You do not have
+    to agree with the number -- you have to be able to point at the evidence for
+    it.
+  - "indefensible": the conversation does not support it. Say in `why` what it
+    credits that did not happen, what it ignores that plainly did, or which of the
+    claims in its stated reasoning the transcript refutes, and cite the turns.
   - "cannot_determine": you were not shown what you would need in order to tell.
 
-You are judging the rating, not the conversation, and not the other evaluator's
-number. The other evaluator's rating is shown only so you know what the
-disagreement was about; it carries no authority and it may be the wrong one.
+Two things are not reasons for either verdict. The size of the gap between the two
+evaluators is not one: judge the rating against the conversation, and a rating one
+point from the other evaluator's gets exactly the same scrutiny as one three points
+away. And the other evaluator's number is not one -- it is shown only so you know
+what the disagreement was about, it carries no authority, and it may be the wrong
+one.
+
+Both verdicts have to be earned from the transcript. `defensible` is not the safe
+answer for a call you find difficult; if you cannot point to what supports the
+rating and cannot point to what refutes it, the honest answer is
+`cannot_determine`.
 """
 
 
@@ -391,7 +459,16 @@ def build_dimension_adjudication_prompt(
     policy: Policy = DEFAULT_POLICY,
 ) -> tuple[str, EvidenceProfile]:
     lo, hi = policy.dimension_rating_scale
-    conversation, profile = render_conversation(sub, policy)
+    # The wide budget, not the blind pass's. Adjudication is one call about one
+    # dimension, so it can read the turns the blind pass had to elide -- and unless
+    # it does, its verdict is formed from the same gap that caused the
+    # disagreement and the gate has nothing independent to count.
+    conversation, profile = render_conversation(
+        sub,
+        policy,
+        policy.adjudication_max_conversation_chars,
+        policy.adjudication_max_turn_chars,
+    )
     justification = " ".join((contributor_justification or "").split())
     return f"""## The user's goal
 
@@ -428,25 +505,39 @@ def build_ranking_adjudication_prompt(
     contributor_likert: int | None,
     auditor_likert: int | None,
     policy: Policy = DEFAULT_POLICY,
+    comparison: Sxs | None = None,
 ) -> tuple[str, list[EvidenceProfile]]:
-    comparison, profiles = render_comparison(task.model_a, task.model_b, policy)
+    """The informed second pass over one comparison's Likert.
+
+    Defaults to the task's primary comparison, so a single-comparison task and
+    every existing caller behave as before.
+    """
+    pair = comparison or task.comparison_list()[0]
+    left, right = pair.left, pair.right
+    rendered, profiles = render_comparison(
+        task.submission(left),
+        task.submission(right),
+        policy,
+        policy.adjudication_max_comparison_chars,
+        policy.adjudication_max_turn_chars,
+    )
     lo, hi = policy.likert_scale
-    justification = " ".join((task.sxs.justification or "").split())
+    justification = " ".join((pair.justification or "").split())
     return f"""## The user's goal
 
 {task.user_goal or '(not stated)'}
 
-{comparison}
+{rendered}
 
 ## The scale
 
-  1 = Model A is much better
-  2 = Model A is better
-  3 = Model A is slightly better
+  1 = Model {left} is much better
+  2 = Model {left} is better
+  3 = Model {left} is slightly better
   4 = the two are equivalent
-  5 = Model B is slightly better
-  6 = Model B is better
-  7 = Model B is much better
+  5 = Model {right} is slightly better
+  6 = Model {right} is better
+  7 = Model {right} is much better
 
 ## The preference under review
 
@@ -487,7 +578,20 @@ CONTRIBUTOR_MARKERS = (
     "previous rating",
 )
 
-CANARY_LENGTH = 30
+# Long enough that contributor prose cannot collide with the transcript it
+# describes. At 30 characters it did: a justification opening "The
+# image-generation workflow was used consistently..." reduced to the canary
+# "the image-generation workflow ", a phrase appearing seven times in that
+# task's own conversation, and the false leak cost the task its whole rating
+# stage. A real leak inserts the justification verbatim, so a longer prefix
+# still catches it; only the collisions go away.
+CANARY_LENGTH = 120
+
+# The floor stays where it was. A justification shorter than the prefix is
+# canaried whole, which is a fingerprint in its own right; raising this instead
+# of the prefix would have switched the guard off for exactly the short
+# justifications it already protected.
+MIN_CANARY_LENGTH = 30
 
 
 @dataclass
@@ -502,9 +606,12 @@ class BlindnessReport:
 def assert_blind(prompt: str, task: Task) -> BlindnessReport:
     """Verify a blind-pass prompt exposes none of the contributor's judgments.
 
-    The contributor's justification text is the canary. It is long and distinctive,
-    so it cannot appear in a correctly built prompt by chance, and any path that
-    starts including contributor context will drag it in.
+    The contributor's justification text is the canary, taken long enough to be a
+    fingerprint rather than a phrase: contributors describe the conversation in
+    the conversation's own vocabulary, so a short prefix collides with the
+    transcript and fails the rating stage of a task that was never contaminated.
+    Any path that starts including contributor context drags the whole
+    justification in, which a long prefix still catches.
     """
     leaked: list[str] = []
     lowered = prompt.lower()
@@ -524,7 +631,7 @@ def assert_blind(prompt: str, task: Task) -> BlindnessReport:
 
     for label, text in canaries:
         canary = " ".join(text.lower().split())[:CANARY_LENGTH]
-        if len(canary) >= CANARY_LENGTH and canary in lowered:
+        if len(canary) >= MIN_CANARY_LENGTH and canary in lowered:
             leaked.append(f"{label} leaked into a blind prompt")
 
     if task.sxs.likert is not None and f"likert {task.sxs.likert}" in lowered:

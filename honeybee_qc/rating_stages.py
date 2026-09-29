@@ -20,12 +20,14 @@ from typing import Any
 from .config import DEFAULT_POLICY, Policy
 from .context import EvidenceProfile, profile_evidence
 from .findings import CriterionRatingFinding, DimensionRatingFinding, LikertFinding
-from .gates import evaluate_check_270, evaluate_check_300, evaluate_check_400
+from .gates import evaluate_check_270, evaluate_check_271, evaluate_check_300, evaluate_check_305, evaluate_check_400
 from .llm import ModelClient, ModelRequest, ModelResponse, run_requests
 from .models import ModelSlot, ModelSubmission, Task
+from .projects import drop_disabled
 from .rating_prompts import (
     ADJUDICATION_SCHEMA,
     ADJUDICATION_SYSTEM_PROMPT,
+    COLLABORATION_RATING_SCHEMA,
     CRITERION_RATING_SCHEMA,
     DIMENSION_RATING_SCHEMA,
     LIKERT_SCHEMA,
@@ -41,7 +43,7 @@ from .scoring import CheckVerdict, Measurement, build_verdict
 from .taxonomies import RATING_DIMENSIONS
 
 CONFIDENCES = ("low", "medium", "high")
-RATING_CHECKS = (270, 300, 400)
+RATING_CHECKS = (270, 271, 300, 305, 400)
 
 
 @dataclass
@@ -56,8 +58,15 @@ class RatingStageResult:
     task_id: str
     verdicts: list[CheckVerdict] = field(default_factory=list)
     criterion_findings: list[CriterionRatingFinding] = field(default_factory=list)
+    simplified_criterion_findings: list[CriterionRatingFinding] = field(
+        default_factory=list
+    )
     dimension_findings: list[DimensionRatingFinding] = field(default_factory=list)
-    likert: LikertFinding | None = None
+    collaboration_findings: list[DimensionRatingFinding] = field(default_factory=list)
+    # One per comparison the task recorded. A task with two comparisons yields
+    # two independent Likert judgments, and each is adjudicated and scored on
+    # its own.
+    likerts: list[LikertFinding] = field(default_factory=list)
     abstentions: list[Abstention] = field(default_factory=list)
     evidence: list[EvidenceProfile] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -65,6 +74,19 @@ class RatingStageResult:
     cost_usd: float = 0.0
     calls: int = 0
     cached_calls: int = 0
+
+    @property
+    def likert(self) -> LikertFinding | None:
+        """The primary comparison's Likert finding.
+
+        Kept so that readers written when a task had exactly one comparison
+        keep working; anything that needs to see every comparison reads
+        `likerts`.
+        """
+        return self.likerts[0] if self.likerts else None
+
+    def likert_for(self, pair: str) -> LikertFinding | None:
+        return next((f for f in self.likerts if f.pair == pair), None)
 
     def abstained(self, check_id: int) -> int:
         return sum(1 for a in self.abstentions if a.check_id == check_id)
@@ -77,7 +99,8 @@ class RatingStageResult:
             "cost_usd": round(self.cost_usd, 4),
             "criterion_judgments": len(self.criterion_findings),
             "dimension_judgments": len(self.dimension_findings),
-            "likert_judged": self.likert is not None,
+            "likert_judged": bool(self.likerts),
+            "likerts_judged": [f.pair for f in self.likerts],
             "abstentions": {
                 "270": self.abstained(270),
                 "300": self.abstained(300),
@@ -148,7 +171,7 @@ def build_rating_requests(
             )
         )
 
-    for sub in task.submissions():
+    for sub in task.submissions_in_scope():
         for criterion in task.rubric:
             prompt, profile = build_criterion_rating_prompt_with_evidence(
                 task, criterion, sub, policy
@@ -165,11 +188,35 @@ def build_rating_requests(
                     # The judgment and the render that conditioned it are separated
                     # by a queue, a cache, and a worker pool; the request is what
                     # survives all three.
-                    "truncated": profile.truncated,
+                    "truncated": profile.tail_truncated,
+                    "elided_turns": profile.elided_turns,
                 },
             )
 
-    for sub in task.submissions():
+    if task.simplified is not None:
+        for criterion in task.rubric:
+            prompt, profile = build_criterion_rating_prompt_with_evidence(
+                task, criterion, task.simplified, policy
+            )
+            add(
+                f"{task.task_id}::rate::S::{criterion.criterion_id}",
+                prompt,
+                CRITERION_RATING_SCHEMA,
+                {
+                    "check_id": 271,
+                    "model": "S",
+                    "criterion_id": criterion.criterion_id,
+                    "truncated": profile.tail_truncated,
+                    "elided_turns": profile.elided_turns,
+                },
+            )
+
+    for sub in task.submissions_in_scope():
+        # No contributor 1-5s for this slot means check 300 has nothing to
+        # disagree with. Skip the spend; a separate fill writes the missing
+        # ratings rather than pretending they were audited.
+        if not any(d.model == sub.model for d in task.dimension_ratings):
+            continue
         for dimension in RATING_DIMENSIONS:
             prompt, profile = build_dimension_rating_prompt_with_evidence(
                 task, dimension, sub, policy
@@ -182,26 +229,63 @@ def build_rating_requests(
                     "check_id": 300,
                     "model": sub.model,
                     "dimension": dimension,
-                    "truncated": profile.truncated,
+                    "truncated": profile.tail_truncated,
+                    "elided_turns": profile.elided_turns,
                 },
             )
 
-    if task.model_a is not None and task.model_b is not None:
-        prompt, profiles = build_likert_prompt_with_evidence(task, policy)
-        by_slot = {p.model: p for p in profiles}
-        a, b = by_slot.get("A"), by_slot.get("B")
+    for entry in task.dimension_ratings:
+        if entry.dimension != "Collaboration quality":
+            continue
+        if not task.in_audit_scope(entry.model):
+            continue
+        sub = task.submission(entry.model)  # type: ignore[arg-type]
+        if sub is None:
+            continue
+        prompt, profile = build_dimension_rating_prompt_with_evidence(
+            task, "Collaboration quality", sub, policy
+        )
         add(
-            f"{task.task_id}::likert",
+            f"{task.task_id}::dimension::{sub.model}::Collaboration quality",
+            prompt,
+            COLLABORATION_RATING_SCHEMA,
+            {
+                "check_id": 305,
+                "model": sub.model,
+                "dimension": "Collaboration quality",
+                "truncated": profile.tail_truncated,
+                "elided_turns": profile.elided_turns,
+            },
+        )
+
+    # One independent Likert per recorded comparison. Keyed by the pair so that
+    # A-vs-B and A-vs-C get their own cached judgment: they are different
+    # questions, and a single cache key would serve the first answer to both.
+    for comparison in task.comparison_list():
+        left = task.submission(comparison.left)
+        right = task.submission(comparison.right)
+        if left is None or right is None:
+            continue
+        prompt, profiles = build_likert_prompt_with_evidence(task, policy, comparison)
+        by_slot = {p.model: p for p in profiles}
+        lp, rp = by_slot.get(comparison.left), by_slot.get(comparison.right)
+        add(
+            f"{task.task_id}::likert::{comparison.pair_label}",
             prompt,
             LIKERT_SCHEMA,
             {
                 "check_id": 400,
-                "truncated_a": bool(a and a.truncated),
-                "truncated_b": bool(b and b.truncated),
-                "turns_shown_a": a.turns_rendered if a else 0,
-                "turns_shown_b": b.turns_rendered if b else 0,
-                "turns_total_a": a.turns_available if a else 0,
-                "turns_total_b": b.turns_available if b else 0,
+                "pair": comparison.pair_label,
+                "left": comparison.left,
+                "right": comparison.right,
+                # Named left/right rather than a/b because the right-hand side
+                # is C in half the comparisons this now covers.
+                "truncated_a": bool(lp and lp.tail_truncated),
+                "truncated_b": bool(rp and rp.tail_truncated),
+                "turns_shown_a": lp.turns_rendered if lp else 0,
+                "turns_shown_b": rp.turns_rendered if rp else 0,
+                "turns_total_a": lp.turns_available if lp else 0,
+                "turns_total_b": rp.turns_available if rp else 0,
             },
         )
     return requests
@@ -297,12 +381,15 @@ def parse_likert(
     contributor_likert: int | None,
     policy: Policy = DEFAULT_POLICY,
     render: dict | None = None,
+    pair: str = "AB",
 ) -> tuple[LikertFinding | None, Abstention | None, str]:
     if not response.ok or response.data is None:
         return None, None, response.error or "no data returned"
     data = response.data
     if data.get("cannot_determine"):
-        return None, Abstention(400, "task", _why_unverifiable(data)), ""
+        # Abstention item ids are namespaced by pair so a task that abstains on
+        # one comparison and judges the other is not read as abstaining wholesale.
+        return None, Abstention(400, pair, _why_unverifiable(data)), ""
     if contributor_likert is None:
         return None, None, ""
 
@@ -322,6 +409,7 @@ def parse_likert(
             turns_shown_b=int(meta.get("turns_shown_b") or 0),
             turns_total_a=int(meta.get("turns_total_a") or 0),
             turns_total_b=int(meta.get("turns_total_b") or 0),
+            pair=pair,
         ),
         None,
         "",
@@ -430,6 +518,15 @@ def run_rating_stage(
                 scores.get((cid, model)),
                 truncated=bool(meta.get("truncated")),
             )
+        elif check_id == 271:
+            cid, model = meta["criterion_id"], meta["model"]
+            finding, abstention, error = parse_criterion_rating(
+                response,
+                cid,
+                model,
+                scores.get((cid, model)),
+                truncated=bool(meta.get("truncated")),
+            )
         elif check_id == 300:
             dimension, model = meta["dimension"], meta["model"]
             entry = dims.get((model, dimension))
@@ -443,9 +540,31 @@ def run_rating_stage(
                 policy,
                 truncated=bool(meta.get("truncated")),
             )
+        elif check_id == 305:
+            dimension, model = meta["dimension"], meta["model"]
+            entry = dims.get((model, dimension))
+            finding, abstention, error = parse_dimension_rating(
+                response,
+                dimension,
+                model,
+                entry.rating if entry else None,
+                bool(entry.not_applicable) if entry else False,
+                entry is not None,
+                policy,
+                truncated=bool(meta.get("truncated")),
+            )
         else:
+            pair_label = str(meta.get("pair") or "AB")
+            recorded = next(
+                (c for c in task.comparison_list() if c.pair_label == pair_label),
+                None,
+            )
             finding, abstention, error = parse_likert(
-                response, task.sxs.likert, policy, render=meta
+                response,
+                recorded.likert if recorded else None,
+                policy,
+                render=meta,
+                pair=pair_label,
             )
 
         if error:
@@ -460,10 +579,14 @@ def run_rating_stage(
 
         if check_id == 270:
             result.criterion_findings.append(finding)
+        elif check_id == 271:
+            result.simplified_criterion_findings.append(finding)
         elif check_id == 300:
             result.dimension_findings.append(finding)
+        elif check_id == 305:
+            result.collaboration_findings.append(finding)
         else:
-            result.likert = finding
+            result.likerts.append(finding)
 
     run_adjudication(task, result, client, policy, workers=workers)
 
@@ -519,7 +642,7 @@ def build_adjudication_requests(
         sub = subs.get(f.model)
         if sub is None:
             continue
-        prompt, _ = build_dimension_adjudication_prompt(
+        prompt, profile = build_dimension_adjudication_prompt(
             task,
             f.dimension,
             sub,
@@ -538,30 +661,43 @@ def build_adjudication_requests(
                     "check_id": 300,
                     "model": f.model,
                     "dimension": f.dimension,
+                    # Whether even the wide render left turns out. This is what
+                    # decides whether the verdict below is countable, so it has to
+                    # travel with the request the same way the blind pass's does.
+                    "adjudication_tail_truncated": profile.tail_truncated,
                 },
             )
         )
 
-    if (
-        result.likert is not None
-        and result.likert.delta > 0
-        and policy.ranking_disagreement_requires_informed_confirmation
-    ):
-        prompt, _ = build_ranking_adjudication_prompt(
-            task,
-            result.likert.contributor_likert,
-            result.likert.auditor_likert,
-            policy,
-        )
-        requests.append(
-            ModelRequest(
-                key=f"{task.task_id}::adjudicate::likert",
-                prompt=prompt,
-                schema=ADJUDICATION_SCHEMA,
-                system=ADJUDICATION_SYSTEM_PROMPT,
-                metadata={"check_id": 400},
+    if policy.ranking_disagreement_requires_informed_confirmation:
+        by_pair = {c.pair_label: c for c in task.comparison_list()}
+        for likert in result.likerts:
+            if likert.delta <= 0:
+                continue
+            prompt, profiles = build_ranking_adjudication_prompt(
+                task,
+                likert.contributor_likert,
+                likert.auditor_likert,
+                policy,
+                by_pair.get(likert.pair),
             )
-        )
+            requests.append(
+                ModelRequest(
+                    # Keyed by pair: A-vs-B and A-vs-C are different questions
+                    # and a shared key would serve the first answer to both.
+                    key=f"{task.task_id}::adjudicate::likert::{likert.pair}",
+                    prompt=prompt,
+                    schema=ADJUDICATION_SCHEMA,
+                    system=ADJUDICATION_SYSTEM_PROMPT,
+                    metadata={
+                        "check_id": 400,
+                        "pair": likert.pair,
+                        "adjudication_tail_truncated": any(
+                            p.tail_truncated for p in profiles
+                        ),
+                    },
+                )
+            )
     return requests
 
 
@@ -611,12 +747,15 @@ def run_adjudication(
     for request, response in zip(requests, responses):
         meta = request.metadata
         target = (
-            result.likert
+            result.likert_for(str(meta.get("pair") or "AB"))
             if meta.get("check_id") == 400
             else by_dimension.get((meta.get("model"), meta.get("dimension")))
         )
         if target is None:
             continue
+        target.adjudication_tail_truncated = bool(
+            meta.get("adjudication_tail_truncated")
+        )
         if not response.ok or response.data is None:
             target.why_unadjudicated = (
                 response.error or "adjudication returned no data"
@@ -645,6 +784,20 @@ def _build_rating_verdicts(
     )
 
     thin = _thin_evidence_verdict(
+        task, 271, len(result.simplified_criterion_findings), result.abstained(271), policy
+    )
+    verdicts.append(
+        thin
+        if thin is not None
+        else evaluate_check_271(
+            task,
+            result.simplified_criterion_findings,
+            policy,
+            abstained=result.abstained(271),
+        )
+    )
+
+    thin = _thin_evidence_verdict(
         task, 300, len(result.dimension_findings), result.abstained(300), policy
     )
     verdicts.append(
@@ -655,8 +808,22 @@ def _build_rating_verdicts(
         )
     )
 
-    if result.likert is not None:
-        verdicts.append(evaluate_check_400(task, result.likert, policy))
+    thin = _thin_evidence_verdict(
+        task, 305, len(result.collaboration_findings), result.abstained(305), policy
+    )
+    verdicts.append(
+        thin
+        if thin is not None
+        else evaluate_check_305(
+            task,
+            result.collaboration_findings,
+            policy,
+            abstained=result.abstained(305),
+        )
+    )
+
+    if result.likerts:
+        verdicts.append(evaluate_check_400(task, result.likerts, policy))
     else:
         reason = (
             "auditor abstained from the comparison"
@@ -673,7 +840,7 @@ def _build_rating_verdicts(
                 policy=policy,
             )
         )
-    return verdicts
+    return drop_disabled(verdicts, task.project_id)
 
 
 def split_check_270_by_model(
@@ -689,7 +856,9 @@ def split_check_270_by_model(
     named on the finding/abstention rather than by re-deriving it.
     """
     by_model: dict[ModelSlot, CheckVerdict] = {}
-    for slot in ("A", "B"):
+    # The competing slots. The simplified trajectory's ratings are audited by
+    # their own check, so they are not split out here.
+    for slot in (sub.model for sub in task.submissions_in_scope()):
         findings = [f for f in result.criterion_findings if f.model == slot]
         abstained = sum(
             1 for a in result.abstentions if a.check_id == 270 and a.item_id.startswith(f"{slot}::")
@@ -727,10 +896,26 @@ def estimate_rating_calls(task: Task) -> int:
     estimated separately rather than folded in here where it would turn an exact
     count into a guess.
     """
-    models = len(task.submissions())
-    return models * len(task.rubric) + models * len(RATING_DIMENSIONS) + (
-        1 if models == 2 else 0
+    models = len(task.submissions_in_scope())
+    dim_models = {
+        s.model
+        for s in task.submissions_in_scope()
+        if any(d.model == s.model for d in task.dimension_ratings)
+    }
+    n = models * len(task.rubric) + len(dim_models) * len(RATING_DIMENSIONS)
+    n += sum(
+        1
+        for c in task.comparison_list()
+        if task.submission(c.left) and task.submission(c.right)
     )
+    if task.simplified is not None:
+        n += len(task.rubric)
+    n += sum(
+        1
+        for d in task.dimension_ratings
+        if d.dimension == "Collaboration quality" and task.in_audit_scope(d.model)
+    )
+    return n
 
 
 def estimate_adjudication_calls(task: Task, policy: Policy = DEFAULT_POLICY) -> int:
@@ -741,10 +926,14 @@ def estimate_adjudication_calls(task: Task, policy: Policy = DEFAULT_POLICY) -> 
     operator with one. A task where the two sides agree everywhere spends nothing
     here.
     """
-    models = len(task.submissions())
+    models = len(task.submissions_in_scope())
     calls = 0
     if policy.dimension_disagreement_requires_informed_confirmation:
         calls += models * len(RATING_DIMENSIONS)
-    if policy.ranking_disagreement_requires_informed_confirmation and models == 2:
-        calls += 1
+    if policy.ranking_disagreement_requires_informed_confirmation:
+        calls += sum(
+            1
+            for c in task.comparison_list()
+            if task.submission(c.left) and task.submission(c.right)
+        )
     return calls

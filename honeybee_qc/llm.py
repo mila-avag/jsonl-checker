@@ -16,12 +16,12 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Protocol
 
 from .cache import ResponseCache, compute_cache_key
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-haiku-4-5"
 DEFAULT_EFFORT = "medium"
 
 
@@ -37,6 +37,11 @@ class ModelRequest:
     # must treat them as distinct rows; see `compute_cache_key`. Zero is the
     # single-sample default and keys exactly as it did before sampling existed.
     sample_index: int = 0
+    # Which model should answer this one request. Empty means the client's own,
+    # which is every request unless something routed it; see `RoutedClient`. It
+    # is part of the cache key wherever it is set, because an answer is only
+    # cacheable against the model that gave it.
+    model: str = ""
 
 
 @dataclass
@@ -81,7 +86,7 @@ class ClaudeCliClient:
         argv = [
             self.binary,
             "-p", request.prompt,
-            "--model", self.model,
+            "--model", request.model or self.model,
             "--effort", self.effort,
             "--output-format", "json",
             "--json-schema", json.dumps(request.schema, separators=(",", ":")),
@@ -169,6 +174,11 @@ def parse_cli_output(
 # ---------------------------------------------------------------------------
 
 
+def _is_auth_error(error: str | None) -> bool:
+    text = (error or "").lower()
+    return "authentication_error" in text or "oauth access token" in text or "401" in text
+
+
 class RetryingClient:
     """Retries transient failures. A schema-valid answer is never retried."""
 
@@ -183,6 +193,11 @@ class RetryingClient:
             last = self.inner.complete(request)
             last.attempts = attempt
             if last.ok:
+                return last
+            # Auth failures are not transient. Retrying a 401 3x was what
+            # stretched the hollow Aspirational run to ~90 minutes per task
+            # with $0 spend.
+            if _is_auth_error(last.error):
                 return last
             if attempt < self.attempts:
                 time.sleep(self.backoff_s * (2 ** (attempt - 1)))
@@ -209,11 +224,14 @@ class CachedClient:
         self.policy_version = policy_version
         self.refresh = refresh
 
+    def _model_for(self, request: ModelRequest) -> str:
+        return request.model or self.model
+
     def _key(self, request: ModelRequest) -> str:
         return compute_cache_key(
             prompt=request.prompt,
             schema=request.schema,
-            model=self.model,
+            model=self._model_for(request),
             effort=self.effort,
             policy_version=self.policy_version,
             system=request.system,
@@ -242,7 +260,7 @@ class CachedClient:
                 cache_key,
                 resp.data or {},
                 request_key=request.key,
-                model=self.model,
+                model=self._model_for(request),
                 effort=self.effort,
                 prompt=request.prompt,
                 schema=request.schema,
@@ -250,6 +268,45 @@ class CachedClient:
                 cost_usd=resp.cost_usd,
             )
         return resp
+
+
+class RoutedClient:
+    """Sends named request kinds to a model other than the client's default.
+
+    The audit's cost is not spread evenly over its checks and neither is its
+    accuracy, so the cheap judge that is good enough for most of them can be
+    wrong for one. This exists so that is a per-check decision rather than a
+    whole-run one: a config can buy the strong model back for the check that
+    needs it without paying for it everywhere.
+
+    Keyed on the kind segment of the request key -- `task::kind::...` -- which is
+    the same name the response cache stores and `CALL_NAME_TO_CHECK` maps to a
+    check. Callers pass kinds rather than check ids to keep this file free of the
+    stage vocabulary; the CLI owns that translation.
+
+    Must sit outside `CachedClient`, so a routed request keys and stores under
+    the model that answered it. Inside, it would read the default model's cached
+    answer and report it as the routed model's.
+    """
+
+    def __init__(self, inner: ModelClient, model_by_kind: dict[str, str]):
+        self.inner = inner
+        self.model_by_kind = {k: v for k, v in model_by_kind.items() if v}
+
+    @staticmethod
+    def kind_of(key: str) -> str:
+        parts = key.split("::")
+        return parts[1] if len(parts) > 1 else ""
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        # An explicit per-request model wins: routing is a default, not an
+        # override of something a caller already decided.
+        if request.model:
+            return self.inner.complete(request)
+        model = self.model_by_kind.get(self.kind_of(request.key))
+        if not model:
+            return self.inner.complete(request)
+        return self.inner.complete(replace(request, model=model))
 
 
 class ThrottledClient:
@@ -375,6 +432,7 @@ def build_client(
     attempts: int = 3,
     refresh: bool = False,
     max_in_flight: int | None = None,
+    model_by_kind: dict[str, str] | None = None,
 ) -> tuple[ModelClient, ResponseCache]:
     cache = ResponseCache(cache_path)
     client: ModelClient = RetryingClient(
@@ -389,6 +447,9 @@ def build_client(
             policy_version=policy_version,
             refresh=refresh,
         )
+    # Outside the cache, so a routed call keys under the model that answered it.
+    if model_by_kind:
+        client = RoutedClient(client, model_by_kind)
     # Outermost, so a cache hit costs nothing against the limit and a retry does
     # not have to queue behind unrelated work to finish.
     if max_in_flight:

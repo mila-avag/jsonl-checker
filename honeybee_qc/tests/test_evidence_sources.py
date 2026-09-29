@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 
 from ..config import DEFAULT_POLICY
 from ..gates import dimension_direction
@@ -237,6 +238,42 @@ def test_challenge_page_is_recognised():
     assert not is_challenge_page("<html><head><title>Compare Alveo Deals</title></head></html>")
 
 
+def test_geminis_deleted_share_dialog_is_recognised_as_a_dead_page():
+    """Gemini renders a gone share as a dialog over an otherwise normal page.
+
+    Observed on five links in one batch: each answered HTTP 200 and redirected to a
+    plausible `/share/<id>` URL, so neither the status nor the URL betrays it. Left
+    unrecognised the page parses as "text we could not turn into turns", which reads
+    as our parser failing rather than as a share the contributor deleted -- and a
+    deleted share is check 90's business, not a fetch problem to retry.
+    """
+    html = (
+        "<html><body><h1 class='dialog-title-element'>Link doesn't exist</h1>"
+        "<a class='dialog-text'>The link might have been deleted or not entered "
+        "correctly.</a><button>OK</button></body></html>"
+    )
+    turns, full_text, dead = parse_share_html(html, "gemini")
+    assert turns == []
+    assert dead is True
+    assert "might have been deleted" in full_text
+
+
+def test_a_live_page_is_never_called_dead_just_because_a_dialog_word_appears():
+    """The dead-page markers are only consulted when no turns were recovered.
+
+    A conversation in hand outranks any phrase on the page, which is what keeps a
+    marker list from turning a working share into a fail.
+    """
+    html = (
+        "<html><body><user-query-content>is the link doesn't exist error normal?"
+        "</user-query-content><message-content>Yes, that appears when a share is "
+        "deleted.</message-content></body></html>"
+    )
+    turns, _, dead = parse_share_html(html, "gemini")
+    assert len(turns) == 2
+    assert dead is False
+
+
 def test_claude_current_assistant_markup_parses():
     html = (
         '<div data-testid="user-message">what is the plan</div>'
@@ -244,6 +281,41 @@ def test_claude_current_assistant_markup_parses():
     )
     turns, _, _ = parse_share_html(html, "claude")
     assert [t.role for t in turns] == ["user", "assistant"]
+
+
+def test_a_cited_source_reads_as_linked_rather_than_merely_named():
+    """Anchor text survived extraction and the anchor did not, so a linked
+    citation and a bare mention of the same name were the same string.
+
+    On task `6a7d3a48a9485b6a031cb308` four of five draws stated positively that a
+    turn offered "no link, no source" where the page carries a Sources section of
+    embedded links, and QC failed the task for that inaccuracy. The host, not the
+    URL: what the claim turns on is whether anything was linked at all, and a
+    search-citation URL costs several times what its host does.
+    """
+    html = (
+        '<div data-testid="user-message">where did that number come from</div>'
+        '<div class="font-claude-response">Pricing is per million tokens. '
+        '<a href="https://www.cloudzero.com/blog/llm-costs/">CloudZero</a> '
+        'It has not changed since June.</div>'
+    )
+    turns, _, _ = parse_share_html(html, "claude")
+
+    assert "CloudZero [link: cloudzero.com]" in turns[1].text
+
+
+def test_in_page_navigation_is_not_reported_as_a_source():
+    """A share page is full of anchors that go nowhere a citation could: the
+    provider's own controls, fragment jumps, `javascript:` handlers. Marking
+    those would put a link beside text nobody linked."""
+    html = (
+        '<div data-testid="user-message">go on</div>'
+        '<div class="font-claude-response">See <a href="#section-2">section 2</a> '
+        'or <a href="javascript:void(0)">expand</a>.</div>'
+    )
+    turns, _, _ = parse_share_html(html, "claude")
+
+    assert "[link:" not in turns[1].text
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +381,37 @@ def test_hydration_reports_a_dead_page_separately_from_a_fetch_failure():
     assert report.hydrated == 0
     assert len(report.dead_pages) == 1
     assert any("no final trajectory link" in f for f in report.failures)
+    # The report line is for a human reading stderr; check 90 reads the flag.
+    assert task.model_a.share_page_dead is True
+
+
+def test_a_timed_out_fetch_is_not_stamped_as_a_dead_page():
+    """The distinction check 90 rests on: our failure is not their bad link."""
+    task = make_task()
+    task.model_a.final_link = "https://chatgpt.com/share/slow"
+    task.model_b.final_link = ""
+
+    def fetch(url: str) -> Transcript:
+        t = Transcript(kind="link", source_id="slow", provider="gpt")
+        t.error = "browser produced an empty DOM (timed out)"
+        return t
+
+    report = hydrate_conversations([task], fetch=fetch)
+    assert report.dead_pages == []
+    assert task.model_a.share_page_dead is False
+
+
+def test_check_90_fails_on_a_dead_page_found_by_hydration():
+    """Hydration sees the dead page on every fetching run; provenance is opt-in."""
+    from ..cli import run_deterministic
+
+    task = make_task()
+    task.model_a.final_link = "https://chatgpt.com/share/dead"
+    task.model_a.share_page_dead = True
+
+    verdict = next(v for v in run_deterministic(task) if v.check_id == 90)
+    assert verdict.band == "fail"
+    assert verdict.measurement.counts["dead_links"] == 1
 
 
 def test_hydration_fetches_each_distinct_url_once():
@@ -326,3 +429,146 @@ def test_hydration_fetches_each_distinct_url_once():
     report = hydrate_conversations(tasks, fetch=fetch)
     assert calls == ["https://share.gemini.google/same"]
     assert report.hydrated == 6
+
+
+# ---------------------------------------------------------------------------
+# A full disk, which announces itself as a network timeout
+# ---------------------------------------------------------------------------
+#
+# Drawn from a 34-task run that hydrated 5 of 68 submissions and reported
+# "browser produced an empty DOM (timed out)" against every other link,
+# including two that had rendered fine three hours earlier. Chrome cannot write
+# its profile on a full disk, so it exits having produced nothing, which is
+# byte-for-byte what a page that never rendered produces. The run cost $133 and
+# the verdicts were scored against a judge that had no transcripts.
+
+
+def test_a_full_disk_is_refused_before_a_browser_is_launched(monkeypatch):
+    """The check has to come first, or the diagnosis is lost.
+
+    Once Chrome has been launched and killed there is nothing left to
+    distinguish this from the host timing out.
+    """
+    from .. import sources
+
+    monkeypatch.setattr(sources, "find_chrome", lambda: "/fake/chrome")
+    monkeypatch.setattr(sources, "free_disk_bytes", lambda path=None: 500 * 1024**2)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("a browser must not be launched with no disk to write to")
+
+    monkeypatch.setattr(sources.subprocess, "Popen", explode)
+
+    result = sources.fetch_rendered_html("https://share.gemini.google/x")
+    assert "refusing to launch a browser" in result.error
+    assert "0.5 GiB free" in result.error
+    assert not result.html
+
+
+def test_an_empty_dom_on_a_full_disk_blames_the_disk_and_not_the_host(monkeypatch):
+    """Triage reads a timeout as the host refusing us and marks the task for a
+    refetch. A refetch cannot fix a full disk, so the message has to say which
+    of the two it was."""
+    from .. import sources
+
+    monkeypatch.setattr(sources, "free_disk_bytes", lambda path=None: 100 * 1024**2)
+    note = sources._disk_note()
+    assert "0.1 GiB free" in note
+
+
+def test_an_empty_dom_with_disk_to_spare_still_reads_as_a_timeout(monkeypatch):
+    """The original diagnosis has to survive: most empty DOMs really are the page."""
+    from .. import sources
+
+    monkeypatch.setattr(sources, "free_disk_bytes", lambda path=None: 500 * 1024**3)
+    assert sources.free_disk_bytes() > sources.MIN_FREE_DISK_BYTES
+
+
+def test_the_sweep_removes_abandoned_profiles_but_spares_a_running_one(tmp_path, monkeypatch):
+    """The fetch cleans up in a `finally`, which a SIGKILL skips. One interrupted
+    run left 61 profiles behind holding 255 MiB, on a disk with 6.8 GiB free."""
+    import time as _time
+
+    from .. import sources
+
+    monkeypatch.setattr(sources.tempfile, "gettempdir", lambda: str(tmp_path))
+    stale = tmp_path / "hb_profile_old"
+    stale.mkdir()
+    (stale / "Default").write_text("cache")
+    os.utime(stale, (_time.time() - 7200, _time.time() - 7200))
+    live = tmp_path / "hb_profile_new"
+    live.mkdir()
+    unrelated = tmp_path / "someone_elses_dir"
+    unrelated.mkdir()
+
+    removed = sources.sweep_stale_browser_profiles(older_than_s=3600)
+
+    assert removed == 1
+    assert not stale.exists()
+    assert live.exists(), "a profile a running fetch is using must survive"
+    assert unrelated.exists(), "the sweep must only touch its own prefix"
+
+
+# ---------------------------------------------------------------------------
+# Office deliverables -- a .docx is a zip, and the generic GET rejected it
+# ---------------------------------------------------------------------------
+
+
+def _docx_bytes(paragraphs: list[str]) -> bytes:
+    """The smallest thing that is genuinely a .docx as far as the reader cares."""
+    import io
+    import zipfile
+
+    body = "".join(f"<w:p><w:r><w:t>{p}</w:t></w:r></w:p>" for p in paragraphs)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("word/document.xml", f"<w:document><w:body>{body}</w:body></w:document>")
+    return buf.getvalue()
+
+
+class _FakeResponse:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+        self.headers = {"Content-Type": "application/octet-stream"}
+
+    def read(self, size: int = -1) -> bytes:
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_a_docx_deliverable_is_read_rather_than_dropped(monkeypatch, tmp_path):
+    from .. import sources
+
+    payload = _docx_bytes(["Deploy seven ThinkPad E14 units.", "Record every serial number."])
+    monkeypatch.setattr(sources, "urlopen", lambda *a, **k: _FakeResponse(payload))
+    policy = dataclasses.replace(DEFAULT_POLICY, snapshot_dir=str(tmp_path))
+
+    text = sources.fetch_attachment_text(
+        "https://example.com/checklist.docx",
+        policy,
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    assert "Deploy seven ThinkPad E14 units." in text
+    assert "Record every serial number." in text
+    assert "<w:t>" not in text, "XML tags must not reach the auditor as content"
+
+
+def test_an_unreadable_office_file_returns_empty_rather_than_garbage(monkeypatch, tmp_path):
+    """Fail safe: an unreadable deliverable must not look like an empty one."""
+    from .. import sources
+
+    monkeypatch.setattr(sources, "urlopen", lambda *a, **k: _FakeResponse(b"not a zip at all"))
+    policy = dataclasses.replace(DEFAULT_POLICY, snapshot_dir=str(tmp_path))
+
+    text = sources.fetch_attachment_text(
+        "https://example.com/broken.docx", policy, mime_type="application/octet-stream"
+    )
+
+    assert text == ""

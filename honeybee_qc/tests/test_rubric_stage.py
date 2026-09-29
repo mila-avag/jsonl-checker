@@ -863,6 +863,18 @@ def test_a_failed_criterion_leaves_the_denominator_and_lowers_confidence():
     assert len(result.errors) == 2
 
 
+def test_every_criterion_call_failing_is_not_evaluated_not_clean():
+    task = make_task(n_criteria=4)
+    client = FakeModelClient(
+        stage_responder(task, fail_ids={c.criterion_id for c in task.rubric})
+    )
+    result = run_rubric_stage(task, client, POLICY, workers=2)
+    bands = {v.check_id: v.band for v in result.verdicts}
+    assert set(bands) >= {200, 210, 230, 240, 250, 260}
+    assert all(band == "not_evaluated" for band in bands.values())
+    assert "nothing was audited" in result.verdicts[0].measurement.notes
+
+
 def test_monotonicity_is_preserved_through_the_stage():
     task = make_task(n_criteria=12)
     q = lambda i: task.rubric[i - 1].text[:20]
@@ -948,6 +960,25 @@ def test_retry_gives_up_and_reports_the_last_error():
     )
     assert not resp.ok
     assert resp.attempts == 3
+
+
+def test_retry_does_not_repeat_an_auth_failure():
+    attempts = {"n": 0}
+
+    class Expired:
+        def complete(self, request):
+            attempts["n"] += 1
+            return ModelResponse(
+                key=request.key,
+                error='401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has expired."}}',
+            )
+
+    resp = RetryingClient(Expired(), attempts=5, backoff_s=0).complete(
+        ModelRequest(key="k", prompt="p", schema={})
+    )
+    assert not resp.ok
+    assert attempts["n"] == 1
+    assert "401" in (resp.error or "")
 
 
 def test_cli_output_parsing_extracts_structured_output_and_cost():

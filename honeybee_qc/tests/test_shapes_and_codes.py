@@ -9,9 +9,18 @@ from honeybee_qc.registry import ORDER, REGISTRY
 from honeybee_qc.scoring import SHAPE_BANDS, ShapeViolation, build_verdict
 from honeybee_qc.tests.test_spec_conformance import NET_NEW_CHECK_IDS, SPEC_CHECK_IDS
 
-BINARY = (85, 90, 95, 96, 220, 460, 470, 1000)
-NON_FAIL_ONLY = (80, 110, 210)
-GRADED = (70, 75, 100, 200, 230, 240, 250, 260, 270, 280, 300, 310, 400, 450)
+BINARY = (76, 90, 95, 96, 97, 220, 460, 470, 1000)
+# 85 sits here rather than in BINARY, and it is the one entry in this file that
+# does not describe the requirement it implements. The audit workflow tab states
+# the environment-context requirement flatly, with no middle band, so 85 is a
+# binary check running one band down while the fixes to what its judge is asked
+# await validation on a scored run. `test_environment_context` carries the reason
+# and the restore condition; this line is where the shape lives.
+NON_FAIL_ONLY = (80, 82, 85, 86, 110, 210, 271, 281, 305)
+GRADED = (
+    60, 70, 71, 72, 75, 91, 100, 200, 230, 240, 250, 260, 270, 280, 300, 310,
+    400, 450,
+)
 
 
 def test_registry_covers_the_spec_dimensions_plus_the_declared_net_new_ones():
@@ -104,12 +113,13 @@ def test_280_and_310_share_both_strings():
     assert ERROR_CODES[280] == ERROR_CODES[310]
 
 
-def test_the_code_table_has_exactly_two_duplicate_strings():
-    """280 and 310 share both of their strings and nothing else may. A third
-    duplicate would mean two dimensions publishing the same label without the
-    namespacing that keeps 280 and 310 apart."""
+def test_the_code_table_has_exactly_three_duplicate_strings():
+    """280 and 310 share both of their strings; 90 and 91 share the fail
+    string. Nothing else may collide. A fourth duplicate would mean two
+    dimensions publishing the same label without the namespacing that keeps
+    those pairs apart."""
     codes = all_codes()
-    assert len(codes) - len(set(codes)) == 2
+    assert len(codes) - len(set(codes)) == 3
 
 
 def test_1000_code_is_a_sentence_not_a_bracketed_tag():

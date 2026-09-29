@@ -244,6 +244,15 @@ ATTACHMENT_TEXT_MAX_BYTES = 200_000
 _UNREADABLE_MEDIA_HINTS = ("video", "audio")
 _IMAGE_HINTS = ("image",)
 _PDF_HINTS = ("pdf",)
+# Office files are zip containers, so the generic GET below rejects them on
+# Content-Type and every .docx deliverable read as "the model produced nothing".
+# They are the deliverable on 22 of the 138 tasks in the first blind batch --
+# exactly the tasks whose ratings turn on a document the auditor could not open.
+_OOXML_HINTS = ("officedocument", "wordprocessingml", "spreadsheetml")
+_OOXML_EXTENSIONS = (".docx", ".xlsx")
+# Where the text lives inside each container. A .docx keeps the body in one
+# part; a .xlsx keeps cell strings in a shared table plus the sheets themselves.
+_OOXML_TEXT_PARTS = ("word/document.xml", "xl/sharedStrings.xml")
 
 
 def fetch_attachment_text(
@@ -286,9 +295,24 @@ def fetch_attachment_text(
         dest.write_text(text, encoding="utf-8")
         return text
 
+    is_html_ext = url.lower().split("?")[0].endswith(_HTML_NAME_SUFFIXES)
+    if any(h in hint for h in _HTML_MIME_HINTS) or is_html_ext:
+        transcript = read_html_transcript(url, policy)
+        text = transcript.full_text if not transcript.error else ""
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        return text
+
     if any(h in hint for h in _PDF_HINTS) or url.lower().split("?")[0].endswith(".pdf"):
         transcript = read_pdf_transcript(url, policy)
         text = transcript.full_text if not transcript.error else ""
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        return text
+
+    is_ooxml_ext = url.lower().split("?")[0].endswith(_OOXML_EXTENSIONS)
+    if any(h in hint for h in _OOXML_HINTS) or is_ooxml_ext:
+        text = _read_ooxml_text(url, policy)
         cache_dir.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
         return text
@@ -326,6 +350,50 @@ def fetch_attachment_text(
     cache_dir.mkdir(parents=True, exist_ok=True)
     dest.write_text(text, encoding="utf-8")
     return text
+
+
+def _read_ooxml_text(url: str, policy: Policy = DEFAULT_POLICY) -> str:
+    """Pull the visible text out of a .docx/.xlsx without a third-party reader.
+
+    Both formats are zip archives of XML, so the body is recoverable with the
+    standard library alone: strip the tags from the parts named in
+    `_OOXML_TEXT_PARTS` and keep the character data. Paragraph and cell
+    boundaries become spaces, which is all the auditor needs -- it is asked
+    whether the document says a thing, never how it was laid out.
+
+    Fails safe to "" on anything unexpected, for the same reason every other
+    branch here does: a deliverable this cannot read must not be indistinguishable
+    from one correctly read as empty, or the auditor concludes the model produced
+    nothing and fails a contributor for our missing parser.
+    """
+    import io
+    import zipfile
+
+    try:
+        request = Request(url, headers={"User-Agent": PDF_USER_AGENT})
+        with urlopen(request, timeout=policy.pdf_download_timeout_s) as response:
+            raw = response.read(ATTACHMENT_TEXT_MAX_BYTES + 1)
+    except Exception:
+        return ""
+    if len(raw) > ATTACHMENT_TEXT_MAX_BYTES:
+        return ""
+
+    chunks: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = set(archive.namelist())
+            parts = [p for p in _OOXML_TEXT_PARTS if p in names]
+            # A spreadsheet with no repeated strings keeps its values inline on
+            # the sheets instead of in the shared table.
+            parts += sorted(n for n in names if n.startswith("xl/worksheets/"))
+            for part in parts:
+                xml = archive.read(part).decode("utf-8", errors="replace")
+                chunks.append(re.sub(r"<[^>]+>", " ", xml))
+    except Exception:
+        return ""
+
+    text = " ".join(" ".join(chunks).split())
+    return text[:ATTACHMENT_TEXT_MAX_BYTES]
 
 
 def _pdf_page_count(path: str) -> int:
@@ -381,6 +449,180 @@ def read_pdf_transcript(path: str | None, policy: Policy = DEFAULT_POLICY) -> Tr
     else:
         t.error = "no PDF backend could extract text (install pymupdf or pypdf)"
     return t
+
+
+# ---------------------------------------------------------------------------
+# Uploaded HTML / MHTML chat exports (no share URL)
+# ---------------------------------------------------------------------------
+#
+# The 6aad55e9371b00482f57f7* A-vs-B cluster files Model B as
+# `model_b_chat_download` (Gemini Spark dump-dom `.html` / Blink `.mhtml`)
+# with no `*_trajectory*` share link. Treating "no final trajectory link" as
+# dark-B is wrong when that export parses into real turns.
+
+_HTML_NAME_SUFFIXES = (".html", ".htm", ".mhtml", ".mht")
+_HTML_MIME_HINTS = ("text/html", "application/xhtml", "multipart/related", "message/rfc822")
+
+
+def looks_like_html_chat_export(path: str) -> bool:
+    """True for a Gemini Spark dump-dom / Blink MHTML chat-download path or URL."""
+    from urllib.parse import unquote
+
+    raw = unquote((path or "").split("?")[0]).lower()
+    return raw.endswith(_HTML_NAME_SUFFIXES)
+
+
+def _looks_like_mhtml(raw: bytes) -> bool:
+    head = raw[:800].lstrip()
+    return (
+        head.startswith(b"From:")
+        or head.startswith(b"MIME-Version:")
+        or b"multipart/related" in head[:400]
+        or b"Content-Type: multipart/" in head[:400]
+    )
+
+
+def extract_html_from_mhtml(raw: bytes) -> str:
+    """Return the first text/html part of a Blink/Safari MHTML archive."""
+    from email import policy as email_policy
+    from email.parser import BytesParser
+
+    message = BytesParser(policy=email_policy.default).parsebytes(raw)
+    parts = [message] if not message.is_multipart() else list(message.walk())
+    for part in parts:
+        if part.get_content_type() not in {"text/html", "application/xhtml+xml"}:
+            continue
+        content = part.get_content()
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+        return str(content or "")
+    return ""
+
+
+def infer_html_provider(html: str) -> str:
+    """Guess the share-page parser from dump-dom markers, Gemini first."""
+    if "user-query-content" in html or "<user-query" in html:
+        return "gemini"
+    if "data-message-author-role" in html:
+        return "gpt"
+    if 'data-testid="user-message"' in html or "font-claude-response" in html:
+        return "claude"
+    return "gemini"
+
+
+def _download_bytes(url: str, dest: Path, policy: Policy) -> str:
+    """Download `url` to `dest`. Empty string on success, error text otherwise."""
+    if dest.exists() and dest.stat().st_size > 0:
+        return ""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_suffix(dest.suffix + ".part")
+    try:
+        request = Request(url, headers={"User-Agent": PDF_USER_AGENT})
+        with urlopen(request, timeout=policy.pdf_download_timeout_s) as response:
+            with open(partial, "wb") as handle:
+                shutil.copyfileobj(response, handle)
+    except Exception as exc:
+        partial.unlink(missing_ok=True)
+        return f"could not download chat export from {url}: {exc}"
+    partial.replace(dest)
+    return ""
+
+
+def read_html_transcript(
+    path: str | None, policy: Policy = DEFAULT_POLICY
+) -> Transcript:
+    """Parse a contributor-uploaded HTML or MHTML conversation dump.
+
+    Remote paths are cached next to the DOM snapshots. No Chrome launch: these
+    files already *are* the rendered page.
+    """
+    t = Transcript(
+        kind="html",
+        source_id=os.path.basename(urlsplit(path or "").path or path or ""),
+    )
+    if not path:
+        t.error = "no HTML transcript supplied"
+        return t
+
+    local_path = path
+    cache_dir = Path(policy.snapshot_dir)
+    if path.startswith(("http://", "https://")):
+        dest = cache_dir / f"html_{hashlib.sha256(path.encode()).hexdigest()[:16]}.bin"
+        error = _download_bytes(path, dest, policy)
+        if error:
+            t.error = error
+            return t
+        local_path = str(dest)
+
+    if not os.path.exists(local_path):
+        t.error = f"HTML transcript not found at {path}"
+        return t
+
+    raw = Path(local_path).read_bytes()
+    if _looks_like_mhtml(raw):
+        html = extract_html_from_mhtml(raw)
+        if not html.strip():
+            t.error = "MHTML archive contained no text/html part"
+            return t
+    else:
+        html = raw.decode("utf-8", errors="replace")
+
+    snapshot = cache_dir / f"html_{hashlib.sha256(path.encode()).hexdigest()[:16]}.html"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text(html, encoding="utf-8")
+    t.snapshot_path = str(snapshot)
+
+    provider = infer_html_provider(html)
+    t.provider = provider
+    order = [provider] + [p for p in ("gemini", "gpt", "claude") if p != provider]
+    turns: list = []
+    full_text = ""
+    dead = False
+    for candidate in order:
+        turns, full_text, dead = parse_share_html(html, candidate)
+        if turns:
+            t.provider = candidate
+            break
+    t.turns = turns
+    t.full_text = full_text
+    t.dead_page = dead
+    if dead:
+        t.error = "HTML export reports the conversation as unavailable"
+    elif not turns:
+        t.error = "" if full_text.strip() else "HTML export contained no conversation turns"
+    return t
+
+
+def read_chat_export_transcript(
+    path: str | None, policy: Policy = DEFAULT_POLICY
+) -> Transcript:
+    """`model_*_chat_download` may be a PDF, an HTML dump, or an MHTML archive."""
+    if not path:
+        t = Transcript(kind="html", source_id="")
+        t.error = "no chat export supplied"
+        return t
+    if path.startswith(("http://", "https://")):
+        dest = Path(policy.snapshot_dir) / (
+            f"export_{hashlib.sha256(path.encode()).hexdigest()[:16]}.bin"
+        )
+        error = _download_bytes(path, dest, policy)
+        if error:
+            t = Transcript(kind="html", source_id=os.path.basename(urlsplit(path).path))
+            t.error = error
+            return t
+        local = dest
+        source = path
+    else:
+        local = Path(path)
+        source = path
+        if not local.exists():
+            t = Transcript(kind="html", source_id=local.name)
+            t.error = f"chat export not found at {path}"
+            return t
+    raw = local.read_bytes()[:16]
+    if raw.startswith(b"%PDF"):
+        return read_pdf_transcript(str(local) if not path.startswith("http") else path, policy)
+    return read_html_transcript(source, policy)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +693,14 @@ DEAD_PAGE_MARKERS = (
     "unable to load conversation",
     "you don't have access",
     "sign in to continue",
+    # Gemini's own copy for a share that no longer resolves, rendered as a dialog on
+    # an otherwise normal-looking page. Observed on five links in one batch, each
+    # answering 200 and redirecting to a real-looking `/share/<id>` URL, so neither
+    # the status nor the URL gives this away -- without these two phrases the page
+    # parsed as "rendered text we could not turn into turns", which reads as our
+    # parser failing rather than as a deleted share.
+    "the link might have been deleted",
+    "link doesn't exist",
 )
 
 
@@ -481,6 +731,7 @@ class _BlockExtractor(HTMLParser):
         self._stack: list[str] = []
         self._open: list[tuple[str, int, list[str]]] = []  # role, depth, parts
         self._skip_depth = 0
+        self._links: list[tuple[int, str]] = []  # depth, marker to emit on close
 
     def _note_media(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         """Record a turn whose whole reply is a rendered artifact.
@@ -495,6 +746,40 @@ class _BlockExtractor(HTMLParser):
             return
         alt = next((v for k, v in attrs if k.lower() == "alt" and v), "")
         self._open[-1][2].append(f"[{_MEDIA_TAGS[tag]}{': ' + alt if alt else ''}]")
+
+    def _note_link(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Mark anchor text as anchored, so a cited source reads as one.
+
+        The extractor keeps an anchor's text and drops its href, which makes a
+        linked citation and a bare mention of the same name identical strings.
+        Judges then read the missing markup as missing sourcing: on task
+        6a7d3a48a9485b6a031cb308 four of five draws stated positively that a turn
+        offered "no link, no source" where the page carries a Sources section of
+        embedded links, and QC failed the task for exactly that inaccuracy.
+
+        The host alone, not the URL. What the claim under audit turns on is
+        whether anything was linked at all, and a search-citation URL runs past a
+        hundred characters against a host of fifteen -- a turn citing twenty
+        sources would spend two thousand characters of the conversation budget to
+        answer a yes-or-no question. Only http(s) anchors with a host qualify, so
+        the provider's own in-page navigation and `javascript:` handlers stay out.
+        """
+        if tag != "a" or not self._open:
+            return
+        href = next((v for k, v in attrs if k.lower() == "href" and v), "")
+        parts = urlsplit(href.strip())
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return
+        host = parts.netloc.split("@")[-1].split(":")[0]
+        self._links.append((len(self._stack), f"[link: {host.removeprefix('www.')}]"))
+
+    def _close_link(self) -> None:
+        # A stray close unwinds several levels at once, so drain every anchor the
+        # unwind passed rather than assuming one per pop.
+        while self._links and self._links[-1][0] > len(self._stack):
+            _, marker = self._links.pop()
+            if self._open:
+                self._open[-1][2].append(marker)
 
     def _role_for(self, tag: str, attrs: list[tuple[str, str | None]]) -> str | None:
         attr_map = {k.lower(): (v or "") for k, v in attrs}
@@ -524,6 +809,7 @@ class _BlockExtractor(HTMLParser):
             return
         self._stack.append(tag)
         self._note_media(tag, attrs)
+        self._note_link(tag, attrs)
         # Nested matches are ignored; the outermost block owns the text.
         if not self._open:
             role = self._role_for(tag, attrs)
@@ -543,6 +829,7 @@ class _BlockExtractor(HTMLParser):
         # Unwind to the matching tag so a stray close cannot desynchronise depth.
         while self._stack:
             popped = self._stack.pop()
+            self._close_link()
             if self._open and self._open[-1][1] > len(self._stack):
                 role, _, parts = self._open.pop()
                 text = " ".join(" ".join(parts).split())
@@ -781,6 +1068,53 @@ class FetchResult:
     snapshot_path: str = ""
 
 
+# A browser given nowhere to write its profile still starts, still accepts the
+# URL, and still exits leaving an empty output file, which is indistinguishable
+# from a page that never rendered. A full disk therefore reports itself as a
+# network timeout on every link at once, and triage reads that as the host
+# refusing us and marks the tasks for a refetch that cannot help. The floor is
+# what one Chrome profile plus its cache needs with room to spare.
+MIN_FREE_DISK_BYTES = 2 * 1024**3
+
+
+def free_disk_bytes(path: str | None = None) -> int:
+    try:
+        return shutil.disk_usage(path or tempfile.gettempdir()).free
+    except Exception:  # noqa: BLE001 - a diagnostic must never end the run
+        return -1
+
+
+def _disk_note() -> str:
+    free = free_disk_bytes()
+    if free < 0:
+        return ""
+    return f"{free / 1024**3:.1f} GiB free on {tempfile.gettempdir()}"
+
+
+def sweep_stale_browser_profiles(older_than_s: float = 3600.0) -> int:
+    """Delete profile directories abandoned by killed runs.
+
+    The fetch cleans up its own profile in a `finally`, which a SIGKILL skips.
+    Each survivor holds tens of megabytes, and enough of them will exhaust the
+    disk that the next run needs.
+    """
+    removed = 0
+    cutoff = time.time() - older_than_s
+    for pattern in ("hb_profile_*", "hb_dom_*"):
+        for path in Path(tempfile.gettempdir()).glob(pattern):
+            try:
+                if path.stat().st_mtime > cutoff:
+                    continue
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+                removed += 1
+            except Exception:  # noqa: BLE001 - best effort housekeeping
+                continue
+    return removed
+
+
 def fetch_rendered_html(url: str, policy: Policy = DEFAULT_POLICY) -> FetchResult:
     """Render a share page with headless Chrome.
 
@@ -792,6 +1126,13 @@ def fetch_rendered_html(url: str, policy: Policy = DEFAULT_POLICY) -> FetchResul
     chrome = find_chrome()
     if not chrome:
         return FetchResult(error="no Chrome or Chromium binary found")
+
+    free = free_disk_bytes()
+    if 0 <= free < MIN_FREE_DISK_BYTES:
+        return FetchResult(
+            error=f"refusing to launch a browser: only {_disk_note()}, "
+            f"below the {MIN_FREE_DISK_BYTES / 1024**3:.0f} GiB a render needs"
+        )
 
     tmp = tempfile.NamedTemporaryFile(prefix="hb_dom_", suffix=".html", delete=False)
     tmp.close()
@@ -851,6 +1192,12 @@ def fetch_rendered_html(url: str, policy: Policy = DEFAULT_POLICY) -> FetchResul
         os.unlink(tmp.name)
 
     if not html.strip():
+        free = free_disk_bytes()
+        if 0 <= free < MIN_FREE_DISK_BYTES:
+            return FetchResult(
+                error=f"browser produced an empty DOM, and the disk is nearly "
+                f"full ({_disk_note()}) -- treat this as a local failure, not the host"
+            )
         return FetchResult(error="browser produced an empty DOM (timed out)")
     return FetchResult(html=html)
 

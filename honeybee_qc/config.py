@@ -19,17 +19,27 @@ WeightBucket = Literal["low", "medium", "high"]
 
 @dataclass(frozen=True)
 class WeightBucketMap:
-    """Maps the 1-5 weight scale onto the high/medium/low levels check 260 counts.
+    """Maps a weight scale onto the high/medium/low levels check 260 counts.
 
-    Grounded in the customer's own weight guide: 1 "minor positive",
-    2 "moderately important", 3 "important", 4 "highly important", 5 "essential".
+    The default is the 1-5 scale, grounded in the customer's own weight guide:
+    1 "minor positive", 2 "moderately important", 3 "important", 4 "highly
+    important", 5 "essential". Check 260's L1 definition states "Criteria weights
+    should be on a scale of 1 to 5 (no negative weights)". The audit workflow
+    tab's issue table refers to weights 8-10, 4-7 and "[weight -5]", but that
+    table is shared across QC projects (its examples are all tax and options
+    trading), so the project-specific statement wins. What that spec still does
+    not state is which of 1-5 counts as high, medium, or low, which is the
+    mapping below.
 
-    The scale itself is settled: check 260's definition states "Criteria weights
-    should be on a scale of 1 to 5 (no negative weights)". The audit workflow tab's
-    issue table refers to weights 8-10, 4-7 and "[weight -5]", but that table is
-    shared across QC projects (its examples are all tax and options trading), so the
-    project-specific statement wins. What the spec still does not state is which of
-    1-5 counts as high, medium, or low, which is the mapping below.
+    Not every project uses that scale, and getting it wrong is silent rather than
+    loud. Honeybee Aspirational's spec states a three-point scale -- "+1 (low),
+    +2 (medium), +3 (high)" -- and its rubrics bear that out: across 1,779
+    criteria on 73 tasks the weights are 243 ones, 742 twos and 794 threes, with
+    no 4 or 5 anywhere. Read through the 1-5 map, its most important criteria
+    bucket as "medium" and its "high" level is unreachable, so nearly half the
+    corpus is compared against the wrong rung and every off-by-one measurement
+    is understated. `THREE_POINT_WEIGHTS` below is that project's map; a project
+    profile names which one applies.
     """
 
     low: tuple[int, ...] = (1, 2)
@@ -63,6 +73,13 @@ class WeightBucketMap:
         if not self.in_scale(cb_weight) or not self.in_scale(auditor_weight):
             return 2
         return abs(self.level_index(cb_weight) - self.level_index(auditor_weight))
+
+
+# Honeybee Aspirational's scale, quoted from its rubric: "+1 (low), +2 (medium),
+# +3 (high)". One weight per level, so "off by one" and "off by one level" are
+# the same statement here -- which is what makes the spec's own "off by 1" and
+# "off by 2" thresholds directly measurable rather than needing a mapping.
+THREE_POINT_WEIGHTS = WeightBucketMap(low=(1,), medium=(2,), high=(3,))
 
 
 @dataclass(frozen=True)
@@ -150,8 +167,18 @@ class Policy:
     # remove, so the three draws are a $3-a-run regression guard on a check with no
     # fail band rather than a measurement. Drop it with `--samples 110=1` once the
     # abstention fix has a full run behind it.
+    # 450 draws five rather than three because three was measured as not enough.
+    # Re-auditing sixteen tasks that had already been judged, with the prompt
+    # substantively unchanged, moved their defect counts by 6->3, 7->11, 8->5 and
+    # 7->5 -- and those are the numbers *after* three-draw majority voting, not raw
+    # draws. The aggregate barely moved (63 issues to 60), so the judge is not
+    # biased, it is noisy per item; and because tasks sit near the share threshold,
+    # per-item noise lands directly on the task verdict. That is what made recall
+    # estimates for this check range from 22% to 86% across samples of the same
+    # population. Five draws needs three to agree instead of two, which is the
+    # cheapest available brake on a single erratic draw carrying an item.
     samples_by_check: dict[int, int] = field(
-        default_factory=lambda: {110: 3, 280: 3, 310: 3, 450: 3}
+        default_factory=lambda: {110: 3, 280: 3, 310: 3, 450: 5}
     )
 
     # Strict majority. A claim carried by exactly half the samples is not kept:
@@ -188,6 +215,14 @@ class Policy:
     rubric_major_moderate_fail_rate: float = 0.15  # check 240, inclusive
     rubric_all_fail_rate: float = 0.20          # check 250, inclusive
 
+    # Checks whose fail threshold is exclusive rather than inclusive -- fail
+    # strictly above the rate, not at it. Empty by default because the L1 spec
+    # words every one of these gates as "at least". Honeybee Aspirational's V5
+    # rubric words two of them the other way, and on a rate whose denominator is
+    # a rubric of 15-30 criteria the boundary is a value tasks actually land on,
+    # not a rounding curiosity.
+    exclusive_fail_thresholds: frozenset[int] = frozenset()
+
     # Check 260, both inclusive, and both left at the spec's own percentages
     # ("at least 5% ... off by two levels", "at least 30% ... off by one level or
     # two"). What was wrong with this check was the numerator, not the percentage:
@@ -213,9 +248,102 @@ class Policy:
 
     relevant_turns_fail_count: int = 3          # checks 280 and 310, inclusive
 
+    # Check 280 only, inclusive, and a floor on top of the count above rather
+    # than a replacement for it: a task fails 280 when it carries at least
+    # `relevant_turns_fail_count` incorrectly cited turns AND those turns are at
+    # least this share of the criteria the check audited.
+    #
+    # The count leg alone is a defect *count* over a population that this corpus
+    # runs from 0 to 54 criteria wide, and it behaves accordingly: the numerator
+    # correlates with rubric size at +0.61, the median `items_audited` on a 280
+    # escalation is 34 against 0 on a non-escalation, and 10 of the 14 false
+    # fails attributed to the 280/310 family were 280. A task with a
+    # 34-criterion rubric gets 34 chances to reach 3; a task with none can never
+    # trip it at all. That is a rubric-size test wearing a defect-density test's
+    # clothes.
+    #
+    # 310 deliberately has no rate floor. Its item population is always the
+    # task's dimension ratings -- 14 items, every task -- so it has no size to
+    # correlate with, and its measured correlation is -0.26. A shared floor
+    # would raise 310's effective bar from 3 to 5 for no reason anyone has
+    # measured.
+    #
+    # The absolute count is kept as well, deliberately: a small rubric with
+    # three genuinely fabricated citations is a real defect, and a pure rate
+    # would let it through. Set to 0.0 to restore the pure absolute count.
+    rubric_relevant_turns_fail_rate: float = 0.33
+
+    # Check 300, inclusive, and a COUNT of confirmed disagreements. 0 disables it,
+    # which is the default: this leg is the one `dimension_fail_total_points`
+    # below was measured to replace, and switching it back on globally would
+    # reinstate the false fails that change removed. Honeybee Aspirational's V5
+    # rubric states it outright ("You have 5 or more major or minor
+    # disagreements"), so that project sets it, at a bar two and a half times the
+    # count that was measured to be wrong.
+    dimension_fail_total_count: int = 0
+
     dimension_major_delta: int = 3              # check 300, inclusive
+    # Check 300, inclusive, and see the note on `dimension_fail_total_points`
+    # below for why this leg cannot fire on its own at the current numbers.
     dimension_fail_major_count: int = 2         # check 300, inclusive
-    dimension_fail_total_count: int = 5         # check 300, inclusive
+    # Check 300, inclusive, and a SUM OF POINTS rather than a count of items.
+    # This replaces `dimension_fail_total_count = 2`, which counted dimensions
+    # carrying any nonzero confirmed delta and so scored a 1-point disagreement
+    # exactly like a 4-point one.
+    #
+    # The spec's own fail cell says "total point-deltas" and its number is 5. The
+    # mistake was never the unit, it was the population: the spec's 5 was applied
+    # to raw *blind* deltas, and applied there it fails 85.7% of a human-QC-clean
+    # corpus. Since informed confirmation landed the numerator is
+    # confirmed-indefensible gaps only, which is 7.6% to 9.3% of the blind gaps
+    # on the two scored corpora. Counting the spec's unit over the confirmed
+    # population, rather than counting items over it, is what this field does.
+    #
+    # 6 is measured on 171 tasks with every gap magnitude recovered from the
+    # stored draws (zero misses) and the published band reproduced on all of
+    # them:
+    #
+    #                                    91 QC-clean tasks   60 mixed   live 40
+    #     n>=2 or majors>=2 (previous)      7 fails            6         19
+    #     points>=6 or majors>=2 (this)     2 fails            1         10
+    #
+    # That removes 5 of the 7 false fails on the QC-clean corpus (71%), takes the
+    # unambiguous ones -- QC scored the task 5 and cited no dimension-rating
+    # issue -- from 3 to 1, and on the mixed corpus removes both false fails
+    # while keeping the one fail QC also failed the task for.
+    #
+    # Recall cost, stated plainly: three of the four fails that sat on QC=Fail
+    # tasks in the 60-task corpus become `non_fail`, including the one task where
+    # QC explicitly cited a dimension-rating issue and 300 agreed -- its
+    # confirmed gaps are [1,1,1]. At the *task verdict* level the cost is close
+    # to zero, because all three still fail on 450 and/or 310, so no QC-failed
+    # task becomes a pass; what changes is per-check attribution. That is the
+    # right trade for a check nobody can use as a per-check defect rate while its
+    # fail band fires on three 1-point disagreements.
+    #
+    # What is robust across every corpus and rule tried is the direction: 2
+    # confirmed gaps of any magnitude is too low a bar, and the 1-point gap is
+    # where the false fails live. The exact number 6 is not robust; it is priced
+    # on 7 false fails and 1 QC-corroborated true positive. The next-best point,
+    # if discarding 1-point recall is unacceptable, is a count leg at 3 (3 fails
+    # on the QC-clean corpus, 4 of 7 false fails removed).
+    #
+    # THE MAJOR LEG CANNOT FIRE ON ITS OWN AT THESE NUMBERS, and that is worth
+    # stating where a reader will see it, because the previous comment left the
+    # same trap unmarked. `dimension_fail_major_count` (2) gaps of
+    # `dimension_major_delta` (3) points is 6 points, which already trips this
+    # leg, so every numeric disagreement the major leg would fail a task for is
+    # one this leg fails it for first. It was dead code under the old count leg
+    # for the mirror-image reason (two major gaps are already two total gaps) and
+    # it is dead again here. It is kept rather than deleted for two reasons: it
+    # is the leg that still binds if this threshold is ever raised above
+    # `major_count * major_delta`, and it is the only route by which an
+    # applicability divergence can fail a task when `na_mismatch_counts_as` is
+    # set to "major", since an N/A mismatch carries no numeric delta and so
+    # contributes no points. `evaluate_check_300` publishes
+    # `major_leg_can_fire`, computed from these three numbers, so the condition
+    # is visible in the output instead of resting on this comment.
+    dimension_fail_total_points: int = 6
 
     likert_fail_delta: int = 3                  # check 400, inclusive
 
@@ -236,22 +364,245 @@ class Policy:
     # that fired on 17 of 17 tasks with per-justification trip rates from 7% to
     # 80%, and a verdict that is always fail carries no information.
     #
-    # 0.30 is the higher of the two proportions the spec itself states for "a
+    # 0.20 is the lower of the two proportions the spec itself states for "a
     # share of many small authored items is defective": 200's "at least 30% of
-    # the labels are incorrect" and 250's 20% of criteria. The higher one is the
-    # defensible choice here because 450's numerator is the most sensitive in the
-    # audit -- one inaccurate load-bearing claim, or one fabricated quote, is
-    # enough to put a whole justification in it -- so pairing it with the lower
-    # share would make the task-level bar stricter than any proportional gate the
-    # customer actually wrote while resting on a twitchier count than any of them.
-    # At 30% of fifteen, five justifications must fail, which is a contributor
-    # whose arguments break down across a third of the dimensions they wrote
-    # about: that is the systematic defect "[Fail - Bad Justifications]" names.
+    # the labels are incorrect" and 250's 20% of criteria. This sat at 0.30 on
+    # the argument that 450's numerator is the most sensitive in the audit -- one
+    # inaccurate load-bearing claim, or one fabricated quote, is enough to put a
+    # whole justification in it -- so it deserved the more forgiving share. The
+    # first blind batch measured that argument and it does not hold, for a reason
+    # the argument overlooked: the twitchy cases are not on this leg at all.
+    # `justification_severe_conditions` already fails a task on one fabricated
+    # citation or one false load-bearing claim at any share, so the share rule
+    # never was the thing standing between a single bad claim and a fail. Setting
+    # it high did not buy protection from the sensitive numerator; it only raised
+    # the bar for the accumulating defect this leg exists to catch.
+    #
+    # Scored against 117 human-labelled tasks, moving 0.30 -> 0.20 takes check
+    # 450 from 14% recall at 43% precision to 55% recall at 52% precision, and
+    # the whole audit from 52% recall at 31% precision to 61% at 34% -- three more
+    # true fails for one more false one. 0.10 was also swept and is worse: one
+    # further true fail for five false ones. Both numbers are in-sample on a
+    # single batch and the labels behind them are unadjudicated single-auditor
+    # opinions, so this is a better-supported choice than 0.30 was, not a
+    # settled one.
+    #
+    # At 0.20 of fifteen, three justifications must fail. That is still a
+    # contributor whose arguments break down on a fifth of the dimensions they
+    # wrote about, which is the systematic defect "[Fail - Bad Justifications]"
+    # names, and it is no longer stricter in effect than the customer's own
+    # comparable gates.
+    #
+    # 0.20 -> 0.10 travels with `justification_draw_agreement` 3 -> 5 and is not
+    # defensible without it. The paragraph above rejecting 0.10 was measured at a
+    # 3-of-5 majority, where lowering the share admits the minority-vote items the
+    # majority had already let through -- one further true fail for five false
+    # ones. At unanimity those items are gone before the share is taken, so the
+    # two knobs are not independent and the earlier sweep does not price this
+    # pairing. Swept jointly, k=5 with 0.10 gives false fails 42 -> 38 at
+    # unchanged task-level recall; k=3 with 0.10 gives 43 false fails. Move them
+    # together or not at all.
+    #
+    # A caution for whoever tunes this next: at unanimity the share is nearly
+    # inert. On the 60 landed `priority_batch` tasks, k=5 escalates 9 of 60 at
+    # every share from 0.10 to 0.30, because almost nothing survives unanimity in
+    # enough quantity to reach a share gate and
+    # `justification_severe_conditions` carries what is left. Four of those nine
+    # escalations bypass the share entirely. Tuning this number is not where the
+    # remaining leverage on this check is.
     #
     # Applies only under per_justification scope. Pooling collapses the task to a
     # single synthetic justification, so there is no population left to take a
     # share of and the pooled branch keeps its any-trigger fail.
-    justification_fail_rate: float = 0.30
+    # Which rule check 450's band comes from. "share_or_severe" is this build's,
+    # measured and argued in the notes below: a share of justifications carrying
+    # any condition, plus a one-is-enough escape for the severe ones.
+    #
+    # "all_models_or_all_comparisons" is Honeybee Aspirational's V5 rule, which
+    # is structural instead -- every model, or every comparison, must carry a
+    # major issue before the task fails. It is dramatically more forgiving: one
+    # fabricated citation fails a task under the first rule and is a non-fail
+    # under the second so long as another model's justifications are clean. Not a
+    # threshold that can be tuned into agreement, which is why it is a named rule
+    # rather than a number.
+    justification_fail_rule: Literal[
+        "share_or_severe", "all_models_or_all_comparisons"
+    ] = "share_or_severe"
+
+    justification_fail_rate: float = 0.10
+
+    # Check 450 only: how many of `samples_by_check[450]` draws must report a
+    # defect on one justification for it to survive aggregation. 3 is exactly the
+    # `median_low` this replaced -- for five draws `median_low(v) >= t` holds iff
+    # at least three draws have `v >= t` -- so 3 reproduces every run scored
+    # before this field existed, and the sweep in
+    # `audit_runs/false_fail_analysis/sweep450.py` confirms that end to end.
+    #
+    # 5 is unanimity, and it is set there because a bare majority of this judge is
+    # close to a coin flip. Measured over 400 complete five-draw groups on the
+    # 151-task sheet22 corpus: only 17% of flagged justification items were
+    # flagged by all five draws and 56% were the opinion of one or two. That is
+    # not a threshold problem -- 30 of the 32 tasks QC tagged [Fail - Bad
+    # Justifications] have a non-zero numerator at one draw, so the judge sees the
+    # defects; it does not see them consistently. `median_low` kept everything at
+    # three of five, and combined with `justification_severe_conditions` failing a
+    # task on one item, a 3-of-5 coin flip on one justification of fifteen failed
+    # a $6 task.
+    #
+    # Out-of-sample check, because the number above was measured on the same
+    # corpus the threshold was tuned on. On 60 tasks of the `priority_batch` run
+    # -- patched build, never-reviewed population, no QC ground truth -- raw
+    # unanimity is 23.6% and the minority rate 54.0%. The minority figure
+    # replicates outright; the unanimity gap is a composition effect, since that
+    # corpus is 77% defect-rich against sheet22's 41% and defect-rich tasks are
+    # twice as unanimous in either corpus. Standardised to sheet22's mix it is
+    # 18.3% against 17.2%. See `audit_runs/oos_validation/OOS_450_VALIDATION.md`.
+    #
+    # Priced in-sample at 5: false fails 42 -> 38 with task-level recall
+    # unchanged at 31, and 450's own precision 48% -> 50% against recall 47% ->
+    # 34%. The recall lost is the check's own, not the audit's -- every task 450
+    # stops failing is either failed by another check or was a false fail. Priced
+    # out-of-sample at 5: 450 escalates 16 of 60 tasks -> 9, seven tasks stop
+    # failing it, all seven still fail another check, and no whole-task verdict
+    # moves. k=4 at the same share instead *adds* a task-level fail, which is why
+    # this is 5 and not the softer 4.
+    #
+    # Not an open question, and not a knob to reopen without new measurement: the
+    # value is settled at 5 on both corpora. It stays a named field because the
+    # severe route is still being measured separately and because 3 is what
+    # replays a pre-patch run.
+    #
+    # Rescaled to however many draws came back, so a group that lost one is not
+    # silently held to a different rule: see `sampling._justification_votes`.
+    justification_draw_agreement: int = 5
+
+    # Check 450: the conditions the share above does not govern. A justification
+    # tripping one of these fails the task on its own, whatever its share of the
+    # population.
+    #
+    # The share is a task-level judgment about a *pattern* -- arguments that
+    # break down across a third of the dimensions -- and it is the right
+    # instrument for the conditions whose own floors are soft: two unsupported
+    # claims, two misread quotes, a weighting the auditor would have set
+    # differently. It is the wrong instrument for the two the spec stamps "One is
+    # enough to fail" in the auditor's own instructions (`inaccurate_evidence`
+    # and `inaccurate_primary_claims`). A fabricated quote or a false
+    # load-bearing claim is not evidence of a tendency that needs corroborating
+    # across the other fourteen justifications; it is the defect itself, and the
+    # spec set its floor at one precisely so that it would not need company.
+    #
+    # Read as a share, those two floors were unreachable: one instance of
+    # fifteen is 6.7% against a 30% gate, so the strictest numerator in the audit
+    # was the one the gate could never see. In the 53-task validation run this
+    # cost five of the six tasks the human QC team failed on justification
+    # grounds, including one that tripped `cites_incorrect_evidence` on 27% of
+    # its justifications -- four separate fabricated citations -- and passed.
+    #
+    # `is_inaccurate` covers a second branch, the wrong subordinate claim, which
+    # the spec does not call one-is-enough and this build now does. The spec's
+    # equivalence was two subordinate errors to one load-bearing one, which is
+    # the reason the two counts share a condition in the first place; the floor
+    # that enforced it lives in `findings.SECONDARY_INACCURACY_FLOOR` and is set
+    # to 1 there, with the argument for the departure beside it. Read this tuple
+    # with that floor: the severe escape is now reachable from one subordinate
+    # inaccuracy, so it is a wider door than the paragraphs below measured.
+    #
+    # A correction worth carrying, because an earlier analysis of this field drew
+    # the wrong conclusion from the right observation. Setting this tuple to
+    # ("cites_incorrect_evidence",) gives byte-identical results to emptying it on
+    # both measured corpora, and that was read as the condition never firing. It
+    # fires: 7 items on 3 of 151 sheet22 tasks and 12 items on 7 of 60
+    # `priority_batch` tasks. What the identity proves is only that it was never
+    # *decisive*, because every task carrying it also carried `is_inaccurate` or
+    # cleared the share honestly. At `justification_draw_agreement = 5` that stops
+    # being true: one escalation of 60 is carried by `cites_incorrect_evidence`
+    # alone, the minority-vote `is_inaccurate` findings beside it having been
+    # filtered out. The spec's own one-fabricated-quote condition is load-bearing
+    # for the first time in either corpus, so it must not be treated as inert.
+    #
+    # Also measured, and now partly superseded: `is_inaccurate` reduced to
+    # `inaccurate_primary_claims >= 1` in practice -- the two-secondary-claims
+    # branch accounted for 0 of the 5 severe escapes out of sample, which is one
+    # of the reasons its floor moved to 1 -- and 31% of
+    # 450's escalations bypass the share through this tuple entirely, rising to 44%
+    # once the agreement bar tightens. Whether the severe route should carry its
+    # own agreement bar is a separate decision with its own measurement in flight.
+    # It would go beside `justification_draw_agreement` rather than in here.
+    #
+    # Emptying this tuple restores the pure share gate, which is the supported
+    # way to run without the escape. Conditions are named as
+    # `JustificationFinding.triggered_conditions` emits them; a name with no
+    # counterpart there is inert rather than an error, since the finding's
+    # vocabulary is the spec's and not this field's to police.
+    justification_severe_conditions: tuple[str, ...] = (
+        "is_inaccurate",
+        "cites_incorrect_evidence",
+    )
+
+    # Check 450: how many independent draws must have named a severe condition
+    # before it is allowed to bypass the share. Counted out of the draws that came
+    # back, not rescaled to `samples_by_check[450]`, which is the whole point of
+    # the field.
+    #
+    # The escape has never been the free-for-all it reads as. It consults the
+    # *aggregated* finding, so `sampling.aggregate_justifications` has always
+    # bounded it: measured over the 151-task sheet22 corpus and the 60 landed
+    # `priority_batch` tasks, every severe condition that survived aggregation on
+    # a complete five-draw group was named by at least three draws, which is
+    # exactly what `median_low` requires. A draw-agreement bar stated as a share
+    # of the group is therefore inert at or below that, and 1 reproduces today.
+    #
+    # What the aggregator does not bound is a group that lost draws.
+    # `aggregate_justifications` returns a lone draw verbatim when `total <= 1`,
+    # and on sheet22 two tasks -- 6a7f7ca67216429b95c72149 and
+    # 6a800beb4c1c25ccc73e4ab7 -- failed on a severe condition exactly one stored
+    # draw ever named, on one justification of fifteen. Both survive the 5-of-5
+    # aggregation change, because there is nothing for five-of-five to filter
+    # when only one draw exists. 2 is the smallest value that closes that, and it
+    # is free: on the 91-task all-QC-pass corpus and the 151-task corpus it moves
+    # neither true nor false task-level fails, and on the live run it moves
+    # nothing at all. It removes two of 450's 22 escalations at k=5, which are two
+    # claims the check could not support.
+    #
+    # Above 2 it stops being free. 5 -- "the escape needs all five draws,
+    # whatever came back" -- costs one true fail on sheet22 for no false-fail
+    # gain, because it also rejects a group of four that agreed unanimously. The
+    # spec's own reading is that a lost call is our failure and not the
+    # contributor's, and 2 is the version of this that only denies an escape no
+    # draw ever corroborated.
+    #
+    # Findings nothing sampled carry `draws_combined = 0` and are exempt rather
+    # than denied: a synthesised empty-justification finding and a single-sample
+    # run have no draw record, and refusing them the escape would make this field
+    # a switch on `samples_by_check` instead of a bar on evidence.
+    justification_severe_min_draws: int = 2
+
+    # Check 450: the share of a task's justifications that must carry a severe
+    # condition before one of them may fail the task on its own. 0.0 is off, and
+    # off is today.
+    #
+    # This is the "one of many" question and it is a policy decision, not a
+    # calibration. The spec stamps `inaccurate_evidence` and
+    # `inaccurate_primary_claims` "One is enough to fail" in the auditor's own
+    # instructions, so any value above 0 overrides the customer's own floor and
+    # nobody should set it without saying so. It is a field rather than a patch so
+    # that the decision can be taken deliberately, and measured before it is.
+    #
+    # Measured, with `justification_draw_agreement` at 5 and the share at 0.10:
+    # every severe escape left on either corpus is one severe justification of
+    # thirteen to fifteen, 6.7% to 7.7%, and all five draws agree on all of them.
+    # So any floor above 7.7% closes the route outright on this data and the
+    # choice is not between floors, it is whether to keep the route. At 0.10 it
+    # takes the 151-task corpus from 38 false task-level fails to 36 for one true
+    # fail, the 91-task corpus from 34 to 32, and flips one live verdict.
+    #
+    # A share rather than a count because the complaint is not that one is never
+    # enough. One inaccurate load-bearing claim in eight justifications and one in
+    # fifteen are different claims about a contributor, and a share says so where
+    # a count of two says only that one is never enough. On this corpus the two
+    # are indistinguishable -- a count of 2 gives the same numbers everywhere --
+    # so the share is chosen on the argument and not on the measurement.
+    justification_severe_min_share: float = 0.0
 
     # ---- ambiguity resolutions (spec section 11) ----------------------------
     # Gap 6: 240 reads "between 1% and 15%" while 230/250 read "more than 0%".
@@ -264,6 +615,24 @@ class Policy:
 
     # Gap 7: the spec counts incorrectly selected turns, not absent ones.
     count_missing_turns_as_incorrect: bool = True
+
+    # Check 95's structural leg. The customer fails a task whose final-outcome
+    # upload section is empty even when every file was attached turn by turn,
+    # and the named-file comparison cannot express that, because ingest unions
+    # the two upload fields before the gate ever sees them. Off switches the leg
+    # back off and leaves 95 a pure claimed-vs-uploaded comparison.
+    final_outputs_section_required: bool = True
+
+    # Check 95's extraction scope. "conversation" lists every file the model
+    # produced across the whole session, which is the L1 reading. "final_response"
+    # lists only files mentioned in the last assistant turn, which is V5's rule
+    # verbatim: "every output file mentioned in the final response was uploaded",
+    # with intermediate versions and earlier-turn files explicitly excused.
+    artifact_scope: Literal["conversation", "final_response"] = "conversation"
+
+    # Check 91 Unique Links. V5 fails at "4+ turns for Gemini that do not contain
+    # a unique link" and non-fails at "1-3". L1 has no such dimension.
+    unique_links_fail_count: int = 4
 
     # Gap 1, now closed: the L2 taxonomy was missing from the spec export and
     # check 210 returned not_evaluated rather than a speculative clean. The
@@ -485,6 +854,45 @@ class Policy:
     max_comparison_chars: int = 260000
     max_turn_chars: int = 12000
 
+    # The adjudication pass reads the same conversations under a wider budget, and
+    # the width is the whole point of it.
+    #
+    # Raising `max_conversation_chars` to 160000 did not stop truncation, because
+    # the flag that suppressed a finding was mostly not about the conversation
+    # budget at all: `max_turn_chars` elides the middle of any turn past 12000
+    # characters, and live turns run to 73000 (one task) and 95000 (another). On
+    # three of the four tasks whose check-300 gaps were dropped for truncation,
+    # every turn had been rendered and the conversation was well inside 160000 --
+    # a single long turn set the flag, and the check published clean.
+    #
+    # These budgets exist because the blind pass and the adjudication pass have
+    # different economics. The blind pass makes twelve dimension calls per task and
+    # pays the conversation once per call, so a wide budget there multiplies by
+    # twelve. Adjudication runs only on the two to six dimensions actually in
+    # dispute and asks one narrow question about each, so it can afford to read the
+    # turns at close to full length -- which is what makes its verdict something
+    # other than a confirmation of the blind pass's blind spot, and therefore
+    # something the gate can count.
+    adjudication_max_conversation_chars: int = 400000
+    adjudication_max_comparison_chars: int = 600000
+    adjudication_max_turn_chars: int = 100000
+
+    # Check 450's prompts carry the task's own weighted rubric, and this bounds
+    # it. A contributor who faults a model for not returning a Google Drive link
+    # is quoting rubric criterion 811b1f24 (weight 4), not inventing a standard,
+    # and a judge shown only the conversation reads the difference the wrong way
+    # round: on task 6a7d3a48a9485b6a031cb312, a task human QC scored 5, all five
+    # draws agreed on "inaccurate primary claim", which is a severe condition and
+    # failed a clean task on its own.
+    #
+    # The budget is a guard rather than a routine trim. Across the 60-task
+    # sheet22 run 15 tasks carried a rubric at all, of 18 to 40 criteria, and the
+    # rendered block ran 4.8k characters at the median and 7.8k at the widest --
+    # against a conversation budget of 160000 in the same prompt. Over the cap
+    # the heaviest criteria are kept and the rest are dropped with a count, since
+    # weight is the pipeline's own statement of which requirements matter.
+    max_rubric_prompt_chars: int = 12000
+
     # When a submission's conversation carries no model replies -- hydration
     # failed, or the product only ever published a single final share link, which
     # is the norm for slot B -- the exported chat PDF is the other copy of the
@@ -544,6 +952,17 @@ class Policy:
 
     # Below this share of judgeable items, a rate is not worth publishing: it
     # would be computed over whichever few criteria happened to be text-only.
+    #
+    # Check 450 reads it per model rather than per task, because its calls are
+    # per model: one batched judgment covers all of that model's dimension
+    # justifications, so a call that comes back empty takes a whole side of the
+    # task with it and leaves a denominator that looks merely small. On the
+    # 60-task sheet22 run three tasks audited 8 justifications of the 15 their
+    # own dimension ratings carry -- on one of them (6a7d3a48a9485b6a031cb305)
+    # model B's entire set was absent, the check reported clean, and a replay
+    # with B present failed it at 3/15 with three severe items. A per-task ratio
+    # would not have caught it: 8 of 15 is 53%, over this bar. A per-model one
+    # does, because B's own coverage was zero.
     min_judged_ratio: float = 0.50
 
     def provenance(self) -> dict:

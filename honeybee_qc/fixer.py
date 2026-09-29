@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -72,6 +73,28 @@ from .projects import (
     ProjectProfile,
     profile_by_key,
     profile_for_project,
+)
+from .fixer_invariants import (
+    MUCH_BETTER_RE,
+    RANKING_CONSISTENCY_NOTE,
+    SLIGHTLY_BETTER_RE,
+    TIE_RE,
+    assistant_generated_file,
+    audit_fix_results,
+    audit_task,
+    cited_turns,
+    copied_justification_pairs,
+    dimension_is_na,
+    empty_turns_ok,
+    foreign_slots,
+    form_likert_side,
+    inversion_is_unexplained,
+    is_na_score_token,
+    likert_magnitude_ok,
+    patched_task,
+    sxs_body,
+    write_invariant_report,
+    _preference_side_simple,
 )
 from .registry import check_name
 from .taxonomies import L1_LABELS
@@ -111,27 +134,95 @@ Kind = Literal[
     "produced_final_outcome",
 ]
 
+JUSTIFICATION_VOICE_PROMPT = """
+You rewrite Honeybee QC justifications a reviewer will paste into the form.
+
+Voice
+Write the way a real person talks when they actually looked at the chats and are explaining the call. Complete sentences. Detailed. Concrete. Direct, a little informal, not an essay.
+
+Not rushed. Not fragments. You can land 2–3 points. You cannot be vague.
+
+Name who did the thing. Model A, Model B, Model C, or the user. Never "they" unless the last sentence already named the model and it's still obvious. If a reader has to ask who "they" is, rewrite it.
+
+Not fake. Fake is polished LLM prose, "the model demonstrates", and lists of abstractions (planning, coding, explaining) with no turn and no example.
+
+Do
+- Multiple points are good. Each one needs its own example. "Better at planning, coding, and explaining" is three empty claims
+- Sound like a person: "on turn 6 Model A still recommends the $38 line after the user capped budget." Not like a rubric: "this demonstrates a deficiency in instruction following"
+- Contractions are fine. "I" is fine. Don't perform casualness with one-word sentences
+
+Don't
+- Overexplain the scoring system or restate the dimension definition
+- Recap the entire trajectory
+- Open with Upon reviewing / The model demonstrates / Overall / It is worth noting
+- Em dash (—), en dash (–) as an em dash, spaced --
+
+Banned: delve, tapestry, furthermore, moreover, notably, overall, in conclusion, it is worth noting, multifaceted, robust, nuanced, comprehensive, insightful, seamless, "this highlights", utilize, leverage, "the model demonstrates"
+
+BAD (vague justification, no examples)
+"A was better at planning, coding, and explaining. B was worse at all three. The user had to keep correcting B. I'd pick A."
+
+BAD (who is they?)
+"Turn 7 they cite budget.csv but the uploaded file is spend_sept.csv."
+Who. Model A? Model B? The user? If you mean Model A, write Model A.
+
+BAD (fake-detailed, no real examples for why this is better, just generic jargon)
+"Upon reviewing both trajectories, Model A demonstrates stronger instruction following, more robust tool use, and a more comprehensive final artifact. Turn 4 showcases an initial plan, turn 9 underscores a verification gap, and turn 14 highlights a polished writeup."
+
+BAD (SxS canned)
+"Verdict: Model B is much better (Likert 7/7; 1 = A much better, 7 = B much better). Even though the dimension scores favor Model A, Model B is the SxS winner because the pairwise outcome outweighs the mean of the 1-5s."
+
+GOOD
+"On turn 3 Model A still writes 16:30 after the user asked for 12-hour times, and Model A never corrects it later on. On turn 7 Model A cites budget.csv but the uploaded file is spend_sept.csv, so that path is just wrong. Model A's recap on turn 11 is actually usable (dates and owners are right) which is why this isn't a 1, but those two misses are real, so I'm at a 2."
+
+GOOD (other model, not a copy)
+"Model B switches to 12-hour on turn 3 as soon as the user says am/pm, and the recap keeps 7:30pm not 19:30. On turn 6 Model B uses spend_sept.csv, the file that was actually uploaded. Model B still skips timezone on turn 9 when the user asks whether this is local or UTC, so I'm not giving a 5, but the two things Model A got wrong are handled here."
+
+GOOD (SxS)
+"Model A's 1-5s come out higher because the tables are cleaner and Model A's recap on turn 14 is easier to scan. The actual dealbreaker is turn 8: the user said the cap is $25 and Model A still pushes Bring data, reach sport shop at 38.7533, then repeats that same line on turn 12. Model B's writeup is messier, which is why the means look worse, but on turn 7 Model B drops that set and does not bring it back. That's why Model B wins slightly."
+
+Grounding
+Only the chat and files in front of you. The turn you cite has to contain the thing you claim. A user complaint is not proof of what the model did. N/A: one clear sentence, empty turns.
+
+Scores
+1–5 must match the paragraph. Likert 1–7, only 4 is a tie, 3/5 slight, 1/7 much better. Don't flip the winner. Don't turn a winner into a tie. If you can't ground the change, leave the current text.
+""".strip()
+
 SYSTEM_PROMPT = (
     "You are correcting one field on a Honeybee model-comparison task. An "
     "independent QC audit already failed this task and named the defect. You "
     "do not re-litigate whether the audit is right, except for turn citations: "
     "keep any current citation that supports the claim, even if the audit "
-    "flagged it, and never invent turn numbers to fill an empty list. Change "
+    "flagged it. Never invent a turn number that is not in this conversation. "
+    "If the list is empty and the dimension is scored 1–3, pick the in-range "
+    "model turn(s) whose text supports the justification. A score of 4 or 5 "
+    "may stay empty. N/A must be empty. Change "
     "only the field you were given. Do not invent share links, uploaded files, "
-    "or conversation turns. Write the value a reviewer should paste back into "
+    "or conversation turns. Do not claim a turn contains text that is not in "
+    "the conversation block. Write the value a reviewer should paste back into "
     "the form. A score and its justification (or a Likert and its writeup) "
     "must agree: never leave a high writeup next to a low score, or a "
     "preference paragraph that names the opposite winner from the Likert. "
     "Criterion scores are binary: 0 = not met, 1 = met. Never write 0 to mean "
-    "pass or 1 to mean fail. Dimension ratings are 1-5 (1 worst, 5 best)."
+    "pass or 1 to mean fail. Never raise a criterion from 0 to 1: a contributor "
+    "0 stays 0. Only 1→0 is allowed. Dimension ratings are 1-5 (1 worst, 5 best). "
+    "Dimension 1 is worst, not 'met'. Never describe a dimension score as a "
+    "criterion 0/1. Do not flip a ranking winner and do not move a winner "
+    "to a tie. Stay in the same Likert band (1-3 left, 4 tie, or 5-7 right). "
+    "Name the winner as the slot in this pair (Model A / Model C on an A-vs-C "
+    "task), never a product nickname or a slot that is not in the pair. "
+    "Do not jump a dimension rating by more than 2 points. If a dimension is "
+    "N/A, the score is not-applicable and the turn list is empty.\n\n"
+    + JUSTIFICATION_VOICE_PROMPT
 )
+
 
 def ranking_scale_instruction(comparison: str | None) -> str:
     """Spell 1 as the left slot. Hardcoding A is how D-better writeups shipped as 7.
 
-    Honeybee's paste form is not the auditor's classic bipolar 7. 3-5 are ties.
-    Teaching 3 = 'slightly better left' is how we shipped Likert 3 next to an
-    A-win writeup on a form that means tie.
+    Paste form matches the auditor's classic bipolar 7: only 4 is a tie.
+    3 is a slight left win, 5 is a slight right win. Teaching 3-5 as ties
+    is how we parked real winners on the midpoint.
     """
     left, right = "left", "right"
     if comparison and len(comparison) >= 2:
@@ -139,15 +230,24 @@ def ranking_scale_instruction(comparison: str | None) -> str:
     return f"""
 Likert scale for this comparison (do not invert it):
   1 = Model {left} is much better
-  2 = Model {left} is slightly better
-  3 = tie
+  2 = Model {left} is better
+  3 = Model {left} is slightly better
   4 = tie
-  5 = tie
-  6 = Model {right} is slightly better
+  5 = Model {right} is slightly better
+  6 = Model {right} is better
   7 = Model {right} is much better
-1-2 prefer Model {left}. 3-5 are ties (3 is not a slight {left} win). 6-7 prefer
-Model {right}. A paragraph that prefers Model {left} must be 1-2. A paragraph
-that prefers Model {right} must be 6-7. A tie / mixed / neither writeup must be 3-5.
+1-3 prefer Model {left} (3 is a slight {left} win, not a tie). Only 4 is a tie.
+5-7 prefer Model {right} (5 is a slight {right} win, not a tie). A paragraph
+that prefers Model {left} must be 1-3. A paragraph that prefers Model {right}
+must be 5-7. A tie / mixed / neither writeup must be 4.
+Do not flip the winner and do not move a winner to a tie. If the current
+Likert is 1-3, the new value must stay 1-3. If it is 5-7, stay 5-7. If it
+is already 4, keep 4.
+Name the winner as Model {left} or Model {right}. A product nickname
+(Gemini, ChatGPT, Claude) is only that slot if it is that slot's product.
+"Gemini is better" with Likert 5-7 is a winner flip when Gemini is Model
+{left}. Nearly identical / equivalent / mixed writeups belong on 4, not
+on 1-3 or 5-7.
 """
 
 SCORE_POLARITY_INSTRUCTION = """
@@ -156,6 +256,14 @@ Criterion score polarity (do not invert it):
   1 = the criterion IS met
 Never write 0 because the model did the thing, and never write 1 because it failed.
 Notes must use those words: "met" goes with 1, "not met" goes with 0.
+Never raise a 0 to a 1. If the current score is 0, return 0. A 0→1 paste
+is how rows claimed a criterion was met against the dump.
+"""
+
+DIMENSION_POLARITY_INSTRUCTION = """
+Dimension scores are 1-5 only (1 = worst, 5 = best). They are not criterion
+0/1. Never write "score of 1 (met)", "criterion met", or "dimension met".
+A 1 next to a success writeup (or a 5 next to "failed") is itself a fail.
 """
 
 CRITERION_TEXT_INSTRUCTION = """
@@ -177,6 +285,19 @@ Turn-citation rules for this field:
 - If the current list is already defensible, return it unchanged.
 - Do not invent citations. Do not swap in a "better" turn when the original
   supports the claim. Do not replace a turn you cannot open.
+- Keep every unflagged citation that is still in this conversation. You may
+  drop or replace flagged numbers only. Do not add a turn that was not already
+  cited unless it replaces a flagged one, OR the current list is empty and
+  the dimension is not N/A — then pick the in-range model turn(s) whose text
+  actually supports the justification claim.
+- If this dimension is N/A / no tools / no memory, return an empty list.
+  Never copy another dimension's turns onto an N/A row.
+- A dimension scored 5 may stay empty. Do not invent a cite just to fill a 5.
+- Only cite turn numbers that appear in the conversation above. If a number is
+  not shown, it does not exist. Do not claim the transcript was truncated in
+  order to drop a later turn that is on the page. The model text at the cited
+  turn must support the specific justification claim, not merely share a topic.
+  User-turn complaints are not evidence.
 """
 
 # Score/writeup pairs that must be edited together. Changing one and leaving
@@ -323,6 +444,14 @@ PATCH_COLUMNS = [
 ]
 
 
+# Bump when prompts or apply-gates change so a re-run does not reuse unsafe cache hits.
+FIX_CACHE_VERSION = "v8"
+
+
+def fix_request_key(task_id: str, field_id: str) -> str:
+    return f"fix::{FIX_CACHE_VERSION}::{task_id}::{field_id}"
+
+
 @dataclass
 class FieldJob:
     """One editable form field, one model call."""
@@ -336,6 +465,9 @@ class FieldJob:
     dimension: str | None = None
     comparison: str | None = None  # e.g. "AB"
     flagged_turns: tuple[int, ...] = ()
+    # Hygiene / ranking-companion jobs. Missing model output drops them instead
+    # of writing an error patch that would fail unrelated field tests.
+    optional: bool = False
 
     @property
     def field_id(self) -> str:
@@ -355,6 +487,7 @@ class FieldJob:
             check_ids=checks,
             feedback=feedback,
             flagged_turns=tuple(sorted(set(self.flagged_turns + other.flagged_turns))),
+            optional=self.optional and other.optional,
         )
 
 
@@ -472,9 +605,15 @@ def unfixable_issue_names(fail_checks: list[int], reason: str) -> list[str]:
     if not reason:
         return []
     blocking: list[str] = []
+    lowered_reason = reason.lower()
     for check_id in fail_checks:
         if check_id in TRAJECTORY_CHECKS or check_id == UNAUDITABLE_CHECK:
             name = check_name(check_id)
+            # Unique Links (91) on HTML-export B must not appear as a blocker
+            # just because the eval recorded it. Only names the leftover
+            # reason actually cites are unfixable issues.
+            if check_id != UNAUDITABLE_CHECK and name.lower() not in lowered_reason:
+                continue
             if name not in blocking:
                 blocking.append(name)
     lowered = reason.lower()
@@ -574,11 +713,30 @@ def simplified_turn_count(task: Task) -> int:
     return task.simplified.exchange_count() or len(task.simplified.turn_manifest)
 
 
+def unique_links_html_export_na(task: Task) -> bool:
+    """True when Unique Links (91) must not park this task.
+
+    Spark HTML/MHTML B has no per-turn Gemini share URLs. Re-running 91 on
+    the ingested task yields N/A / not fail. Share-link B that still fails
+    uniqueness stays a trajectory blocker. Tasks with no HTML export keep
+    the ordinary 91 trajectory gate.
+    """
+    from .gates import evaluate_check_91, html_export_without_share_manifest
+
+    if not any(html_export_without_share_manifest(sub) for sub in task.trajectories()):
+        return False
+    return evaluate_check_91(task).band != "fail"
+
+
 def unfixable_reason(task: Task, report_task: dict, profile: ProjectProfile | None) -> str:
     """Why this task cannot be repaired by editing fields. Empty if it can."""
     fails = set(_fail_ids(report_task))
     if report_task.get("verdict") == "unauditable" or UNAUDITABLE_CHECK in fails:
         return "task is unauditable; the submission itself cannot be trusted"
+    # HTML/MHTML Spark B has no per-turn Gemini share URLs. Unique Links (91)
+    # is N/A on that slot — do not park the task or skip 310/400/450/460.
+    if 91 in fails and unique_links_html_export_na(task):
+        fails.discard(91)
     hit = sorted(fails & TRAJECTORY_CHECKS)
     if hit:
         labelled = ", ".join(check_name(n) for n in hit)
@@ -645,6 +803,7 @@ def _companion_job(task: Task, job: FieldJob) -> FieldJob | None:
             feedback=feedback,
             slot=job.slot,
             dimension=job.dimension,
+            optional=job.optional,
         )
     if job.kind == "dimension_justification":
         if not job.slot or not job.dimension:
@@ -657,6 +816,7 @@ def _companion_job(task: Task, job: FieldJob) -> FieldJob | None:
             feedback=feedback,
             slot=job.slot,
             dimension=job.dimension,
+            optional=job.optional,
         )
     if job.kind == "preference_likert":
         sxs = _comparison(task, job.comparison)
@@ -666,6 +826,7 @@ def _companion_job(task: Task, job: FieldJob) -> FieldJob | None:
             current_value=sxs.justification if sxs else "",
             feedback=feedback,
             comparison=job.comparison or (sxs.pair_label if sxs else None),
+            optional=job.optional,
         )
     if job.kind == "preference_justification":
         sxs = _comparison(task, job.comparison)
@@ -675,6 +836,7 @@ def _companion_job(task: Task, job: FieldJob) -> FieldJob | None:
             current_value=sxs.likert if sxs else None,
             feedback=feedback,
             comparison=job.comparison or (sxs.pair_label if sxs else None),
+            optional=job.optional,
         )
     return None
 
@@ -709,6 +871,276 @@ def _ensure_paired_jobs(task: Task, jobs: list[FieldJob]) -> list[FieldJob]:
     return _merge_jobs([*jobs, *extra])
 
 
+def _hygiene_jobs(task: Task) -> list[FieldJob]:
+    """Edits that must happen even when the eval never failed that check.
+
+    Empty N/A copies, file-claim vs checkbox No, 3/5 treated as ties, and
+    unexplained ranking inversions used to ship because nobody asked for them
+    on the next run.
+    """
+    jobs: list[FieldJob] = []
+    for dim in task.dimension_ratings:
+        if not _slot_rewritable(task, dim.model):
+            continue
+        legal = _legal_turns(task, dim.model)
+        current = list(dim.relevant_turns or [])
+        if dimension_is_na(dim):
+            if current:
+                jobs.append(
+                    FieldJob(
+                        kind="dimension_turns",
+                        check_ids=(310,),
+                        slot=dim.model,
+                        dimension=dim.dimension,
+                        current_value=current,
+                        flagged_turns=tuple(current),
+                        feedback=(
+                            "This dimension is N/A. The turn list must be empty. "
+                            "Do not copy cites from another dimension."
+                        ),
+                        optional=True,
+                    )
+                )
+            if dim.rating is not None:
+                jobs.append(
+                    FieldJob(
+                        kind="dimension_rating",
+                        check_ids=(300,),
+                        slot=dim.model,
+                        dimension=dim.dimension,
+                        current_value=dim.rating,
+                        feedback=(
+                            "This dimension is N/A. The score must be "
+                            "not-applicable, not a 1–5."
+                        ),
+                        optional=True,
+                    )
+                )
+            continue
+        cited = cited_turns(dim.justification)
+        current_set = set(current)
+        if cited and current_set and not (cited & current_set):
+            jobs.append(
+                FieldJob(
+                    kind="dimension_turns",
+                    check_ids=(310,),
+                    slot=dim.model,
+                    dimension=dim.dimension,
+                    current_value=current,
+                    flagged_turns=tuple(current),
+                    feedback=(
+                        f"The justification names turns {sorted(cited)} but the "
+                        f"selected list is {current}, and they do not overlap. "
+                        "Replace the list with the in-range cited turns."
+                    ),
+                    optional=True,
+                )
+            )
+        oor = [n for n in current if legal and n not in legal]
+        if oor:
+            jobs.append(
+                FieldJob(
+                    kind="dimension_turns",
+                    check_ids=(310,),
+                    slot=dim.model,
+                    dimension=dim.dimension,
+                    current_value=current,
+                    flagged_turns=tuple(oor),
+                    feedback=(
+                        f"These turn numbers are not in Model {dim.model}'s "
+                        f"conversation: {oor}. Replace them with in-range model "
+                        "turns whose text supports the justification, or drop them."
+                    ),
+                    optional=True,
+                )
+            )
+        elif not current:
+            if empty_turns_ok(dim):
+                continue
+            jobs.append(
+                FieldJob(
+                    kind="dimension_turns",
+                    check_ids=(310,),
+                    slot=dim.model,
+                    dimension=dim.dimension,
+                    current_value=[],
+                    flagged_turns=(),
+                    feedback=(
+                        "This dimension is scored 1–3 and has no turn citations. "
+                        "Read the conversation and pick the in-range model "
+                        "turn(s) whose text supports the justification claim. "
+                        "Only use turn numbers that appear above. Empty is "
+                        "legal for N/A and for a 4 or 5."
+                    ),
+                    optional=True,
+                )
+            )
+        elif current_set == {1} and legal and max(legal) >= 7:
+            jobs.append(
+                FieldJob(
+                    kind="dimension_turns",
+                    check_ids=(310,),
+                    slot=dim.model,
+                    dimension=dim.dimension,
+                    current_value=current,
+                    flagged_turns=(1,),
+                    feedback=(
+                        "Turn 1 is not a usable cite on a long transcript. "
+                        "Pick the in-range model turn whose text supports the "
+                        "justification."
+                    ),
+                    optional=True,
+                )
+            )
+
+    for left_slot, right_slot, dimension in copied_justification_pairs(task):
+        for slot in (left_slot, right_slot):
+            if not _slot_rewritable(task, slot):
+                continue
+            dim = _dim(task, slot, dimension)
+            if dim is None:
+                continue
+            jobs.append(
+                FieldJob(
+                    kind="dimension_justification",
+                    check_ids=(300,),
+                    slot=slot,
+                    dimension=dimension,
+                    current_value=dim.justification,
+                    feedback=(
+                        f"This justification is nearly identical to Model "
+                        f"{right_slot if slot == left_slot else left_slot}'s "
+                        "writeup on the same dimension. Rewrite it from this "
+                        "model's transcript only."
+                    ),
+                    optional=True,
+                )
+            )
+
+    for sub in task.trajectories():
+        if sub.produced_final_outcome is not False:
+            continue
+        generated, reason = assistant_generated_file(sub)
+        if not generated:
+            continue
+        jobs.append(
+            FieldJob(
+                kind="produced_final_outcome",
+                check_ids=(82,),
+                slot=sub.model,
+                current_value=False,
+                feedback=(
+                    f"Model {sub.model} produced-outcome checkbox is No, but the "
+                    f"conversation generated a file ({reason}). Return true."
+                ),
+                optional=True,
+            )
+        )
+
+    for sxs in task.comparison_list():
+        if not _comparison_rewritable(task, sxs.pair_label):
+            continue
+        band = form_likert_side(sxs.likert) or _likert_band(sxs.likert)
+        side = _preference_side_simple(sxs.justification, sxs.left, sxs.right)
+        if side is None:
+            side = _preference_side(sxs.justification, sxs.left, sxs.right, task)
+        needs_sxs = False
+        feedback = ranking_scale_instruction(sxs.pair_label) + RANKING_CONSISTENCY_NOTE
+        if band in {"left", "right"} and side == "tie":
+            needs_sxs = True
+            feedback += (
+                f"\nLikert {sxs.likert} is a win, not a tie. 3 and 5 are slight "
+                "wins. Only 4 is a tie. Rewrite the paragraph so it matches."
+            )
+        elif band in {"left", "right"} and side in {"left", "right"} and side != band:
+            needs_sxs = True
+            feedback += (
+                f"\nLikert {sxs.likert} prefers the {band} slot but the writeup "
+                "prefers the other. They must agree. Do not flip the winner."
+            )
+        if inversion_is_unexplained(task, sxs):
+            needs_sxs = True
+            feedback += (
+                "\nDimension means favor the other model from this Likert. "
+                "Explain the inversion in the writeup with concrete turns "
+                "that name Model A/B/C. Do not open with Verdict or write "
+                "that the pairwise outcome outweighs the mean. If you cannot "
+                "ground it, leave the current text; the Likert/scores will "
+                "not paste."
+            )
+        foreign = foreign_slots(sxs.justification, sxs.left, sxs.right)
+        if foreign:
+            needs_sxs = True
+            feedback += (
+                f"\nThis pair is Model {sxs.left} vs Model {sxs.right}. "
+                f"Do not name Model {', '.join(foreign)}. Overlay Verdict "
+                "lines do not clean the body."
+            )
+        if not likert_magnitude_ok(sxs.likert, sxs.justification):
+            needs_sxs = True
+            feedback += (
+                "\nLikert magnitude must match the wording: 3 and 5 are "
+                "slightly better; 1 and 7 are much better. Ignore the scale "
+                "legend inside a Verdict line."
+            )
+        if not needs_sxs:
+            continue
+        jobs.append(
+            FieldJob(
+                kind="preference_justification",
+                check_ids=(400, 460, 470),
+                comparison=sxs.pair_label,
+                current_value=sxs.justification,
+                feedback=feedback,
+                optional=True,
+            )
+        )
+    return jobs
+
+
+def _ensure_ranking_jobs_for_dim_scores(task: Task, jobs: list[FieldJob]) -> list[FieldJob]:
+    """Changing 1–5s without touching SxS is how Inconsistent Ranking shipped."""
+    if not any(j.kind == "dimension_rating" for j in jobs):
+        return jobs
+    extra: list[FieldJob] = []
+    present = {(_pair_id(j), j.kind) for j in jobs if _pair_id(j)}
+    for sxs in task.comparison_list():
+        if not _comparison_rewritable(task, sxs.pair_label):
+            continue
+        pid = ("rank", sxs.pair_label)
+        feedback = (
+            ranking_scale_instruction(sxs.pair_label)
+            + RANKING_CONSISTENCY_NOTE
+            + "\nDimension scores on this task are also being rewritten. "
+            "The SxS Likert and writeup must stay consistent with the new 1–5s."
+        )
+        if (pid, "preference_likert") not in present:
+            extra.append(
+                FieldJob(
+                    kind="preference_likert",
+                    check_ids=(400, 460),
+                    comparison=sxs.pair_label,
+                    current_value=sxs.likert,
+                    feedback=feedback,
+                    optional=True,
+                )
+            )
+        if (pid, "preference_justification") not in present:
+            extra.append(
+                FieldJob(
+                    kind="preference_justification",
+                    check_ids=(400, 460, 470),
+                    comparison=sxs.pair_label,
+                    current_value=sxs.justification,
+                    feedback=feedback,
+                    optional=True,
+                )
+            )
+    if not extra:
+        return jobs
+    return _merge_jobs([*jobs, *extra])
+
+
 def _wave_jobs(jobs: list[FieldJob]) -> tuple[list[FieldJob], list[FieldJob]]:
     """Scores first, writeups second, so the writeup prompt can see the new score."""
     pair_kinds: dict[tuple, set[str]] = {}
@@ -732,12 +1164,17 @@ def _wave_jobs(jobs: list[FieldJob]) -> tuple[list[FieldJob], list[FieldJob]]:
 
 
 def _flagged_incorrect_citations(
+    task: Task,
     counts: dict[str, Any],
+    *,
+    rest_kind: str,
 ) -> list[tuple[str, str, tuple[int, ...]]]:
     """Items the auditor named as wrong citations, with those turn numbers.
 
     Missing citations and unverifiable fetches are not incorrect selections.
     Rewriting those invents turns the contributor never picked.
+    `rest_kind` is `criterion` (expand UUIDs / skip invented keys) or
+    `dimension` (keep the dimension name).
     """
     reasons = counts.get("reasons_by_item") or {}
     flagged = counts.get("turns_by_item") or {}
@@ -755,7 +1192,11 @@ def _flagged_incorrect_citations(
         slot, rest = _parse_model_item(str(key))
         if slot is None or not rest:
             continue
-        out.append((slot, rest, turns))
+        if rest_kind == "criterion":
+            for cid in _resolve_criterion_ids(task, rest):
+                out.append((slot, cid, turns))
+        else:
+            out.append((slot, rest, turns))
     return out
 
 
@@ -800,6 +1241,19 @@ def _normalize_dimension(raw: str) -> str:
     return text
 
 
+def _canonical_dimension(raw: str) -> str | None:
+    """Real form dimension, or None. Title-as-id / parenthetical bags are dropped."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    stripped = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    for candidate in (text, stripped):
+        name = _normalize_dimension(candidate)
+        if name in DIMENSION_TO_PREFIX:
+            return name
+    return None
+
+
 def _parse_model_item(item: str) -> tuple[str | None, str]:
     """`A::C1` or `D::Outcome quality` -> (slot, rest). Bare ids stay (None, item)."""
     text = str(item)
@@ -814,6 +1268,105 @@ def _parse_model_item(item: str) -> tuple[str | None, str]:
         if left in _RATING_SLOTS:
             return left, right
     return None, text
+
+
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_INVENTED_CRITERION_PREFIXES = ("missing::", "overlap::", "bulk_")
+
+
+def _resolve_criterion_ids(task: Task, raw: str) -> list[str]:
+    """Map an auditor item onto real rubric ids. Invented keys become nothing.
+
+    280/281 sometimes emit `B::[uuid] [uuid]` or a criterion title instead of
+    the form id. Writing those through as `criteria[[uuid] …]` is how paste
+    sheets landed on fields that do not exist.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if text.startswith(_INVENTED_CRITERION_PREFIXES):
+        return []
+    if text.lower().startswith("criterion_"):
+        text = text[len("criterion_") :]
+    if len(text) >= 2 and text[0] == "[" and text[-1] == "]" and text.count("[") == 1:
+        text = text[1:-1].strip()
+    rubric_ids = {c.criterion_id for c in task.rubric}
+    found = [u for u in _UUID_RE.findall(text) if u in rubric_ids]
+    if found:
+        return list(dict.fromkeys(found))
+    if text in rubric_ids:
+        return [text]
+    collapsed = " ".join(text.split())
+    for crit in task.rubric:
+        if " ".join(crit.text.split()) == collapsed:
+            return [crit.criterion_id]
+    return []
+
+
+def _slot_rewritable(task: Task, slot: str | None) -> bool:
+    """Skip score/turn/dim rewrites when that slot has no real conversation.
+
+    A one-exchange marketing stub is not a trajectory. Citing Turn 19 on it is
+    how paste rows named turns that are not in the dump. A fetch that failed
+    or a share page that loaded dead is the same: there is nothing to cite.
+    """
+    if not slot:
+        return False
+    if slot == "S":
+        return task.simplified is not None
+    sub = task.submission(slot)  # type: ignore[arg-type]
+    if sub is None:
+        return False
+    if sub.share_page_dead or sub.fetch_failed:
+        return False
+    indices = sub.turn_indices()
+    if not indices:
+        return False
+    return sub.exchange_count() >= 2 and max(indices) >= 4
+
+
+def _comparison_rewritable(task: Task, comparison: str | None) -> bool:
+    """Skip ranking when either side is a stub or missing conversation."""
+    if not comparison or len(comparison) < 2:
+        return False
+    return all(_slot_rewritable(task, slot) for slot in comparison[:2])
+
+
+def _legal_turns(task: Task, slot: str | None) -> set[int]:
+    if not slot:
+        return set()
+    sub = task.submission(slot)  # type: ignore[arg-type]
+    if sub is None:
+        return set()
+    return sub.turn_indices()
+
+
+def _filter_turn_values(task: Task, slot: str | None, value: Any) -> Any:
+    """Drop turn numbers that are not in this slot's conversation.
+
+    An empty list is a real value (N/A, or every cite was illegal). `None`
+    means "could not interpret", which is not the same as "paste []".
+    """
+    allowed = _legal_turns(task, slot)
+    if isinstance(value, int):
+        if not allowed:
+            return None
+        return value if value in allowed else None
+    if isinstance(value, list):
+        kept = []
+        for item in value:
+            try:
+                n = int(item)
+            except (TypeError, ValueError):
+                continue
+            if not allowed or n in allowed:
+                kept.append(n)
+        if allowed:
+            return kept
+        return kept if not value else None
+    return None
 
 
 def _jobs_from_check(
@@ -912,6 +1465,8 @@ def _jobs_from_check(
                 if kt.turn_index == 1 or kt.over_flagged:
                     slots.append(slot)
         for slot in dict.fromkeys(slots):
+            if not _slot_rewritable(task, slot):
+                continue
             sub = task.submission(slot)  # type: ignore[arg-type]
             current = sub.key_turn.turn_index if sub else task.key_turn.turn_index
             jobs.append(
@@ -933,6 +1488,8 @@ def _jobs_from_check(
             slot = slot or (item if item in _PRODUCT_SLOTS else None)
             if not slot or slot in seen:
                 continue
+            if not _slot_rewritable(task, slot):
+                continue
             seen.add(slot)
             sub = task.submission(slot)  # type: ignore[arg-type]
             just = (sub.key_turn.justification if sub else "") or task.key_turn.justification
@@ -950,75 +1507,75 @@ def _jobs_from_check(
     if check_id == 200:
         findings = extra.get("rubric_findings") or []
         for item in items:
-            crit = _criterion(task, item)
-            auditor = ""
-            for finding in findings:
-                if finding.get("criterion_id") == item and finding.get("l1"):
-                    auditor = finding["l1"].get("auditor") or ""
-            jobs.append(
-                FieldJob(
-                    kind="criterion_l1",
-                    check_ids=(200,),
-                    criterion_id=item,
-                    current_value=crit.l1_label if crit else "",
-                    feedback=feedback
-                    + (f"\nAuditor L1: {auditor}" if auditor else ""),
+            for cid in _resolve_criterion_ids(task, item):
+                crit = _criterion(task, cid)
+                auditor = ""
+                for finding in findings:
+                    if finding.get("criterion_id") == cid and finding.get("l1"):
+                        auditor = finding["l1"].get("auditor") or ""
+                jobs.append(
+                    FieldJob(
+                        kind="criterion_l1",
+                        check_ids=(200,),
+                        criterion_id=cid,
+                        current_value=crit.l1_label if crit else "",
+                        feedback=feedback
+                        + (f"\nAuditor L1: {auditor}" if auditor else ""),
+                    )
                 )
-            )
         return jobs
 
     if check_id in RUBRIC_QUALITY_CHECKS:
         findings = extra.get("rubric_findings") or []
         by_id = {f.get("criterion_id"): f for f in findings}
         for item in items:
-            # Auditor-invented ids (missing::<something>) are not pasteable
-            # rubric rows. Writing "Not met" into a fake key is how we shipped
-            # verdicts as criterion text.
-            if str(item).startswith("missing::"):
-                continue
-            crit = _criterion(task, item)
-            issue_lines = []
-            for issue in (by_id.get(item) or {}).get("issues") or []:
-                issue_lines.append(
-                    f"[{issue.get('category')}] {issue.get('description')} "
-                    f"(evidence: {issue.get('evidence')})"
+            for cid in _resolve_criterion_ids(task, item):
+                crit = _criterion(task, cid)
+                if crit is None:
+                    continue
+                issue_lines = []
+                for issue in (by_id.get(cid) or {}).get("issues") or []:
+                    issue_lines.append(
+                        f"[{issue.get('category')}] {issue.get('description')} "
+                        f"(evidence: {issue.get('evidence')})"
+                    )
+                jobs.append(
+                    FieldJob(
+                        kind="criterion_text",
+                        check_ids=(check_id,),
+                        criterion_id=cid,
+                        current_value=crit.text,
+                        feedback=feedback
+                        + (("\n" + "\n".join(issue_lines)) if issue_lines else ""),
+                    )
                 )
-            jobs.append(
-                FieldJob(
-                    kind="criterion_text",
-                    check_ids=(check_id,),
-                    criterion_id=item,
-                    current_value=crit.text if crit else "",
-                    feedback=feedback
-                    + (("\n" + "\n".join(issue_lines)) if issue_lines else ""),
-                )
-            )
         return jobs
 
     if check_id == 260:
         findings = extra.get("rubric_findings") or []
         by_id = {f.get("criterion_id"): f for f in findings}
         for item in items:
-            if str(item).startswith("missing::"):
-                continue
-            crit = _criterion(task, item)
-            weight_info = (by_id.get(item) or {}).get("weight") or {}
-            jobs.append(
-                FieldJob(
-                    kind="criterion_weight",
-                    check_ids=(260,),
-                    criterion_id=item,
-                    current_value=crit.weight if crit else None,
-                    feedback=feedback
-                    + (
-                        f"\nDefensible range: {weight_info.get('defensible_low')}"
-                        f"-{weight_info.get('defensible_high')}; auditor pick "
-                        f"{weight_info.get('auditor')}"
-                        if weight_info
-                        else ""
-                    ),
+            for cid in _resolve_criterion_ids(task, item):
+                crit = _criterion(task, cid)
+                if crit is None:
+                    continue
+                weight_info = (by_id.get(cid) or {}).get("weight") or {}
+                jobs.append(
+                    FieldJob(
+                        kind="criterion_weight",
+                        check_ids=(260,),
+                        criterion_id=cid,
+                        current_value=crit.weight,
+                        feedback=feedback
+                        + (
+                            f"\nDefensible range: {weight_info.get('defensible_low')}"
+                            f"-{weight_info.get('defensible_high')}; auditor pick "
+                            f"{weight_info.get('auditor')}"
+                            if weight_info
+                            else ""
+                        ),
+                    )
                 )
-            )
         return jobs
 
     if check_id in (270, 271):
@@ -1030,24 +1587,29 @@ def _jobs_from_check(
         ]
         allowed = {"S"} if check_id == 271 else _PRODUCT_SLOTS
         for item in disagreeing:
-            slot, criterion_id = _parse_model_item(str(item))
-            if not slot or not criterion_id or slot not in allowed:
+            slot, rest = _parse_model_item(str(item))
+            if not slot or slot not in allowed or not _slot_rewritable(task, slot):
                 continue
-            rating = _rating(task, criterion_id, slot)
-            jobs.append(
-                FieldJob(
-                    kind="criterion_score",
-                    check_ids=(check_id,),
-                    slot=slot,
-                    criterion_id=criterion_id,
-                    current_value=rating.score if rating else None,
-                    feedback=feedback,
+            for criterion_id in _resolve_criterion_ids(task, rest):
+                rating = _rating(task, criterion_id, slot)
+                jobs.append(
+                    FieldJob(
+                        kind="criterion_score",
+                        check_ids=(check_id,),
+                        slot=slot,
+                        criterion_id=criterion_id,
+                        current_value=rating.score if rating else None,
+                        feedback=feedback,
+                    )
                 )
-            )
         return jobs
 
     if check_id in (280, 281):
-        for slot, criterion_id, flagged in _flagged_incorrect_citations(counts):
+        for slot, criterion_id, flagged in _flagged_incorrect_citations(
+            task, counts, rest_kind="criterion"
+        ):
+            if not _slot_rewritable(task, slot):
+                continue
             spec = profile.trajectory(slot) if profile is not None else None
             if spec is not None and not spec.turns_step:
                 continue
@@ -1076,32 +1638,45 @@ def _jobs_from_check(
         ] or items
         for item in keys:
             slot, dimension = _parse_model_item(str(item))
-            if not slot or not dimension:
+            if not slot or not dimension or not _slot_rewritable(task, slot):
                 continue
-            dim = _dim(task, slot, _normalize_dimension(dimension))
+            canonical = _canonical_dimension(dimension)
+            if not canonical:
+                continue
+            dim = _dim(task, slot, canonical)
+            if dim is None:
+                continue
             jobs.append(
                 FieldJob(
                     kind="dimension_rating",
                     check_ids=(check_id,),
                     slot=slot,
-                    dimension=_normalize_dimension(dimension),
-                    current_value=dim.rating if dim else None,
+                    dimension=canonical,
+                    current_value=dim.rating,
                     feedback=feedback,
                 )
             )
         return jobs
 
     if check_id == 310:
-        for slot, dimension, flagged in _flagged_incorrect_citations(counts):
-            canonical = _normalize_dimension(dimension)
+        for slot, dimension, flagged in _flagged_incorrect_citations(
+            task, counts, rest_kind="dimension"
+        ):
+            if not _slot_rewritable(task, slot):
+                continue
+            canonical = _canonical_dimension(dimension)
+            if not canonical:
+                continue
             dim = _dim(task, slot, canonical)
+            if dim is None:
+                continue
             jobs.append(
                 FieldJob(
                     kind="dimension_turns",
                     check_ids=(310,),
                     slot=slot,
                     dimension=canonical,
-                    current_value=list(dim.relevant_turns) if dim else [],
+                    current_value=list(dim.relevant_turns),
                     flagged_turns=flagged,
                     feedback=feedback
                     + f"\nFlagged citations (replace only if truly unsupported): {list(flagged)}",
@@ -1111,6 +1686,8 @@ def _jobs_from_check(
 
     if check_id == 400:
         for sxs in task.comparison_list():
+            if not _comparison_rewritable(task, sxs.pair_label):
+                continue
             jobs.append(
                 FieldJob(
                     kind="preference_likert",
@@ -1135,6 +1712,8 @@ def _jobs_from_check(
                 if "::" in str(item):
                     label = str(item).split("::", 1)[1]
                 sxs = _comparison(task, label)
+                if sxs is None or not _comparison_rewritable(task, sxs.pair_label):
+                    continue
                 jobs.append(
                     FieldJob(
                         kind="preference_justification",
@@ -1148,14 +1727,21 @@ def _jobs_from_check(
             slot, dimension = _parse_model_item(str(item))
             if not slot or not dimension:
                 continue
-            dim = _dim(task, slot, dimension)
+            if not _slot_rewritable(task, slot):
+                continue
+            canonical = _canonical_dimension(dimension)
+            if not canonical:
+                continue
+            dim = _dim(task, slot, canonical)
+            if dim is None:
+                continue
             jobs.append(
                 FieldJob(
                     kind="dimension_justification",
                     check_ids=(450,),
                     slot=slot,
-                    dimension=dimension,
-                    current_value=dim.justification if dim else "",
+                    dimension=canonical,
+                    current_value=dim.justification,
                     feedback=extra_fb,
                 )
             )
@@ -1163,6 +1749,8 @@ def _jobs_from_check(
 
     if check_id == 470:
         for sxs in task.comparison_list():
+            if not _comparison_rewritable(task, sxs.pair_label):
+                continue
             jobs.append(
                 FieldJob(
                     kind="preference_justification",
@@ -1185,8 +1773,6 @@ def plan_task(
 ) -> FixPlan:
     fails = _fail_ids(report_task)
     verdict = report_task.get("verdict") or ""
-    if verdict in {"clean", "pass_with_issues"} and not fails:
-        return FixPlan(task_id=task.task_id, status="skipped", fail_checks=fails)
 
     leftover = unfixable_reason(task, report_task, profile)
     if leftover.startswith("task is unauditable"):
@@ -1199,19 +1785,26 @@ def plan_task(
 
     extra = extra or {}
     skip_checks = set(UNFIXABLE_CHECKS)
+    html_na_91 = 91 in fails and unique_links_html_export_na(task)
     # Turn count is a property of the conversation. Score flips cannot shorten S.
     if leftover and (
         "turn" in leftover.lower() or "outside" in leftover.lower()
     ):
         skip_checks.add(97)
-    jobs: list[FieldJob] = []
-    for check in report_task.get("checks") or []:
-        if check.get("check_id") in skip_checks:
-            continue
-        jobs.extend(_jobs_from_check(task, check, extra, profile))
-    jobs = _ensure_paired_jobs(task, _merge_jobs(jobs))
+    jobs: list[FieldJob] = list(_hygiene_jobs(task))
+    if not (verdict in {"clean", "pass_with_issues"} and not fails):
+        for check in report_task.get("checks") or []:
+            if check.get("check_id") in skip_checks:
+                continue
+            jobs.extend(_jobs_from_check(task, check, extra, profile))
+    jobs = _ensure_ranking_jobs_for_dim_scores(
+        task, _ensure_paired_jobs(task, _merge_jobs(jobs))
+    )
     if not jobs:
-        actionable = [c for c in fails if c not in FIXER_IGNORED_CHECKS]
+        ignore = set(FIXER_IGNORED_CHECKS)
+        if html_na_91:
+            ignore.add(91)
+        actionable = [c for c in fails if c not in ignore]
         if not actionable and not leftover:
             return FixPlan(
                 task_id=task.task_id,
@@ -1331,6 +1924,7 @@ def build_fix_request(
     job: FieldJob,
     policy: Policy = DEFAULT_POLICY,
     paired_corrected_value: Any = None,
+    dimension_score_table: str | None = None,
 ) -> ModelRequest:
     where = []
     if job.slot:
@@ -1351,6 +1945,12 @@ def build_fix_request(
             f"to:\n\n{json.dumps(paired_corrected_value, ensure_ascii=False)}\n\n"
             "Write this field so it defends that value. Do not contradict it.\n"
         )
+    if dimension_score_table:
+        paired_block += (
+            "\n## Dimension scores (including corrections from this pass)\n\n"
+            f"{dimension_score_table}\n"
+            + RANKING_CONSISTENCY_NOTE
+        )
 
     turn_block = ""
     if job.kind in {"criterion_turns", "dimension_turns"}:
@@ -1359,12 +1959,21 @@ def build_fix_request(
             turn_block += (
                 f"\nFlagged as incorrect: {list(job.flagged_turns)}\n"
             )
+        legal = sorted(_legal_turns(task, job.slot))
+        if legal:
+            turn_block += (
+                f"\nLegal turn numbers for Model {job.slot}: {legal}. "
+                "Do not cite any other number.\n"
+            )
     if job.kind in {"preference_likert", "preference_justification"}:
         turn_block += "\n" + ranking_scale_instruction(job.comparison)
+        turn_block += RANKING_CONSISTENCY_NOTE
         if job.comparison:
             turn_block += f"This field is the {job.comparison} pair.\n"
     if job.kind == "criterion_score":
         turn_block += "\n" + SCORE_POLARITY_INSTRUCTION
+    if job.kind in {"dimension_rating", "dimension_justification"}:
+        turn_block += "\n" + DIMENSION_POLARITY_INSTRUCTION
     if job.kind == "criterion_text":
         turn_block += "\n" + CRITERION_TEXT_INSTRUCTION
 
@@ -1401,7 +2010,7 @@ above, this value must agree with it.
 {turn_block}
 """
     return ModelRequest(
-        key=f"fix::{task.task_id}::{job.field_id}",
+        key=fix_request_key(task.task_id, job.field_id),
         prompt=prompt,
         schema=SCHEMAS[job.kind],
         system=SYSTEM_PROMPT,
@@ -1448,6 +2057,930 @@ def _apply_ceiling(
     return ""
 
 
+_MET_WITHOUT_NOT = re.compile(
+    r"\b(?:is met|criterion is met|dimension met|indicate .{0,40}met|score of 1\s*\(\s*met\s*\))\b",
+    re.I,
+)
+_NOT_MET = re.compile(r"\bnot met\b", re.I)
+_SUCCESS_ON_ZERO = re.compile(
+    r"\b(?:would execute|without errors|successfully (?:met|produced|created|ran)|"
+    r"did the thing|is met|was met)\b",
+    re.I,
+)
+_DIM_ONE_AS_MET = re.compile(
+    r"score of 1\s*\(\s*(?:met|criterion met)\s*\)|1\s*\(\s*criterion met\s*\)|"
+    r"paired score of 1\s*\(\s*met\s*\)|\bdimension met\b|\bcriterion met\b",
+    re.I,
+)
+_RATING_PROSE = re.compile(
+    r"\b(?:not met|satisfied|corrected to|model [abcd] (?:passed|failed)|score of [01])\b",
+    re.I,
+)
+_HIGH_PRAISE = re.compile(
+    r"\b(?:perfect|excellent|no issues|outstanding|fully (?:met|delivered))\b", re.I
+)
+_LOW_PAN = re.compile(
+    r"\b(?:failed badly|unusable|worst|did not deliver|severely compromised)\b", re.I
+)
+
+
+def _likert_band(value: Any) -> str | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    if n in (1, 2, 3):
+        return "left"
+    if n == 4:
+        return "tie"
+    if n in (5, 6, 7):
+        return "right"
+    return None
+
+
+def _likert_move_ok(old: Any, new: Any) -> bool:
+    """Paste-safe: stay in the same band. Winner→tie fights the dump."""
+    new_band = _likert_band(new)
+    if new_band is None:
+        return False
+    old_band = _likert_band(old)
+    if old_band is None:
+        return True
+    return old_band == new_band
+
+
+def _provider_aliases(sub: Any) -> tuple[str, ...]:
+    """Nicknames a preference writeup might use instead of Model A / Model B."""
+    if sub is None:
+        return ()
+    blob = f"{getattr(sub, 'declared_provider', '')} {getattr(sub, 'final_link', '')}".lower()
+    aliases: list[str] = []
+    if "gemini" in blob:
+        aliases.extend(["gemini", "google gemini"])
+    if any(token in blob for token in ("chatgpt", "openai.com", "chatgpt.com")):
+        aliases.extend(["chatgpt", "chat gpt", "gpt-4", "gpt-5", "gpt"])
+    if "claude" in blob:
+        aliases.extend(["claude", "anthropic"])
+    return tuple(dict.fromkeys(aliases))
+
+
+def _side_win(text: str, slot: str, aliases: tuple[str, ...]) -> bool:
+    """True when the writeup names this slot (or its product) as the winner."""
+    names = sorted({slot.lower(), *[a.lower() for a in aliases]}, key=len, reverse=True)
+    for name in names:
+        if len(name) == 1:
+            win = re.search(
+                rf"\b(?:model|product|response)\s+{re.escape(name)}\s+"
+                rf"(?:is\s+|was\s+)?(?:much |slightly |clearly )?"
+                rf"(?:better|ahead|preferred)\b",
+                text,
+            ) or re.search(
+                rf"\bprefer(?:s|red)?\s+(?:model\s+)?{re.escape(name)}\b",
+                text,
+            )
+        else:
+            win = re.search(
+                rf"\b{re.escape(name)}\s+(?:is\s+|was\s+|looks\s+)?"
+                rf"(?:much |slightly |clearly )?(?:better|ahead|preferred)\b",
+                text,
+            ) or re.search(
+                rf"\bprefer(?:s|red)?\s+{re.escape(name)}\b",
+                text,
+            )
+        if win:
+            return True
+    return False
+
+
+def _preference_side(
+    text: str, left: str, right: str, task: Task | None = None
+) -> str | None:
+    """left / right / tie if the writeup is explicit, else None.
+
+    Detection matches `audit_task`: TIE_RE on the body (Verdict legend ignored),
+    then an explicit Model/Response winner. Provider nicknames are a fallback.
+    """
+    lower = sxs_body(text or "").lower()
+    if TIE_RE.search(lower):
+        return "tie"
+    left_aliases = right_aliases = ()
+    if task is not None:
+        left_aliases = _provider_aliases(task.submission(left))  # type: ignore[arg-type]
+        right_aliases = _provider_aliases(task.submission(right))  # type: ignore[arg-type]
+    left_win = _side_win(lower, left, left_aliases)
+    right_win = _side_win(lower, right, right_aliases)
+    if left_win and not right_win:
+        return "left"
+    if right_win and not left_win:
+        return "right"
+    return None
+
+
+def _criterion_notes_ok(value: Any, notes: str) -> bool:
+    text = notes or ""
+    if int(value) == 0:
+        if _MET_WITHOUT_NOT.search(text) and not _NOT_MET.search(text):
+            return False
+        if _SUCCESS_ON_ZERO.search(text) and not _NOT_MET.search(text):
+            return False
+    if int(value) == 1 and _NOT_MET.search(text) and not re.search(
+        r"\b(?:is met|was met|now met)\b", text, re.I
+    ):
+        return False
+    return True
+
+
+def _dimension_text_ok(value: Any, text: str) -> bool:
+    blob = text or ""
+    if _DIM_ONE_AS_MET.search(blob):
+        return False
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return True
+    if n <= 2 and _HIGH_PRAISE.search(blob):
+        return False
+    if n >= 4 and _LOW_PAN.search(blob):
+        return False
+    return True
+
+
+def _turn_has_model_text(task: Task, slot: str | None, index: int) -> bool:
+    if not slot:
+        return True
+    sub = task.submission(slot)  # type: ignore[arg-type]
+    if sub is None or not sub.conversation:
+        return True
+    return any(
+        t.index == index and t.role == "assistant" and (t.text or "").strip()
+        for t in sub.conversation
+    )
+
+
+def _kept_turns(
+    task: Task,
+    job: FieldJob,
+    old: Any,
+    new: list[int],
+    flagged: tuple[int, ...],
+    legal: set[int],
+    force_align: bool = False,
+) -> list[int] | None:
+    """Keep unflagged cites; only add a turn as a replacement for a flagged one.
+
+    Empty is legal for N/A. Filling a previously empty non-N/A list is how we
+    stop shipping blank turn annotations. `force_align` bypasses the "no adds
+    unless flagged" rule for deterministic selected↔cited alignment.
+    """
+    dim = (
+        _dim(task, job.slot or "", job.dimension or "")
+        if job.kind == "dimension_turns"
+        else None
+    )
+    if dim is not None and dimension_is_na(dim):
+        return []
+    kept = [n for n in new if (not legal or n in legal)]
+    if legal:
+        kept = [
+            n for n in kept if n in legal and _turn_has_model_text(task, job.slot, n)
+        ]
+    old_nums: list[int] = []
+    if isinstance(old, list):
+        for item in old:
+            try:
+                old_nums.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    old_set = set(old_nums)
+    flagged_set = set(flagged or ())
+    if not old_nums:
+        return kept
+    if not kept:
+        if dim is not None and not dimension_is_na(dim):
+            return None
+        if flagged_set and not ((old_set - flagged_set) & (legal or old_set)):
+            return []
+        return None
+    unflagged = (old_set - flagged_set) & (legal or old_set)
+    new_set = set(kept)
+    if unflagged and not unflagged <= new_set and not force_align:
+        return None
+    added = new_set - old_set
+    if added and not flagged_set and not force_align:
+        return None
+    return kept
+
+
+def _text_cites_illegal_turns(task: Task, job: FieldJob, text: str) -> bool:
+    cited = {int(n) for n in re.findall(r"\bturns?\s+(\d+)\b", text or "", re.I)}
+    cited |= {int(n) for n in re.findall(r"\bT(\d+)\b", text or "")}
+    if not cited:
+        return False
+    if job.comparison and len(job.comparison) >= 2:
+        legal = _legal_turns(task, job.comparison[0]) | _legal_turns(
+            task, job.comparison[1]
+        )
+    else:
+        legal = _legal_turns(task, job.slot)
+    if not legal:
+        return True
+    return bool(cited - legal)
+
+
+def _guard_new_value(task: Task, job: FieldJob, new_value: Any, notes: str) -> Any | None:
+    """None means drop the patch: it would not be paste-safe."""
+    if job.kind in {
+        "dimension_justification",
+        "preference_justification",
+        "key_turn_justification",
+    } and _text_cites_illegal_turns(
+        task, job, f"{notes or ''} {new_value if isinstance(new_value, str) else ''}"
+    ):
+        return None
+
+    if job.kind == "criterion_score":
+        try:
+            n = int(new_value)
+        except (TypeError, ValueError):
+            return None
+        if n not in (0, 1):
+            return None
+        try:
+            old = int(job.current_value)
+        except (TypeError, ValueError):
+            old = None
+        if old == 0 and n == 1:
+            return None
+        if not _criterion_notes_ok(n, notes):
+            return None
+        return n
+
+    if job.kind == "criterion_weight":
+        try:
+            n = int(new_value)
+        except (TypeError, ValueError):
+            return None
+        if n not in (1, 2, 3, 4, 5):
+            return None
+        try:
+            old = int(job.current_value)
+        except (TypeError, ValueError):
+            old = n
+        if abs(n - old) > 2:
+            return None
+        return n
+
+    if job.kind == "criterion_text":
+        text = str(new_value or "").strip()
+        if not text or _RATING_PROSE.search(text):
+            return None
+        return text
+
+    if job.kind == "dimension_rating":
+        if is_na_score_token(new_value):
+            dim = _dim(task, job.slot or "", job.dimension or "")
+            if dim is not None and dimension_is_na(dim):
+                return "not-applicable"
+            return None
+        try:
+            n = int(new_value)
+        except (TypeError, ValueError):
+            return None
+        if n not in (1, 2, 3, 4, 5):
+            return None
+        try:
+            old = int(job.current_value)
+        except (TypeError, ValueError):
+            old = n
+        if abs(n - old) > 2:
+            return None
+        if not _dimension_text_ok(n, notes):
+            return None
+        return n
+
+    if job.kind == "dimension_justification":
+        text = str(new_value or "").strip()
+        if not text:
+            return None
+        dim = _dim(task, job.slot or "", job.dimension or "")
+        score = dim.rating if dim else 3
+        if not _dimension_text_ok(score, notes + " " + text):
+            return None
+        return text
+
+    if job.kind == "preference_likert":
+        try:
+            n = int(new_value)
+        except (TypeError, ValueError):
+            return None
+        if n not in (1, 2, 3, 4, 5, 6, 7):
+            return None
+        if not _likert_move_ok(job.current_value, n):
+            return None
+        if not _comparison_rewritable(task, job.comparison):
+            return None
+        return n
+
+    if job.kind == "preference_justification":
+        text = str(new_value or "").strip()
+        if not text:
+            return None
+        if not _comparison_rewritable(task, job.comparison):
+            return None
+        left = (job.comparison or "AB")[0]
+        right = (job.comparison or "AB")[1]
+        if foreign_slots(text, left, right):
+            return None
+        side = _preference_side_simple(text, left, right)
+        if side is None:
+            side = _preference_side(text, left, right, task)
+        band = form_likert_side(job.current_value) or _likert_band(job.current_value)
+        sxs = _comparison(task, job.comparison)
+        if sxs is not None:
+            band = form_likert_side(sxs.likert) or band
+            left, right = sxs.left, sxs.right
+            if foreign_slots(text, left, right):
+                return None
+            if not likert_magnitude_ok(sxs.likert, text):
+                return None
+            side = _preference_side_simple(text, left, right)
+            if side is None:
+                side = _preference_side(text, left, right, task)
+        elif not likert_magnitude_ok(job.current_value, text):
+            return None
+        if side and band and side != band:
+            return None
+        return text
+
+    if job.kind == "produced_final_outcome":
+        if not isinstance(new_value, bool):
+            text = str(new_value).strip().lower()
+            if text in {"true", "yes", "1"}:
+                new_value = True
+            elif text in {"false", "no", "0"}:
+                new_value = False
+            else:
+                return None
+        sub = task.submission(job.slot) if job.slot else None  # type: ignore[arg-type]
+        generated, _reason = assistant_generated_file(sub)
+        old = job.current_value
+        if old is False and new_value is True and not generated:
+            return None
+        if old is True and new_value is False and generated:
+            return None
+        return bool(new_value)
+
+    if job.kind == "key_turn_index":
+        try:
+            n = int(new_value)
+        except (TypeError, ValueError):
+            return None
+        if n == 1:
+            return None
+        return n
+
+    return new_value
+
+
+def _drop_inconsistent_pairs(task: Task, patches: list[FieldPatch]) -> list[FieldPatch]:
+    by_pair: dict[tuple, list[FieldPatch]] = {}
+    unpaired: list[FieldPatch] = []
+    for patch in patches:
+        dummy = FieldJob(
+            kind=patch.kind,  # type: ignore[arg-type]
+            check_ids=tuple(patch.check_ids),
+            current_value=patch.old_value,
+            feedback="",
+            slot=patch.slot,
+            criterion_id=patch.criterion_id,
+            dimension=patch.dimension,
+            comparison=patch.comparison,
+        )
+        pid = _pair_id(dummy)
+        if pid is None:
+            unpaired.append(patch)
+            continue
+        by_pair.setdefault(pid, []).append(patch)
+
+    kept: list[FieldPatch] = []
+    drop: set[int] = set()
+    for group in by_pair.values():
+        rating = next((p for p in group if p.kind in _SCORE_KINDS), None)
+        just = next((p for p in group if p.kind in _JUSTIF_KINDS), None)
+        if rating and just:
+            if rating.kind == "preference_likert":
+                left = (rating.comparison or "AB")[0]
+                right = (rating.comparison or "AB")[1]
+                just_text = str(just.new_value or "")
+                sxs = _comparison(task, rating.comparison)
+                if sxs is not None:
+                    left, right = sxs.left, sxs.right
+                side = _preference_side_simple(just_text, left, right)
+                if side is None:
+                    side = _preference_side(just_text, left, right, task)
+                band = form_likert_side(rating.new_value) or _likert_band(rating.new_value)
+                if side and band and side != band:
+                    drop.add(id(rating))
+                    drop.add(id(just))
+                    continue
+                if foreign_slots(just_text, left, right):
+                    drop.add(id(rating))
+                    drop.add(id(just))
+                    continue
+                if not likert_magnitude_ok(rating.new_value, just_text):
+                    drop.add(id(rating))
+                    drop.add(id(just))
+                    continue
+            if rating.kind == "dimension_rating":
+                if not _dimension_text_ok(rating.new_value, str(just.new_value or "")):
+                    drop.add(id(rating))
+                    drop.add(id(just))
+                    continue
+        elif just and not rating:
+            if just.kind == "preference_justification":
+                left = (just.comparison or "AB")[0]
+                right = (just.comparison or "AB")[1]
+                just_text = str(just.new_value or "")
+                sxs = _comparison(task, just.comparison)
+                if sxs is not None:
+                    left, right = sxs.left, sxs.right
+                side = _preference_side_simple(just_text, left, right)
+                if side is None:
+                    side = _preference_side(just_text, left, right, task)
+                band = _likert_band(just.old_value)
+                if sxs is not None:
+                    band = form_likert_side(sxs.likert) or band
+                if side and band and side != band:
+                    drop.add(id(just))
+                    continue
+                if foreign_slots(just_text, left, right):
+                    drop.add(id(just))
+                    continue
+                likert = sxs.likert if sxs is not None else just.old_value
+                if not likert_magnitude_ok(likert, just_text):
+                    drop.add(id(just))
+                    continue
+            if just.kind == "dimension_justification" and not _dimension_text_ok(
+                None, str(just.new_value or "")
+            ):
+                drop.add(id(just))
+                continue
+        kept.extend(group)
+    kept = [p for p in kept if id(p) not in drop]
+    return unpaired + kept
+
+
+def _drop_unexplained_ranking_inversions(
+    task: Task, patches: list[FieldPatch]
+) -> list[FieldPatch]:
+    """Do not paste 1–5s that flip the ranking against the Likert with no explanation."""
+    numeric_dim = [
+        p
+        for p in patches
+        if p.kind == "dimension_rating"
+        and p.new_value is not None
+        and not p.error
+        and not is_na_score_token(p.new_value)
+    ]
+    if not numeric_dim:
+        return patches
+    simulated = patched_task(task, [p for p in patches if not p.error])
+    if not any(
+        inversion_is_unexplained(simulated, sxs) for sxs in simulated.comparison_list()
+    ):
+        return patches
+    drop_dims = {(p.slot, p.dimension) for p in numeric_dim}
+    return [
+        p
+        for p in patches
+        if not (
+            p.kind in {"dimension_rating", "dimension_justification"}
+            and (p.slot, p.dimension) in drop_dims
+        )
+    ]
+
+
+_PASTE_FAMILIES = frozenset(
+    {"dimension_turns", "sxs_scale", "sxs_magnitude", "inconsistent_ranking"}
+)
+_TIE_REPLACEMENTS = {
+    "tie": "close contest",
+    "tied": "close",
+    "toss-up": "close call",
+    "toss up": "close call",
+    "dead heat": "close contest",
+    "equally good": "both capable",
+    "equally strong": "both capable",
+    "equally matched": "both capable",
+    "no clear winner": "a recorded winner on the required outcome",
+    "no winner": "a recorded winner on the required outcome",
+    "neither": "each",
+    "mixed": "split across dimensions",
+    "comparable": "in the same neighborhood",
+    "roughly even": "close on some axes",
+    "nearly identical": "very similar on some axes",
+    "equivalent": "similar",
+    "indistinguishable": "hard to separate on some axes",
+    "essentially the same": "similar in places",
+}
+_LIKERT_MAGNITUDE = {
+    1: "much better",
+    2: "better",
+    3: "slightly better",
+    5: "slightly better",
+    6: "better",
+    7: "much better",
+}
+
+
+def _patch_identity(patch: FieldPatch) -> tuple:
+    return (patch.kind, patch.slot, patch.dimension, patch.comparison, patch.criterion_id)
+
+
+def _make_field_patch(
+    *,
+    kind: Kind,
+    new_value: Any,
+    old_value: Any = None,
+    notes: str = "",
+    slot: str | None = None,
+    dimension: str | None = None,
+    comparison: str | None = None,
+    check_ids: tuple[int, ...] | list[int] = (),
+    profile: ProjectProfile | None = None,
+) -> FieldPatch:
+    dummy = FieldJob(
+        kind=kind,
+        check_ids=tuple(check_ids),
+        current_value=old_value,
+        feedback="",
+        slot=slot,
+        dimension=dimension,
+        comparison=comparison,
+    )
+    step_id, export_field = export_locator(dummy, profile)
+    return FieldPatch(
+        field_id=dummy.field_id,
+        kind=kind,
+        check_ids=list(check_ids),
+        old_value=old_value,
+        new_value=new_value,
+        notes=notes,
+        slot=slot,
+        criterion_id=dummy.criterion_id,
+        dimension=dimension,
+        comparison=comparison,
+        step_id=step_id,
+        export_field=export_field,
+    )
+
+
+def _upsert_patch(patches: list[FieldPatch], new: FieldPatch) -> list[FieldPatch]:
+    ident = _patch_identity(new)
+    out: list[FieldPatch] = []
+    replaced = False
+    for patch in patches:
+        if _patch_identity(patch) == ident:
+            out.append(new)
+            replaced = True
+        else:
+            out.append(patch)
+    if not replaced:
+        out.append(new)
+    return out
+
+
+def _neutralize_tie_language(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        token = (match.group(1) or match.group(0)).lower()
+        replacement = _TIE_REPLACEMENTS.get(token)
+        if replacement is None:
+            replacement = _TIE_REPLACEMENTS.get(match.group(0).lower(), "close contest")
+        orig = match.group(0)
+        if orig[:1].isupper():
+            return replacement[:1].upper() + replacement[1:]
+        return replacement
+
+    return TIE_RE.sub(repl, text or "")
+
+
+def _align_magnitude(just: str, likert: int) -> str:
+    if likert_magnitude_ok(likert, just):
+        return just
+    if likert in (3, 5):
+        return MUCH_BETTER_RE.sub("slightly better", just or "")
+    if likert in (1, 7):
+        return SLIGHTLY_BETTER_RE.sub("much better", just or "")
+    return just
+
+
+def _lead_sentence(likert: int, left: str, right: str) -> str:
+    if likert == 4:
+        return (
+            f"Model {left} and Model {right} are a recorded tie on the 1–7 SxS "
+            "scale (only 4 is a tie)."
+        )
+    magnitude = _LIKERT_MAGNITUDE.get(likert, "better")
+    if likert in (1, 2, 3):
+        return f"Model {left} is {magnitude} than Model {right}."
+    return f"Model {right} is {magnitude} than Model {left}."
+
+
+def _strip_opposite_winner_lines(text: str, likert: int, left: str, right: str) -> str:
+    want = form_likert_side(likert)
+    if want not in {"left", "right"}:
+        return text
+    kept: list[str] = []
+    for line in (text or "").splitlines():
+        side = _preference_side_simple(line, left, right)
+        if side in {"left", "right"} and side != want:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _rewrite_sxs_body(text: str, likert: Any, left: str, right: str) -> str:
+    """Deterministic writeup that matches the existing Likert. Never flips the winner."""
+    try:
+        n = int(likert)
+    except (TypeError, ValueError):
+        return text or ""
+    new_just = text or ""
+    if n != 4:
+        new_just = _neutralize_tie_language(new_just)
+    new_just = _align_magnitude(new_just, n)
+    new_just = _strip_opposite_winner_lines(new_just, n, left, right)
+    side = _preference_side_simple(new_just, left, right)
+    want = form_likert_side(n)
+    if want in {"left", "right"} and side != want:
+        lead = _lead_sentence(n, left, right)
+        body = sxs_body(new_just).strip()
+        new_just = f"{lead}\n\n{body}" if body else lead
+        if n != 4:
+            new_just = _neutralize_tie_language(new_just)
+        new_just = _align_magnitude(new_just, n)
+        new_just = _strip_opposite_winner_lines(new_just, n, left, right)
+    return new_just.strip()
+
+
+def _aligned_cited_turns(task: Task, slot: str, justification: str) -> list[int]:
+    legal = _legal_turns(task, slot)
+    cited = cited_turns(justification)
+    aligned = [
+        n
+        for n in sorted(cited)
+        if (not legal or n in legal) and _turn_has_model_text(task, slot, n)
+    ]
+    if legal and max(legal) >= 7:
+        without_first = [n for n in aligned if n != 1]
+        if without_first:
+            aligned = without_first
+    return aligned
+
+
+def _sxs_needs_body_fix(sxs) -> bool:
+    likert_side = form_likert_side(sxs.likert)
+    just_side = _preference_side_simple(sxs.justification, sxs.left, sxs.right)
+    if likert_side in {"left", "right"} and just_side == "tie":
+        return True
+    if (
+        likert_side in {"left", "right"}
+        and just_side in {"left", "right"}
+        and likert_side != just_side
+    ):
+        return True
+    return not likert_magnitude_ok(sxs.likert, sxs.justification)
+
+
+def _family_hits(task: Task, patches: list[FieldPatch], families: set[str] | frozenset[str]):
+    simulated = patched_task(task, [p for p in patches if not p.error])
+    return [h for h in audit_task(simulated) if h.family in families]
+
+
+def _paste_safety_sweep(
+    task: Task, patches: list[FieldPatch], profile: ProjectProfile | None
+) -> tuple[list[FieldPatch], list[str]]:
+    """Final deterministic alignment so the four paste families do not ship dirty."""
+    leftovers: list[str] = []
+    out = list(patches)
+
+    simulated = patched_task(task, [p for p in out if not p.error])
+    for sxs in simulated.comparison_list():
+        unexplained = inversion_is_unexplained(simulated, sxs)
+        if not _sxs_needs_body_fix(sxs) and not unexplained:
+            continue
+        new_just = _rewrite_sxs_body(sxs.justification, sxs.likert, sxs.left, sxs.right)
+        # 460 needs a turn-grounded inversion writeup from the LLM. Do not
+        # prepend the canned "pairwise outcome outweighs the mean" sentence.
+        orig = _comparison(task, sxs.pair_label)
+        trial = _make_field_patch(
+            kind="preference_justification",
+            new_value=new_just,
+            old_value=orig.justification if orig is not None else sxs.justification,
+            notes="deterministic_sxs_body_matches_likert",
+            comparison=sxs.pair_label,
+            check_ids=(400, 460, 470),
+            profile=profile,
+        )
+        trial_patches = _upsert_patch(out, trial)
+        still = [
+            h
+            for h in _family_hits(
+                task, trial_patches, {"sxs_scale", "sxs_magnitude", "inconsistent_ranking"}
+            )
+            if sxs.pair_label in h.detail
+        ]
+        if still:
+            out = [
+                p
+                for p in out
+                if not (
+                    p.kind in {"preference_likert", "preference_justification"}
+                    and p.comparison == sxs.pair_label
+                )
+            ]
+            leftovers.append(
+                f"SxS 1–7 / Inconsistent Ranking on {sxs.pair_label} could not be "
+                "rewritten to match the Likert"
+            )
+            continue
+        if new_just.strip() != (sxs.justification or "").strip():
+            out = trial_patches
+
+    simulated = patched_task(task, [p for p in out if not p.error])
+    for dim in simulated.dimension_ratings:
+        orig = _dim(task, dim.model, dim.dimension)
+        if dimension_is_na(dim):
+            current = list(dim.relevant_turns or [])
+            if current:
+                out = _upsert_patch(
+                    out,
+                    _make_field_patch(
+                        kind="dimension_turns",
+                        new_value=[],
+                        old_value=list(orig.relevant_turns or []) if orig else current,
+                        notes="na_turns_must_be_empty",
+                        slot=dim.model,
+                        dimension=dim.dimension,
+                        check_ids=(310,),
+                        profile=profile,
+                    ),
+                )
+            continue
+        selected = set()
+        for item in dim.relevant_turns or []:
+            try:
+                selected.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        cited = cited_turns(dim.justification)
+        if cited and selected and not (cited & selected):
+            aligned = _aligned_cited_turns(task, dim.model, dim.justification)
+            if not aligned:
+                out = [
+                    p
+                    for p in out
+                    if not (
+                        p.kind == "dimension_turns"
+                        and p.slot == dim.model
+                        and p.dimension == dim.dimension
+                    )
+                ]
+                leftovers.append(
+                    f"Dimension Relevant Turns {dim.model}/{dim.dimension}: "
+                    "selected disjoint from cited and no in-range assistant turns"
+                )
+                continue
+            old = list(orig.relevant_turns or []) if orig else list(dim.relevant_turns or [])
+            if not _same_turns(old, aligned):
+                out = _upsert_patch(
+                    out,
+                    _make_field_patch(
+                        kind="dimension_turns",
+                        new_value=aligned,
+                        old_value=old,
+                        notes="justification_cites_disjoint_from_selected",
+                        slot=dim.model,
+                        dimension=dim.dimension,
+                        check_ids=(310,),
+                        profile=profile,
+                    ),
+                )
+
+    drop_ids: set[int] = set()
+    simulated = patched_task(task, [p for p in out if not p.error])
+    for patch in out:
+        if patch.kind != "dimension_turns" or patch.error:
+            continue
+        dim = _dim(simulated, patch.slot or "", patch.dimension or "")
+        if dim is None or dimension_is_na(dim):
+            continue
+        new_turns: list[int] = []
+        raw = patch.new_value if isinstance(patch.new_value, list) else []
+        for item in raw:
+            try:
+                new_turns.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        cited = cited_turns(dim.justification)
+        selected = set(new_turns)
+        if not new_turns and empty_turns_ok(dim):
+            continue
+        if not new_turns or (cited and selected and not (cited & selected)):
+            drop_ids.add(id(patch))
+    if drop_ids:
+        out = [p for p in out if id(p) not in drop_ids]
+
+    still = _family_hits(task, out, _PASTE_FAMILIES)
+    if still:
+        dirty_dims = {
+            (h.detail.split(":", 1)[0].strip() if "/" in h.detail else h.detail)
+            for h in still
+            if h.family == "dimension_turns"
+        }
+        if dirty_dims:
+            out = [
+                p
+                for p in out
+                if not (
+                    p.kind == "dimension_turns"
+                    and f"{p.slot}/{p.dimension}" in dirty_dims
+                )
+            ]
+        dirty_pairs = {
+            h.detail.split(":", 1)[0].strip()
+            for h in still
+            if h.family in {"sxs_scale", "sxs_magnitude", "inconsistent_ranking"}
+        }
+        if dirty_pairs:
+            out = [
+                p
+                for p in out
+                if not (
+                    p.kind in {"preference_likert", "preference_justification"}
+                    and (p.comparison or "") in dirty_pairs
+                )
+            ]
+            leftovers.append(
+                "SxS 1–7 / Inconsistent Ranking leftover after paste-safety sweep"
+            )
+        leftover_hits = _family_hits(task, out, _PASTE_FAMILIES)
+        if leftover_hits:
+            names = sorted({h.family for h in leftover_hits})
+            leftovers.append(
+                "paste-safety leftover: " + ", ".join(names)
+            )
+    return out, leftovers
+
+
+def _forced_apply(task: Task, job: FieldJob) -> tuple[Any, str] | None:
+    """Deterministic paste values that must not wait on the model."""
+    if job.kind == "dimension_turns":
+        dim = _dim(task, job.slot or "", job.dimension or "")
+        if dim is None:
+            return None
+        if dimension_is_na(dim):
+            return [], "na_turns_must_be_empty"
+        cited = cited_turns(dim.justification)
+        current: set[int] = set()
+        for item in dim.relevant_turns or []:
+            try:
+                current.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        legal = _legal_turns(task, job.slot)
+
+        def _usable(nums: set[int]) -> list[int]:
+            replacement = sorted(
+                n
+                for n in nums
+                if (not legal or n in legal)
+                and _turn_has_model_text(task, job.slot, n)
+            )
+            if legal and max(legal) >= 7:
+                without_first = [n for n in replacement if n != 1]
+                if without_first:
+                    replacement = without_first
+            return replacement
+
+        if empty_turns_ok(dim) and not current:
+            return None
+        if not current and cited:
+            replacement = _usable(cited)
+            if replacement:
+                return replacement, "justification_names_turns_fill_empty"
+        if cited and current and not (cited & current):
+            replacement = _usable(cited)
+            if replacement:
+                return replacement, "justification_cites_disjoint_from_selected"
+        return None
+    if job.kind == "dimension_rating":
+        dim = _dim(task, job.slot or "", job.dimension or "")
+        if dim is not None and dimension_is_na(dim):
+            return "not-applicable", "na_score_must_be_not_applicable"
+    return None
+
+
 def apply_plan(
     task: Task,
     plan: FixPlan,
@@ -1467,8 +3000,21 @@ def apply_plan(
     patches: list[FieldPatch] = []
     for job in plan.jobs:
         step_id, export_field = export_locator(job, profile)
-        response = responses.get(f"fix::{task.task_id}::{job.field_id}")
-        if not isinstance(response, dict) or "value" not in response:
+        dim = (
+            _dim(task, job.slot or "", job.dimension or "")
+            if job.kind in {"dimension_turns", "dimension_rating"}
+            else None
+        )
+        response = responses.get(fix_request_key(task.task_id, job.field_id))
+        notes = ""
+        force_align = False
+        forced = _forced_apply(task, job)
+        if forced is not None:
+            new_value, notes = forced
+            force_align = job.kind == "dimension_turns"
+        elif not isinstance(response, dict) or "value" not in response:
+            if job.optional:
+                continue
             patches.append(
                 FieldPatch(
                     field_id=job.field_id,
@@ -1486,11 +3032,39 @@ def apply_plan(
                 )
             )
             continue
-        new_value = response.get("value")
+        else:
+            new_value = response.get("value")
+            notes = str(response.get("notes") or "")
+        if job.kind in {"criterion_turns", "dimension_turns", "key_turn_index"}:
+            if job.kind == "dimension_turns" and dim is not None and dimension_is_na(dim):
+                new_value = []
+            else:
+                filtered = _filter_turn_values(task, job.slot, new_value)
+                if filtered is None:
+                    continue
+                new_value = filtered
+        if job.kind in {"criterion_turns", "dimension_turns"}:
+            legal = _legal_turns(task, job.slot)
+            kept = _kept_turns(
+                task,
+                job,
+                job.current_value,
+                list(new_value) if isinstance(new_value, list) else [new_value],
+                job.flagged_turns,
+                legal,
+                force_align=force_align,
+            )
+            if kept is None:
+                continue
+            new_value = kept
         if job.kind in {"criterion_turns", "dimension_turns"} and _same_turns(
             job.current_value, new_value
         ):
             continue
+        guarded = _guard_new_value(task, job, new_value, notes)
+        if guarded is None:
+            continue
+        new_value = guarded
         patches.append(
             FieldPatch(
                 field_id=job.field_id,
@@ -1498,7 +3072,7 @@ def apply_plan(
                 check_ids=list(job.check_ids),
                 old_value=job.current_value,
                 new_value=new_value,
-                notes=str(response.get("notes") or ""),
+                notes=notes,
                 slot=job.slot,
                 criterion_id=job.criterion_id,
                 dimension=job.dimension,
@@ -1508,6 +3082,9 @@ def apply_plan(
             )
         )
 
+    patches = _drop_inconsistent_pairs(task, patches)
+    patches = _drop_unexplained_ranking_inversions(task, patches)
+    patches, sweep_leftover = _paste_safety_sweep(task, patches, profile)
     before = simplified_weighted_rate(task)
     ceiling = _apply_ceiling(task, plan, patches, profile)
     after_scores = {
@@ -1524,6 +3101,9 @@ def apply_plan(
         task, scores=after_scores or None, weights=after_weights or None
     )
     leftover = plan.unfixable_reason
+    if sweep_leftover:
+        extra = "; ".join(sweep_leftover)
+        leftover = f"{leftover}; {extra}" if leftover else extra
     if ceiling:
         leftover = f"{leftover}; {ceiling}" if leftover else ceiling
         only_s = all(97 in p.check_ids for p in patches) if patches else True
@@ -1593,6 +3173,24 @@ def plan_report(
     return plans
 
 
+def _dimension_score_table(
+    task: Task, responses_by_key: dict[str, Any], plan: FixPlan
+) -> str:
+    scores: dict[tuple[str, str], Any] = {
+        (d.model, d.dimension): d.rating for d in task.dimension_ratings
+    }
+    for job in plan.jobs:
+        if job.kind != "dimension_rating" or not job.slot or not job.dimension:
+            continue
+        data = responses_by_key.get(fix_request_key(task.task_id, job.field_id))
+        if isinstance(data, dict) and "value" in data:
+            scores[(job.slot, job.dimension)] = data["value"]
+    lines = []
+    for (slot, dimension), rating in sorted(scores.items()):
+        lines.append(f"- Model {slot} / {dimension}: {rating}")
+    return "\n".join(lines)
+
+
 def run_fixer(
     tasks: list[Task],
     report: dict,
@@ -1647,13 +3245,21 @@ def run_fixer(
             pid = _pair_id(job)
             for other in plan.jobs:
                 if _pair_id(other) == pid and other.kind in _SCORE_KINDS:
-                    data = responses_by_key.get(f"fix::{task.task_id}::{other.field_id}")
+                    data = responses_by_key.get(fix_request_key(task.task_id, other.field_id))
                     if isinstance(data, dict) and "value" in data:
                         paired_value = data["value"]
                     break
             wave2_reqs.append(
                 build_fix_request(
-                    task, job, policy, paired_corrected_value=paired_value
+                    task,
+                    job,
+                    policy,
+                    paired_corrected_value=paired_value,
+                    dimension_score_table=(
+                        _dimension_score_table(task, responses_by_key, plan)
+                        if job.kind == "preference_justification"
+                        else None
+                    ),
                 )
             )
         for response in run_requests(client, wave2_reqs, workers=workers):
@@ -1927,6 +3533,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="generated 1-5s CSV to attach as contributor ratings before planning",
     )
+    ap.add_argument(
+        "--relabel-c-to-b",
+        default="",
+        metavar="FILE",
+        help="task IDs (one per line) whose C trajectory is GPT: promote C to B, "
+             "keep the AC ranking pair rewritten as A-vs-B, and drop Claude-as-B "
+             "plus the simplified trajectory so they are not hydrated. Same "
+             "post-ingest overlay as honeybee_qc.cli; gated on this flag so a "
+             "D-only audit is not narrowed to A-vs-B",
+    )
     args = ap.parse_args(argv)
 
     report = json.loads(Path(args.report).read_text(encoding="utf-8"))
@@ -1958,6 +3574,37 @@ def main(argv: list[str] | None = None) -> int:
         else {t["task_id"] for t in report.get("tasks") or []}
     )
     tasks = [t for t in tasks if t.task_id in wanted]
+
+    if args.relabel_c_to_b:
+        from .remap_gpt_as_b import (
+            AC_SELECTOR_STEP,
+            apply_relabel_c_to_b,
+            load_task_ids,
+            narrow_to_ab_only,
+        )
+
+        relabel_ids = load_task_ids(args.relabel_c_to_b)
+        hit = apply_relabel_c_to_b(tasks, relabel_ids)
+        missing = sorted(relabel_ids - set(hit))
+        print(
+            f"relabel-c-to-b: promoted GPT-on-C to B on {len(hit)} task(s); "
+            f"AC ranking rewritten as A-vs-B (selector {AC_SELECTOR_STEP}); "
+            "Claude-as-B and simplified dropped from hydration",
+            file=sys.stderr,
+        )
+        if missing:
+            print(
+                f"relabel-c-to-b: {len(missing)} id(s) not in this batch: "
+                + ", ".join(missing),
+                file=sys.stderr,
+            )
+        # Gated on this flag so a D-only run still sees DA/DB/DC.
+        for task in tasks:
+            narrow_to_ab_only(task)
+        print(
+            "relabel-c-to-b: every task narrowed to A-vs-B; C/S not hydrated",
+            file=sys.stderr,
+        )
 
     if args.fill_dims:
         from .fill_dims import apply_fill_to_tasks, load_fill_csv
@@ -2026,7 +3673,15 @@ def main(argv: list[str] | None = None) -> int:
         if cache is not None:
             cache.close()
     write_outputs(Path(args.out_dir), plans, results)
+    invariant_report = audit_fix_results(tasks, results)
+    write_invariant_report(Path(args.out_dir), invariant_report)
     print(_summarize(results), file=sys.stderr)
+    print(invariant_report.summary(), file=sys.stderr)
+    print(
+        "subagent checklist (run on every sheet):\n"
+        "  python3 -m honeybee_qc.fixer_invariants --print-subagent-prompt",
+        file=sys.stderr,
+    )
     return 0
 
 

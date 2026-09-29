@@ -21,13 +21,21 @@ resolution the sampling was bought for. So each sample is parsed by the existing
 parser and the findings are combined here, which also means every definitional fix
 another agent lands in a parser applies to all samples for free.
 
-**Count fields aggregate by median, not by an explicit vote.** For a threshold
-predicate `value >= t`, the median satisfies it exactly when a majority of samples
-do, so one statistic implements majority agreement on *every* threshold at once --
-including thresholds this module has never heard of, which is what keeps 450's
-seven conditions from having to be enumerated here and re-enumerated whenever the
-spec audit moves one. The low median is used so that an even sample count resolves
-against the finding rather than for it: with two draws, both must agree.
+**Count fields aggregate by an order statistic, not by an explicit vote.** For a
+threshold predicate `value >= t`, the k-th largest of the draws satisfies it
+exactly when at least k draws do, so one statistic implements k-of-n agreement on
+*every* threshold at once -- including thresholds this module has never heard of,
+which is what keeps 450's seven conditions from having to be enumerated here and
+re-enumerated whenever the spec audit moves one.
+
+Where k sits is a per-check judgment, and for 450 it is no longer a majority. The
+low median is a bare majority, and on 450 a bare majority of five draws is close
+to a coin flip: over 400 complete five-draw groups only 17% of flagged items were
+unanimous while 56% were the opinion of one or two draws, and that replicated out
+of sample once composition was controlled. `median_low` kept every 3-of-5 item,
+and one severe 3-of-5 item fails a task. So 450 reads
+`policy.justification_draw_agreement` (5) and every other aggregator here keeps
+the majority rule it was measured on. See `_justification_votes`.
 
 Disagreement is recorded rather than discarded. A judge that splits 2-1 on an item
 is not producing noise to be filtered, it is telling us the item is marginal, and
@@ -37,7 +45,6 @@ that belongs in the report next to the item.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from statistics import median_low
 
 from .config import DEFAULT_POLICY, Policy
 from .findings import (
@@ -82,6 +89,37 @@ def _kept(votes: int, samples: int, policy: Policy) -> bool:
     if samples <= 0:
         return False
     return votes > samples * policy.sample_majority_ratio
+
+
+def _justification_votes(samples: int, policy: Policy) -> int:
+    """How many of `samples` draws 450 needs, from a rule stated out of five.
+
+    `policy.justification_draw_agreement` is expressed against the nominal draw
+    count, so a group that lost a draw must be rescaled rather than silently held
+    to a different rule -- 4 of 5 applied to a group of three is otherwise a
+    stricter bar than the same setting on a complete group.
+
+    Rounding up is what makes 3 reproduce `median_low` at every group size, not
+    just at five: three draws need 2 (the low median of three), four need 3 (the
+    low median of four), five need 3.
+    """
+    nominal = policy.samples_by_check.get(450, samples) or samples
+    scaled = -(-policy.justification_draw_agreement * samples // nominal)
+    return max(1, min(samples, scaled))
+
+
+def _kth_largest(values: list[int], want: int) -> int:
+    """The largest v for which at least `want` of the values are >= v.
+
+    Generalises the low median that used to sit here. `median_low` of five is the
+    third largest, so `want = 3` returns exactly what it returned, and every one
+    of 450's per-condition thresholds still resolves from one statistic with no
+    list of conditions in this module to fall out of date.
+    """
+    if not values:
+        return 0
+    ordered = sorted(values, reverse=True)
+    return ordered[want - 1] if want <= len(ordered) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -340,28 +378,82 @@ _JUSTIFICATION_COUNT_FIELDS = (
 )
 
 
+def _condition_votes(drawn: list[JustificationFinding]) -> dict[str, int]:
+    """How many of these draws named each condition.
+
+    Counted from `triggered_conditions()` rather than field by field, because it
+    is the condition a policy names and the condition a reader is shown. It is
+    deliberately *not* the statistic the merge uses: the merge votes on each
+    field separately, so `is_inaccurate` survives when enough draws clear one
+    field's floor and not when some clear one floor and the rest clear the other.
+    Field-wise agreement therefore implies this count and not the reverse, which
+    makes this the honest lower bound on what the merge already required.
+    """
+    votes: dict[str, int] = {}
+    for f in drawn:
+        for condition in f.triggered_conditions():
+            votes[condition] = votes.get(condition, 0) + 1
+    return votes
+
+
+def _with_support(finding: JustificationFinding, total: int) -> JustificationFinding:
+    """Copy `finding` carrying its own draw record. See `JustificationFinding`.
+
+    A copy rather than an in-place stamp because the argument is a draw the
+    caller parsed and may still be holding; the single-draw branch is the only
+    place this function is needed, and it is the one place the aggregator returns
+    its input rather than something it built.
+    """
+    return JustificationFinding(
+        **{
+            **vars(finding),
+            "condition_draws": _condition_votes([finding]),
+            "draws_combined": total,
+        }
+    )
+
+
 def aggregate_justifications(
     samples: list[list[JustificationFinding]], policy: Policy = DEFAULT_POLICY
 ) -> tuple[list[JustificationFinding], list[Agreement]]:
     """Combine per-justification condition counts across draws.
 
-    Counts take the low median, which is what makes this robust to a moving
-    definition: `median >= t` holds exactly when a majority of draws have
-    `value >= t`, so every one of 450's thresholds -- "2 or more claims lack
-    evidence", "1 or more inaccurate primary claim", and whichever ones the spec
-    audit lands next -- gets majority agreement from a single statistic, with no
-    list of conditions in this module to fall out of date.
+    Counts keep the value `policy.justification_draw_agreement` of the draws
+    support, which is what makes this robust to a moving definition: the k-th
+    largest is >= t exactly when at least k draws have `value >= t`, so every one
+    of 450's thresholds -- "2 or more claims lack evidence", "1 or more inaccurate
+    primary claim", and whichever ones the spec audit lands next -- resolves from
+    a single statistic, with no list of conditions in this module to fall out of
+    date.
 
-    Booleans take a strict majority. Evidence spans are unioned, because both of
-    them are used to *withhold* a finding rather than to make one: a single draw
-    quoting something specific refutes the claim that a justification is generic,
-    and 450 requires a contradiction to be exhibited before it can be counted. A
-    union is the reading that cannot manufacture a defect.
+    This was `median_low`, which is the same statistic at k=3, and the field
+    defaults to 5. The reason is measured: over 400 complete five-draw groups only
+    17% of flagged justification items were flagged by all five draws and 56% were
+    the opinion of one or two, so the majority `median_low` enforced was a bare
+    one in a population where a bare majority is close to noise. The field's own
+    comment in `config.py` carries the pricing and the out-of-sample check.
+
+    Booleans take the same threshold rather than `sample_majority_ratio`. They
+    have to: `is_generic` and `is_skewed` reach 450's fail band on their own, so
+    leaving them on a majority while the counts require unanimity would make the
+    aggregation rule depend on which field a condition happens to be stored in.
+    `sample_majority_ratio` still governs checks 110, 280 and 310.
+
+    Evidence spans are unioned, because both of them are used to *withhold* a
+    finding rather than to make one: a single draw quoting something specific
+    refutes the claim that a justification is generic, and 450 requires a
+    contradiction to be exhibited before it can be counted. A union is the reading
+    that cannot manufacture a defect.
     """
     usable = [s for s in samples if s is not None]
     total = len(usable)
     if total <= 1:
-        return (usable[0] if usable else []), []
+        # A lone draw is still stamped with its own support, which is the whole
+        # point of stamping: `draws_combined = 1` is what lets 450's severe route
+        # tell a defect five draws agreed on from one nobody corroborated because
+        # the other four calls never came back. Replaced rather than mutated, so
+        # the caller's parsed draws are left alone.
+        return [_with_support(f, total) for f in (usable[0] if usable else [])], []
 
     order: list[str] = []
     by_item: dict[str, list[JustificationFinding]] = {}
@@ -374,6 +466,7 @@ def aggregate_justifications(
 
     aggregated: list[JustificationFinding] = []
     records: list[Agreement] = []
+    needed = _justification_votes(total, policy)
 
     for item_id in order:
         drawn = by_item[item_id]
@@ -383,7 +476,8 @@ def aggregate_justifications(
         missing = [0] * (total - len(drawn))
 
         def count(name: str) -> int:
-            return int(median_low([getattr(f, name) for f in drawn] + missing))
+            values = [getattr(f, name) for f in drawn] + missing
+            return int(_kth_largest(values, needed))
 
         def vote(name: str) -> int:
             return sum(1 for f in drawn if getattr(f, name))
@@ -394,8 +488,8 @@ def aggregate_justifications(
                 (f.rated_value for f in drawn if f.rated_value is not None), None
             ),
             contradicts_verdict_claims=count("contradicts_verdict_claims"),
-            is_generic=_kept(vote("is_generic"), total, policy),
-            is_skewed=_kept(vote("is_skewed"), total, policy),
+            is_generic=vote("is_generic") >= needed,
+            is_skewed=vote("is_skewed") >= needed,
             inaccurate_primary_claims=count("inaccurate_primary_claims"),
             inaccurate_secondary_claims=count("inaccurate_secondary_claims"),
             unsupported_claims=count("unsupported_claims"),
@@ -409,6 +503,8 @@ def aggregate_justifications(
                 {q for f in drawn for q in f.contradicting_quotes if q.strip()}
             ),
             confidence=_lowest_confidence([f.confidence for f in drawn]),
+            condition_draws=_condition_votes(drawn),
+            draws_combined=total,
         )
         aggregated.append(merged)
 

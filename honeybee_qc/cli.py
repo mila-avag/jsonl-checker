@@ -34,18 +34,24 @@ shape does not change as phases land.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sqlite3
 import sys
+import threading
+import time
 import traceback
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .config import DEFAULT_POLICY, Policy
 from .gates import (
-    build_inversion_finding,
+    build_inversion_findings,
+    evaluate_check_91,
     evaluate_check_96,
+    evaluate_check_97,
     evaluate_check_100,
     evaluate_check_460,
 )
@@ -63,6 +69,13 @@ from .links import evaluate_check_90
 from .llm import DEFAULT_EFFORT, DEFAULT_MODEL, ModelClient, build_client
 from .models import Task
 from .ingest import load_taskattempts_csv
+from .projects import (
+    PROFILES,
+    disabled_checks_for,
+    drop_disabled,
+    profile_by_key,
+    profile_for_project,
+)
 from .preflight import RUBRIC_EMPTY_REASON, PreflightResult, load_tasks, validate_batch
 from .provenance import DuplicateFinding
 from .rating_stages import (
@@ -91,7 +104,7 @@ from .verify import (
     verify_task,
 )
 
-DETERMINISTIC_NOW = (90, 96, 100, 460)
+DETERMINISTIC_NOW = (90, 91, 96, 97, 100, 460)
 RUBRIC_STAGE_CHECKS = (200, 210, 230, 240, 250, 260)
 RATING_STAGE_CHECKS = (270, 300, 400)
 INFORMED_STAGE_CHECKS = INFORMED_CHECKS
@@ -110,16 +123,39 @@ def run_deterministic(
     provenance: TaskProvenance | None = None,
     extra: list[CheckVerdict] | None = None,
 ) -> list[CheckVerdict]:
-    verdicts = [
-        evaluate_check_90(task, policy, dead_links=dead_link_reasons(provenance)),
-        evaluate_check_96(task, policy),
-        evaluate_check_100(task, auditor_key_turn=None, policy=policy),
-        evaluate_check_460(task, build_inversion_finding(task, policy=policy), policy),
-    ]
+    # Provenance is the verifier's channel and is off on most runs; hydration
+    # sees the same dead page on every run that fetches. Both render the reason
+    # identically so a link found dead by each is counted once.
+    dead_links = list(
+        dict.fromkeys(
+            dead_link_reasons(provenance)
+            + [
+                f"final_link_{sub.model}:share page unavailable"
+                for sub in task.submissions()
+                if sub.share_page_dead
+            ]
+        )
+    )
+    disabled = disabled_checks_for(task.project_id)
+    verdicts = []
+    if 90 not in disabled:
+        verdicts.append(evaluate_check_90(task, policy, dead_links=dead_links))
+    if 91 not in disabled:
+        verdicts.append(evaluate_check_91(task, policy))
+    if 96 not in disabled:
+        verdicts.append(evaluate_check_96(task, policy))
+    if 97 not in disabled:
+        verdicts.append(evaluate_check_97(task, policy))
+    if 100 not in disabled:
+        verdicts.append(evaluate_check_100(task, auditor_key_turn=None, policy=policy))
+    if 460 not in disabled:
+        verdicts.append(
+            evaluate_check_460(task, build_inversion_findings(task, policy=policy), policy)
+        )
     verdicts += list(extra or [])
     covered = {v.check_id for v in verdicts}
     for check_id in ORDER:
-        if check_id in covered:
+        if check_id in covered or check_id in disabled:
             continue
         verdicts.append(
             build_verdict(
@@ -203,6 +239,157 @@ class StageError:
         return {"task_id": self.task_id, "stage": self.stage, "error": self.error}
 
 
+@dataclass
+class TaskProgress:
+    """One task's result, at the moment it finished rather than at the end.
+
+    A full batch runs for hours and the report is written only once, at the
+    close, so without this the operator has no way to tell a slow run from a
+    wedged one, and no pass/fail signal until every task is done.
+    """
+
+    done: int
+    total: int
+    task_id: str
+    verdict: str
+    fail_checks: list[int] = field(default_factory=list)
+    cost_usd: float = 0.0
+    elapsed_s: float = 0.0
+    errored: bool = False
+
+    def line(
+        self, spent_usd: float, failed_so_far: int, errored_so_far: int = 0
+    ) -> str:
+        """A single line, self-contained enough to read in a tailed log.
+
+        Errored tasks are counted apart from failing ones: a task that crashed
+        has no verdict, and folding it into the fail count would misreport a bug
+        in the pipeline as a defect in the work being audited.
+        """
+        checks = (
+            " fails=" + ",".join(str(c) for c in self.fail_checks)
+            if self.fail_checks
+            else ""
+        )
+        errors = f", {errored_so_far} errored" if errored_so_far else ""
+        return (
+            f"[{self.done}/{self.total}] {self.task_id} {self.verdict}{checks} "
+            f"{self.elapsed_s:.0f}s ${self.cost_usd:.2f} "
+            f"| {failed_so_far} failing{errors}, ${spent_usd:.2f} spent"
+        )
+
+
+def _progress_for(
+    outcome: _TaskOutcome, done: int, total: int, elapsed_s: float
+) -> TaskProgress:
+    """Read a finished task's headline numbers off its outcome.
+
+    A task that died before rollup has no verdict of its own; it is reported as
+    `error` rather than silently as a pass, since a crashed task is exactly the
+    kind of thing an operator watching a long run needs to see immediately.
+    """
+    stages = (outcome.rubric, outcome.rating, outcome.informed)
+    return TaskProgress(
+        done=done,
+        total=total,
+        task_id=outcome.task_id,
+        verdict=outcome.rollup.verdict if outcome.rollup is not None else "error",
+        fail_checks=list(outcome.rollup.fail_checks) if outcome.rollup else [],
+        cost_usd=sum(s.cost_usd for s in stages if s is not None),
+        elapsed_s=elapsed_s,
+        errored=bool(outcome.errors),
+    )
+
+
+class ProgressPrinter:
+    """Prints one line per finished task, with running totals.
+
+    Writes to stderr because stdout may carry the report itself. Counting and
+    printing hold a lock: tasks finish on several threads at once, and a torn
+    line in the log is worse than no line at all.
+    """
+
+    def __init__(self, stream=None) -> None:
+        self.stream = stream if stream is not None else sys.stderr
+        self.spent_usd = 0.0
+        self.failed = 0
+        self.errored = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, progress: TaskProgress) -> None:
+        with self._lock:
+            self.spent_usd += progress.cost_usd
+            if progress.verdict in ("fail", "unauditable"):
+                self.failed += 1
+            if progress.errored:
+                self.errored += 1
+            print(
+                progress.line(self.spent_usd, self.failed, self.errored),
+                file=self.stream,
+                flush=True,
+            )
+
+
+class ProgressJsonl:
+    """Appends one finished task per line, so a stopped run keeps its verdicts.
+
+    The report is written once, at the close of the batch, which means a run
+    killed partway through loses every verdict it had already computed. The
+    model calls themselves survive in the cache, but the verdicts do not, and
+    recovering them costs a second pass over the whole batch. Appending and
+    flushing per task turns that into a file the next run can read.
+
+    Opened in append mode on purpose: a restart adds to the record rather than
+    truncating what the previous attempt managed to finish.
+    """
+
+    def __init__(self, path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("a", encoding="utf-8")
+        self._lock = threading.Lock()
+
+    def __call__(self, progress: TaskProgress) -> None:
+        record = {
+            "task_id": progress.task_id,
+            "verdict": progress.verdict,
+            "fail_checks": list(progress.fail_checks),
+            "cost_usd": progress.cost_usd,
+            "elapsed_s": progress.elapsed_s,
+            "errored": progress.errored,
+            "done": progress.done,
+            "total": progress.total,
+            "finished_at": time.time(),
+        }
+        with self._lock:
+            self._fh.write(json.dumps(record) + "\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._fh.closed:
+                self._fh.close()
+
+
+class ProgressFanout:
+    """Feeds each finished task to several sinks.
+
+    One sink raising must not rob the others of the record, so each is called
+    in isolation; losing the durable line because a print failed would defeat
+    the point of writing it.
+    """
+
+    def __init__(self, *sinks) -> None:
+        self.sinks = [s for s in sinks if s is not None]
+
+    def __call__(self, progress: TaskProgress) -> None:
+        for sink in self.sinks:
+            try:
+                sink(progress)
+            except Exception:
+                continue
+
+
 def audit_batch(
     tasks: list[Task],
     policy: Policy = DEFAULT_POLICY,
@@ -216,8 +403,11 @@ def audit_batch(
     task_workers: int = 1,
     restricted_checks: tuple[int, ...] | None = None,
     skip_rating_checks: tuple[int, ...] | None = None,
+    on_task_done: Callable[[TaskProgress], None] | None = None,
 ) -> dict:
-    preflight: list[PreflightResult] = validate_batch(tasks, policy)
+    preflight: list[PreflightResult] = validate_batch(
+        tasks, policy, required_checks=restricted_checks
+    )
 
     provenance: list[TaskProvenance] = []
     duplicates: list[DuplicateFinding] = []
@@ -336,8 +526,15 @@ def audit_batch(
                 # the rubric and still get judged.
 
                 def run_informed() -> list[CheckVerdict]:
+                    informed_checks = (
+                        set(restricted_checks) if restricted_checks is not None else None
+                    )
                     out.informed = run_informed_stage(
-                        task, client, policy, workers=workers
+                        task,
+                        client,
+                        policy,
+                        workers=workers,
+                        checks=informed_checks,
                     )
                     return list(out.informed.verdicts)
 
@@ -373,10 +570,13 @@ def audit_batch(
         out.rollup = roll_up_task(task.task_id, verdicts, policy)
         return out
 
+    done = itertools.count(1)
+
     def audit_one_isolated(task: Task, pre: PreflightResult) -> _TaskOutcome:
         """The last line of defence: no single task can end the batch."""
+        started = time.monotonic()
         try:
-            return audit_one(task, pre)
+            outcome = audit_one(task, pre)
         except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             detail = f"{type(exc).__name__}: {exc}"
             print(
@@ -385,10 +585,30 @@ def audit_batch(
                 file=sys.stderr,
                 flush=True,
             )
-            return _TaskOutcome(
+            outcome = _TaskOutcome(
                 task_id=task.task_id,
                 errors=[StageError(task.task_id, "task", detail)],
             )
+        if on_task_done is not None:
+            # Reporting progress must never be the thing that kills a task that
+            # otherwise succeeded, so this mirrors the isolation above.
+            try:
+                on_task_done(
+                    _progress_for(
+                        outcome,
+                        done=next(done),
+                        total=len(tasks),
+                        elapsed_s=time.monotonic() - started,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - progress is not worth a task
+                print(
+                    f"  warning: progress reporting failed for {task.task_id} "
+                    f"({type(exc).__name__}: {exc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return outcome
 
     # Auditing tasks concurrently is what keeps the worker pool full: stages that
     # batch per model build only a handful of requests per task, far too few to
@@ -532,12 +752,30 @@ def main(argv: list[str] | None = None) -> int:
         help="read a taskattempts export (task, response) instead of the JSONL contract",
     )
     ap.add_argument(
+        "--project",
+        default="",
+        metavar="KEY",
+        help="force a project profile (l1, l1_sxs, aspirational, …) instead of "
+             "resolving from each row's project id. Needed when one project id "
+             "has more than one taxonomy revision",
+    )
+    ap.add_argument(
         "--verify-provenance",
         action="store_true",
         help="render each share link and check it matches the uploaded PDF",
     )
     ap.add_argument("--snapshot-dir", default=None, help="where to archive rendered DOMs")
     ap.add_argument("--fetch-timeout", type=int, default=None, help="per-link seconds")
+    ap.add_argument(
+        "--hydrate-workers",
+        type=int,
+        default=None,
+        help="browser renders to run at once, defaulting to --workers. Hydration is "
+        "the one CPU-bound stage -- every worker is a headless Chrome -- so the "
+        "count that keeps the judging stages busy will thrash the machine here and "
+        "return empty DOMs. Set this lower than --workers to render gently and "
+        "still judge at full width.",
+    )
     ap.add_argument(
         "--fetch-conversations",
         action="store_true",
@@ -572,6 +810,42 @@ def main(argv: list[str] | None = None) -> int:
              "rubric-authoring checks, which this does not touch",
     )
     ap.add_argument(
+        "--audit-slots",
+        default="",
+        metavar="SLOT,SLOT",
+        help="only grade per-model checks (270/280/300/310/90/95/450-dims) for "
+             "these slots (e.g. D). SxS comparisons still run in full because "
+             "both sides of the pair have to be in front of the judge",
+    )
+    ap.add_argument(
+        "--relabel-c-to-b",
+        default="",
+        metavar="FILE",
+        help="task IDs (one per line) whose C trajectory is GPT: promote C to B, "
+             "keep the AC ranking pair rewritten as A-vs-B, and drop Claude-as-B "
+             "plus the simplified trajectory so they are not hydrated",
+    )
+    ap.add_argument(
+        "--only-checks",
+        default="",
+        metavar="CHECK,CHECK",
+        help="report and spend model calls only on these check IDs. Overrides "
+             "--restricted-checks when both are passed",
+    )
+    ap.add_argument(
+        "--fill-missing-dims",
+        default="",
+        metavar="SLOT",
+        help="for tasks missing 1-5 dimension ratings on this slot, generate "
+             "scores and contributor-voice justifications to a CSV (not fed "
+             "into check 300)",
+    )
+    ap.add_argument(
+        "--fill-out",
+        default=None,
+        help="where to write --fill-missing-dims CSV; defaults next to --out",
+    )
+    ap.add_argument(
         "--skip-rating-checks",
         default="",
         metavar="CHECK,CHECK",
@@ -604,6 +878,13 @@ def main(argv: list[str] | None = None) -> int:
              "few calls per task to keep --workers busy: the informed stage builds "
              "13, so it idles most of a large pool on its own",
     )
+    ap.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="suppress the per-task progress line. Progress goes to stderr as each "
+             "task finishes, so a run of any size reports pass/fail and spend "
+             "while it works instead of only in the final report",
+    )
     ap.add_argument("--cache-db", default=None, help="SQLite path for response caching")
     ap.add_argument("--refresh-cache", action="store_true")
     ap.add_argument("--model-timeout", type=int, default=300)
@@ -615,6 +896,17 @@ def main(argv: list[str] | None = None) -> int:
         help="draw a check's judgments N times and keep only what a majority of "
              "draws agree on. Repeatable. Overrides the policy default per check, "
              "because sampling every check costs several times a single pass",
+    )
+    ap.add_argument(
+        "--model-for",
+        action="append",
+        default=[],
+        metavar="CHECK=MODEL",
+        dest="model_for",
+        help="send one check's calls to a different model than --model. "
+             "Repeatable. Neither cost nor accuracy is spread evenly over the "
+             "checks, so a cheap judge that is good enough for most of them can "
+             "be bought back to the strong one where it is not",
     )
     ap.add_argument(
         "--no-sampling",
@@ -643,6 +935,26 @@ def main(argv: list[str] | None = None) -> int:
                 ap.error(f"--samples expects CHECK=N, got {spec!r}")
             samples[int(check)] = int(count)
         overrides["samples_by_check"] = samples
+
+    # Checks are named by id on the command line and by request-kind inside the
+    # client, and one check can own several kinds (450 is asked twice, once per
+    # justification target). Translating here keeps `llm` free of the stage
+    # vocabulary.
+    model_by_kind: dict[str, str] = {}
+    for spec in args.model_for:
+        check, _, target = spec.partition("=")
+        if not check.strip().isdigit() or not target.strip():
+            ap.error(f"--model-for expects CHECK=MODEL, got {spec!r}")
+        check_id = int(check)
+        kinds = [k for k, c in CALL_NAME_TO_CHECK.items() if c == check_id]
+        if not kinds:
+            ap.error(
+                f"--model-for: check {check_id} makes no informed-stage calls of "
+                "its own, so there is nothing to route"
+            )
+        for kind in kinds:
+            model_by_kind[kind] = target.strip()
+
     if args.verify_provenance:
         overrides["verify_provenance"] = True
     if args.snapshot_dir:
@@ -651,11 +963,36 @@ def main(argv: list[str] | None = None) -> int:
         overrides["fetch_timeout_s"] = args.fetch_timeout
     if args.fetch_conversations:
         overrides["fetch_attachment_text"] = True
-    if overrides:
-        policy = replace(policy, **overrides)
+
+    forced_profile = None
+    if args.project:
+        forced_profile = profile_by_key(args.project)
+        if forced_profile is None:
+            ap.error(
+                f"unknown --project {args.project!r}; "
+                f"known: {', '.join(p.key for p in PROFILES)}"
+            )
+        # This run's disabled set belongs to the forced profile, not to
+        # whatever `profile_for_project(task.project_id)` would pick -- the
+        # SxS-queue revision shares L1's project id.
+        from honeybee_qc import projects as projects_mod
+
+        def _disabled(_pid: str, _profile=forced_profile):
+            return _profile.disabled_checks
+
+        projects_mod.disabled_checks_for = _disabled
+        global disabled_checks_for
+        disabled_checks_for = _disabled
+        print(
+            f"project: forcing profile {forced_profile.key} "
+            f"({forced_profile.name})",
+            file=sys.stderr,
+        )
 
     if args.from_snowflake:
-        tasks, ingest_results = load_taskattempts_csv(Path(args.input))
+        tasks, ingest_results = load_taskattempts_csv(
+            Path(args.input), profile=forced_profile
+        )
         for result in ingest_results:
             if result.error:
                 print(f"ingest: skipped {result.task_id}: {result.error}", file=sys.stderr)
@@ -669,9 +1006,124 @@ def main(argv: list[str] | None = None) -> int:
     else:
         tasks = load_tasks(Path(args.input))
 
+    if args.relabel_c_to_b:
+        from .remap_gpt_as_b import (
+            AC_SELECTOR_STEP,
+            apply_relabel_c_to_b,
+            load_task_ids,
+            narrow_to_ab_only,
+        )
+
+        relabel_ids = load_task_ids(args.relabel_c_to_b)
+        hit = apply_relabel_c_to_b(tasks, relabel_ids)
+        missing = sorted(relabel_ids - set(hit))
+        print(
+            f"relabel-c-to-b: promoted GPT-on-C to B on {len(hit)} task(s); "
+            f"AC ranking rewritten as A-vs-B (selector {AC_SELECTOR_STEP}); "
+            "Claude-as-B and simplified dropped from hydration",
+            file=sys.stderr,
+        )
+        if missing:
+            print(
+                f"relabel-c-to-b: {len(missing)} id(s) not in this batch: "
+                + ", ".join(missing),
+                file=sys.stderr,
+            )
+        # The 26 that already had GPT on B still ingested C (Claude) and the
+        # AC pair. This run is A vs GPT only -- drop those so hydrate skips
+        # Claude and 400/450/470 do not also judge A vs Claude. Gated on this
+        # flag so `--audit-slots D` still sees DA/DB/DC.
+        for task in tasks:
+            narrow_to_ab_only(task)
+        print(
+            "relabel-c-to-b: every task narrowed to A-vs-B; C/S not hydrated",
+            file=sys.stderr,
+        )
+
+    if args.audit_slots:
+        wanted = tuple(
+            s.strip().upper() for s in args.audit_slots.split(",") if s.strip()
+        )
+        for task in tasks:
+            task.audit_slots = wanted
+        print(
+            f"audit-slots: per-model checks limited to {','.join(wanted)}; "
+            "SxS comparisons still use every pair",
+            file=sys.stderr,
+        )
+
+    # A project can state its own values for things the base policy fixes -- the
+    # weight scale being the one that matters, since Honeybee Aspirational's is
+    # 1-3 where the base is 1-5. Applied under the command line, so an explicit
+    # flag still wins. A mixed batch is fine when every project in it states the
+    # same overrides (the Aspirational clone shares V5's); quietly mixing two
+    # different scales is the failure this is here to prevent.
+    project_ids = {t.project_id for t in tasks}
+    profiles = [profile_for_project(pid) for pid in sorted(project_ids)]
+    known = [p for p in profiles if p is not None]
+    # Apply only when every project in the batch is known and they all state
+    # the same non-empty overrides. The Aspirational clone is that case; an
+    # L1 row mixed in is not.
+    same_overrides = (
+        len(known) == len(project_ids)
+        and bool(known)
+        and bool(known[0].policy_overrides)
+        and all(p.policy_overrides == known[0].policy_overrides for p in known)
+    )
+    if same_overrides:
+        policy = known[0].policy(policy)
+        label = known[0].key if len(known) == 1 else "shared"
+        print(
+            f"policy: applied {label} overrides "
+            f"({', '.join(sorted(known[0].policy_overrides))})",
+            file=sys.stderr,
+        )
+    elif len(project_ids) > 1 and any(p.policy_overrides for p in known):
+        print(
+            f"policy: batch spans {len(project_ids)} projects and "
+            f"{', '.join(p.key for p in known if p.policy_overrides)} state "
+            "their own policy values; none applied. Run one project at a time.",
+            file=sys.stderr,
+        )
+
+    if overrides:
+        policy = replace(policy, **overrides)
+
     hydration = None
     if args.fetch_conversations and not args.dry_run:
-        hydration = hydrate_conversations(tasks, policy, workers=args.workers)
+        from .sources import (
+            MIN_FREE_DISK_BYTES,
+            free_disk_bytes,
+            sweep_stale_browser_profiles,
+        )
+
+        swept = sweep_stale_browser_profiles()
+        if swept:
+            print(
+                f"cleaned {swept} browser profile(s) left by an interrupted run",
+                file=sys.stderr,
+            )
+        free = free_disk_bytes()
+        if 0 <= free < MIN_FREE_DISK_BYTES:
+            # Every render would fail, and each one would look like the host
+            # timing out rather than a full disk, so say it once and stop.
+            print(
+                f"refusing to start: {free / 1024**3:.1f} GiB free, below the "
+                f"{MIN_FREE_DISK_BYTES / 1024**3:.0f} GiB headless Chrome needs to "
+                f"render a page. Every fetch would return an empty DOM.",
+                file=sys.stderr,
+            )
+            return 2
+
+        n_hydrate = args.hydrate_workers or args.workers
+        print(
+            f"hydrating conversations ({len(tasks)} tasks, {n_hydrate} browser workers)...",
+            file=sys.stderr,
+            flush=True,
+        )
+        hydration = hydrate_conversations(
+            tasks, policy, workers=n_hydrate
+        )
         print(
             f"conversations: hydrated {hydration.hydrated}/{hydration.submissions} "
             f"submissions, {hydration.turns} turns",
@@ -709,7 +1161,13 @@ def main(argv: list[str] | None = None) -> int:
 
     client: ModelClient | None = None
     cache = None
-    if args.rubric_stage or args.rating_stage or args.informed_stage:
+    need_client = (
+        args.rubric_stage
+        or args.rating_stage
+        or args.informed_stage
+        or bool(args.fill_missing_dims)
+    )
+    if need_client:
         client, cache = build_client(
             model=args.model,
             effort=args.effort,
@@ -718,7 +1176,55 @@ def main(argv: list[str] | None = None) -> int:
             policy_version=stage_policy_version(policy),
             refresh=args.refresh_cache,
             max_in_flight=args.workers,
+            model_by_kind=model_by_kind,
         )
+        for check_id in sorted(
+            {CALL_NAME_TO_CHECK[k] for k in model_by_kind if k in CALL_NAME_TO_CHECK}
+        ):
+            target = model_by_kind[
+                next(k for k, c in CALL_NAME_TO_CHECK.items() if c == check_id)
+            ]
+            print(f"routing check {check_id} to {target}", file=sys.stderr)
+
+    if args.fill_missing_dims and client is not None and not args.dry_run:
+        from .fill_dims import fill_missing_dims, write_fill_csv
+
+        fill_slot = args.fill_missing_dims.strip().upper()
+        fill_rows = fill_missing_dims(
+            tasks,
+            client,
+            slot=fill_slot,  # type: ignore[arg-type]
+            policy=policy,
+            workers=args.workers,
+        )
+        fill_path = Path(
+            args.fill_out
+            or (
+                str(Path(args.out).with_name(f"{fill_slot.lower()}_dims_fill.csv"))
+                if args.out
+                else f"{fill_slot.lower()}_dims_fill.csv"
+            )
+        )
+        write_fill_csv(fill_path, fill_rows, slot=fill_slot)  # type: ignore[arg-type]
+        filled = sum(
+            1
+            for task in tasks
+            if any(d.model == fill_slot for d in task.dimension_ratings)
+        )
+        print(
+            f"fill-dims: wrote {len(fill_rows)} task(s) missing {fill_slot} "
+            f"1-5s to {fill_path}; attached as contributor ratings on {filled} tasks",
+            file=sys.stderr,
+        )
+
+    only_checks = tuple(
+        int(c) for c in args.only_checks.split(",") if c.strip()
+    )
+    restricted_checks = (
+        only_checks
+        if only_checks
+        else (RESTRICTED_CHECKS if args.restricted_checks else None)
+    )
 
     payload = audit_batch(
         tasks,
@@ -729,11 +1235,12 @@ def main(argv: list[str] | None = None) -> int:
         rating_stage=args.rating_stage,
         informed_stage=args.informed_stage,
         task_workers=args.task_workers,
-        restricted_checks=RESTRICTED_CHECKS if args.restricted_checks else None,
+        restricted_checks=restricted_checks,
         skip_rating_checks=tuple(
             int(c) for c in args.skip_rating_checks.split(",") if c.strip()
         )
         or None,
+        on_task_done=None if args.no_progress else ProgressPrinter(),
     )
     if hydration is not None:
         payload["hydration"] = hydration.to_dict()

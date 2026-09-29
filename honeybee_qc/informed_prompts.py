@@ -23,10 +23,12 @@ per-justification thresholds in 450 are meant to be applied.
 from __future__ import annotations
 
 from .config import DEFAULT_POLICY, Policy
+from .context import NO_CONVERSATION_MARKER_LEAD as _NO_CONVERSATION_LEAD
+from .context import golden_answer_block as _golden_answer_block
 from .context import numbered_prompts as _numbered_prompts
 from .context import render_comparison, render_conversation
 from .env_context import input_manifest, universe_materials
-from .models import ModelSubmission, Task
+from .models import ModelSubmission, Sxs, Task
 
 INFORMED_SYSTEM_PROMPT = (
     "You are auditing the work of a contributor who evaluated a model conversation. "
@@ -58,7 +60,7 @@ INFORMED_SYSTEM_PROMPT = (
 # a finding anyway, against 18 of 33 conversations that were visibly cut. The judge
 # had the signal and no field to put it in, so it guessed, and the guess was
 # charged to a contributor who had read the whole conversation.
-UNVERIFIABLE_GUIDANCE = """
+UNVERIFIABLE_GUIDANCE = f"""
 ## When you were not shown the evidence
 
 The conversation above may be incomplete, and where it is, it says so. These are
@@ -73,6 +75,11 @@ the exact markers, and they are the only warning you get:
     to the user here. You are reading the delivery, not the thing delivered.
   - `Files accompanying this conversation (contents NOT available to you;
     filenames only)` -- you have names, never contents.
+  - `{_NO_CONVERSATION_LEAD}` -- nothing at all came back for
+    that side, and the heading above it is followed by no turns whatsoever. This is
+    the only marker that can appear with an empty conversation beneath it, and it
+    means every claim about what either speaker said there is unverifiable. An
+    empty block is never evidence that a model said nothing.
 
 If deciding an item would need a turn, a span of a turn, or the content of a
 deliverable that one of those markers stands in for, that item is unverifiable.
@@ -386,6 +393,14 @@ ENVIRONMENT_CONTEXT_SCHEMA: dict = {
                     "prompt_treats_as_available_to_read": {"type": "boolean"},
                     "conversation_shows_attachment_or_upload": {"type": "boolean"},
                     "conversation_shows_independent_content": {"type": "boolean"},
+                    # Asked here for the same reason they are asked of a
+                    # `references` row. The parser used to hardcode both to True on
+                    # this path, so a file the prompt asked the model to CREATE was
+                    # a violation the moment the two upload questions came back
+                    # false -- which is the expected answer for anything the model
+                    # produced itself.
+                    "presented_as_existing": {"type": "boolean"},
+                    "required_to_complete": {"type": "boolean"},
                     "evidence_summary": {"type": "string"},
                 },
                 "required": [
@@ -394,6 +409,8 @@ ENVIRONMENT_CONTEXT_SCHEMA: dict = {
                     "prompt_treats_as_available_to_read",
                     "conversation_shows_attachment_or_upload",
                     "conversation_shows_independent_content",
+                    "presented_as_existing",
+                    "required_to_complete",
                     "evidence_summary",
                 ],
                 "additionalProperties": False,
@@ -419,6 +436,11 @@ ENVIRONMENT_CONTEXT_SCHEMA: dict = {
                     },
                     "quote": {"type": "string"},
                     "checked_against": {"type": "array", "items": {"type": "string"}},
+                    # The one answer that had nowhere to go. The judge is asked to
+                    # show what it searched, so it writes rows for references it
+                    # looked for and FOUND, and the only field that could carry
+                    # that was free-text prose nothing reads.
+                    "found_in_materials": {"type": "boolean"},
                     "why_outside_universe": {"type": "string"},
                     "presented_as_existing": {"type": "boolean"},
                     "required_to_complete": {"type": "boolean"},
@@ -429,6 +451,7 @@ ENVIRONMENT_CONTEXT_SCHEMA: dict = {
                     "kind",
                     "quote",
                     "checked_against",
+                    "found_in_materials",
                     "why_outside_universe",
                     "presented_as_existing",
                     "required_to_complete",
@@ -473,13 +496,20 @@ def build_environment_context_prompt(task: Task, policy: Policy = DEFAULT_POLICY
         m for m in universe_materials(task) if not m.startswith("input file manifest")
     ]
     manifest = input_manifest(task)
-    files = ", ".join(sorted(manifest.basenames())) or "(none with a readable name)"
+    # `basenames()` is the union of supplied and produced files, and handing that
+    # to the judge under the "DECLARES were supplied" heading is what told it the
+    # models' own outputs were the contributor's inputs.
+    files = (
+        ", ".join(sorted(manifest.supplied_basenames()))
+        or "(none with a readable name)"
+    )
+    produced = ", ".join(sorted(manifest.produced_basenames())) or "(none recorded)"
     outcomes = (
         "\n".join(f"  - {' '.join(o.split())}" for o in task.target_outcome) or "  (empty)"
     )
     conversations = []
-    for sub in (task.model_a, task.model_b):
-        if sub is not None and sub.conversation:
+    for sub in task.submissions():
+        if sub.conversation:
             rendered, _ = render_conversation(sub, policy)
             conversations.append(f"### Conversation with Model {sub.model}\n\n{rendered}")
     conversation_block = (
@@ -498,6 +528,17 @@ Materials available to you: {'; '.join(materials) or '(none)'}
 Files the task DECLARES were supplied (from the prompt-collection step -- this
 says the contributor attached these on Scale's side; it does NOT say the file
 ever reached the model in the conversation below): {files}
+
+Files the models PRODUCED during the conversation and handed back to the user:
+{produced}
+
+Those produced files are OUTPUTS. They are listed so you can recognise them, not
+so you can audit them. A later user turn that asks the model to review, update,
+correct, or quote a file the model itself generated earlier in this same
+conversation is referring to something the conversation established, which is
+inside the task's universe by construction. It is never an out-of-universe
+reference, it never belongs in `declared_file_checks`, and the absence of an
+upload for it is expected rather than evidence of anything.
 Files attached but unnamed: {len(manifest.opaque)}
 
 Target outcome list the contributor wrote:
@@ -567,9 +608,16 @@ For each such file, answer literally, not as a summary judgement:
     the file to a real test, this field is false, even where the model never
     gets caught -- a claim nobody checked is not a claim that passed.
 
-If both are false and `prompt_treats_as_available_to_read` is true, the file
-exists in this conversation in name only: the user is narrating a document and
-the model is going along with the narration, not reading anything. This is not a
+  - `presented_as_existing` / `required_to_complete`: the same two questions
+    asked of a `references` row, asked of this file. False for a file the prompt
+    asks the model to CREATE, and false for one the model can simply write
+    around. Both must be true before a missing file is a violation, and both are
+    read from your answer rather than assumed.
+
+If both upload questions are false and `prompt_treats_as_available_to_read` is
+true, the file exists in this conversation in name only: the user is narrating a
+document and the model is going along with the narration, not reading anything.
+This is not a
 rare or exotic failure -- it is the whole point of asking you to check every
 named file this way rather than only when something else already looks wrong.
 Content the user pasted or typed directly into their own message does not count
@@ -583,10 +631,18 @@ reference: people, organisations, events, systems, and places.
 
 ## `references`: everything that is not a file
 
-Report each such reference and answer three questions about it. All three decide
+Report each such reference and answer four questions about it. All four decide
 whether it counts, so answer them literally rather than as a summary of your
 overall impression:
 
+  - `found_in_materials`: did you actually locate this reference in one of the
+    materials you searched? Answer TRUE whenever you did. A reference you found
+    is not a violation no matter how the other three answers come out, and TRUE
+    is the right answer for most rows you will write, because you are asked to
+    show your work on references you considered as well as ones you are
+    alleging. Do not put "it is in the task universe" in `why_outside_universe`
+    and leave this false -- that field is prose the audit does not read, and a
+    row left false on those terms fails the task.
   - `presented_as_existing`: does the prompt assert the thing is already there?
     False for anything it proposes, hypothesises, asks about, or invites the model
     to invent -- "draft a note to a hypothetical client" invents nothing.
@@ -654,7 +710,23 @@ ARTIFACT_SCHEMA: dict = {
 def build_artifact_prompt(
     task: Task, sub: ModelSubmission, policy: Policy = DEFAULT_POLICY
 ) -> str:
-    conversation, _ = render_conversation(sub, policy)
+    conversation, _ = render_conversation(sub, policy, list_attachment_names=False)
+    # Default prompt is the L1 reading: every file produced across the session.
+    # V5 scopes the same extraction to the last assistant turn; the extra
+    # paragraph is appended only then so existing tests and cached L1 runs
+    # keep the byte-exact prompt they were built against.
+    scope = ""
+    if policy.artifact_scope == "final_response":
+        last = sub.final_response_turn()
+        where = f"turn {last}" if last is not None else "the model's last assistant turn"
+        scope = f"""
+List only files mentioned in the final response ({where}). Intermediate versions
+of a file edited across turns, and files delivered in earlier turns that are not
+named again in the final response, are out of scope -- do not list them. The rest
+of the conversation is shown so you can tell a final-response mention from an
+earlier delivery of the same file.
+
+"""
     return f"""## Conversation with {"Model " + sub.model}
 
 {conversation}
@@ -662,7 +734,7 @@ def build_artifact_prompt(
 ## Your task
 
 List every output file this model actually produced and handed to the user.
-
+{scope}
 For each one give the filename as it appears, the turn it was delivered in, and a
 short verbatim quote showing the delivery. Set `produced` to true only when the
 model created the file and gave it to the user in this conversation.
@@ -717,7 +789,13 @@ ARTIFACT_CONFIRMATION_SCHEMA: dict = {
                     "claimed_filename": {"type": "string"},
                     "assessment": {
                         "type": "string",
-                        "enum": ["missing", "renamed", "not_a_file", "unverifiable"],
+                        "enum": [
+                            "missing",
+                            "renamed",
+                            "superseded",
+                            "not_a_file",
+                            "unverifiable",
+                        ],
                     },
                     "matched_upload": {"type": "string"},
                     "why": {"type": "string"},
@@ -739,13 +817,25 @@ def build_artifact_confirmation_prompt(
     missing: list[str],
     uploaded: list[str],
     policy: Policy = DEFAULT_POLICY,
+    unmatched_uploads: list[str] | None = None,
 ) -> str:
     conversation, _ = render_conversation(sub, policy)
     claimed_block = "\n".join(f"  - {name}" for name in missing)
+    available = uploaded if unmatched_uploads is None else unmatched_uploads
+    spoken_for = [name for name in uploaded if name not in set(available)]
     uploaded_block = (
-        "\n".join(f"  - {name}" for name in uploaded)
-        if uploaded
-        else "  (the manifest records no uploads at all)"
+        "\n".join(f"  - {name}" for name in available)
+        if available
+        else "  (none -- every upload is already accounted for by another claimed file)"
+    )
+    accounted_block = (
+        "\n\n## Uploads already accounted for, and therefore not available here\n\n"
+        + "\n".join(f"  - {name}" for name in spoken_for)
+        + "\n\nEach of these has already been matched to a different file this model "
+        "delivered. One upload is one file: it cannot also be the file you are "
+        "judging below."
+        if spoken_for
+        else ""
     )
     return f"""## Conversation with {"Model " + sub.model}
 
@@ -755,39 +845,54 @@ def build_artifact_confirmation_prompt(
 
 {claimed_block}
 
-## Every file actually uploaded with this submission
+## Uploads still unaccounted for, which are what these could be
 
-{uploaded_block}
+{uploaded_block}{accounted_block}
 
 ## Your task
 
-For each claimed filename above, decide which of four things is true. A name
+For each claimed filename above, decide which of five things is true. A name
 comparison has already been run and found no match, so the question is not whether
 the strings differ -- they do -- but whether that difference means a file the model
 promised is actually absent.
 
-  - "renamed": the same file is in the upload list under a different name. Name it
-    in `matched_upload`. This is common and legitimate: capture tools name
-    screenshots after the date and time, upload paths add a duplicate suffix, and
-    contributors rename a file to something meaningful before attaching it. Judge
-    it on type and on what the conversation says the file was, not on string
-    similarity.
+  - "renamed": the same file is one of the *unaccounted-for* uploads above, under a
+    different name. Name it in `matched_upload`. This is common and legitimate:
+    capture tools name screenshots after the date and time, upload paths add a
+    duplicate suffix, contributors rename a file before attaching it, and the upload
+    path re-encodes some deliverables, so a file the model produced as one format
+    can arrive as an export of it in another. Judge it on what the conversation says
+    the file was and what it contained, not on string similarity and not on the
+    extension alone. You may only use an upload that is still unaccounted for -- if
+    the list above is empty, "renamed" is not available to you, however well the
+    content matches.
+  - "superseded": this is an earlier state of a deliverable the model went on to
+    revise, and the final state of it *is* in the uploads. An iterative session --
+    twelve rounds of edits to one image, three drafts of one document -- produces
+    one work product, not twelve, and the contributor is asked to preserve the work
+    product. Use this only when the later version is genuinely the same deliverable
+    carried forward, not when the conversation delivered two documents that happen
+    to be related.
   - "not_a_file": this was never a claimed attachment. The model printed the
-    content inline -- a fenced code block, a table, a snippet -- or named a path it
-    proposed, recommended, or told the user to create themselves. Nothing was
-    promised, so nothing is missing.
-  - "missing": the model genuinely handed over, or said it was handing over, a file
-    that is not in the upload list under any name. Note that two similar names can
-    still be two different files: `report.pdf` and `report_v2.pdf` are one document
-    each, and if the conversation delivered both, one being uploaded does not
-    account for the other.
+    content inline -- a fenced code block, a table, a snippet -- named a path it
+    proposed, recommended, or told the user to create themselves, or generated an
+    image the chat interface displayed inline with a download button of its own,
+    which is the interface offering a copy rather than the model handing over a
+    file.
+  - "missing": the model genuinely handed over, or said it was handing over, a
+    distinct final deliverable that is not among the uploads under any name. Two
+    similar names can still be two different files: `report.pdf` and `report_v2.pdf`
+    are one document each, and if the conversation delivered both as separate
+    deliverables, one being uploaded does not account for the other.
   - "unverifiable": you cannot tell from what you were shown.
 
 Say why in `why`, in one sentence, citing the conversation where it helps. Leave
 `matched_upload` empty for anything other than "renamed".
 
 Only "missing" is counted against the contributor, so an assessment you are not
-confident in should be "unverifiable" rather than a guess in either direction.
+confident in should be "unverifiable" rather than a guess in either direction. But
+"missing" is the right answer when it is the right answer: a final deliverable the
+user was handed and that nobody uploaded is exactly what this check exists to find.
 """
 
 
@@ -833,9 +938,20 @@ KEY_TURN_JUSTIFICATION_SCHEMA: dict = {
 
 
 def build_key_turn_justification_prompt(
-    task: Task, policy: Policy = DEFAULT_POLICY
+    task: Task, policy: Policy = DEFAULT_POLICY, slot: str | None = None
 ) -> str:
-    sub = task.model_a or task.model_b
+    """Judge one key-turn justification.
+
+    `slot=None` is the L1 single-call path: `task.key_turn` against model A's
+    conversation. A named slot is the V5 path -- one call per competing model.
+    Existing callers that omit `slot` keep the prompt they have always had.
+    """
+    if slot:
+        sub = task.submission(slot)  # type: ignore[arg-type]
+        kt = sub.key_turn if sub is not None else task.key_turn
+    else:
+        sub = task.model_a or task.model_b
+        kt = task.key_turn
     conversation = render_conversation(sub, policy)[0] if sub else "(unavailable)"
     return f"""## The conversation
 
@@ -843,11 +959,11 @@ def build_key_turn_justification_prompt(
 
 ## The turn the contributor selected as the key turn
 
-Turn {task.key_turn.turn_index}
+Turn {kt.turn_index}
 
 ## Their justification for that choice
 
-{' '.join((task.key_turn.justification or '').split()) or '(empty)'}
+{' '.join((kt.justification or '').split()) or '(empty)'}
 
 ## Your task
 
@@ -868,7 +984,7 @@ anything incorrect, misaligned, or otherwise wrong counts, even if minor.
 
 {UNVERIFIABLE_GUIDANCE}
 
-All three questions are asked about turn {task.key_turn.turn_index} specifically.
+All three questions are asked about turn {kt.turn_index} specifically.
 If that turn is not in the conversation above -- cut at the truncation line, or
 present only as a deliverable whose content is absent -- set `unverifiable` true,
 say which in `why_unverifiable`, and answer the three questions true. You cannot
@@ -1035,31 +1151,66 @@ being honest about what you could not see.
 
 
 def build_criterion_turns_prompt(
-    task: Task, sub: ModelSubmission, policy: Policy = DEFAULT_POLICY
+    task: Task,
+    sub: ModelSubmission,
+    policy: Policy = DEFAULT_POLICY,
+    score: int = 0,
 ) -> str:
-    """Check 280. Population is the contributor's own score-0 criteria."""
+    """Checks 280 (score 0) and 281 (score 1). Population is the contributor's
+    own ratings at that score, not a corrected set."""
     conversation, _ = render_conversation(sub, policy)
     text = {c.criterion_id: c.text for c in task.rubric}
     items = "\n\n".join(
         f"  [{r.criterion_id}] {' '.join(text.get(r.criterion_id, '(unknown)').split())}\n"
         f"      turns cited: {r.relevant_turns or '(none)'}"
         for r in task.criterion_ratings
-        if r.model == sub.model and r.score == 0
+        if r.model == sub.model and r.score == score
     )
+    if score == 1:
+        heading = "The criteria this model passed, and the turns the contributor cited"
+        decide = (
+            "For each criterion, decide whether each cited turn actually shows "
+            "the criterion being met."
+        )
+        correct = (
+            "A turn is correct when it contains the behaviour the criterion is "
+            "about -- the place a reader would look to see the criterion met."
+        )
+        judge = (
+            "Judge citation only. Whether the contributor was right to score the "
+            "criterion 1 is a separate check, and these turns are being audited "
+            "against the rating they actually gave. Even where you think the score "
+            "is wrong, judge whether the turn supports the claim they made."
+        )
+    else:
+        heading = "The criteria this model failed, and the turns the contributor cited"
+        decide = (
+            "For each criterion, decide whether each cited turn actually shows "
+            "the failure."
+        )
+        correct = (
+            "A turn is correct when it contains the behaviour the criterion is "
+            "about -- the place a reader would look to see the criterion unmet."
+        )
+        judge = (
+            "Judge citation only. Whether the contributor was right to score the "
+            "criterion 0 is a separate check, and these turns are being audited "
+            "against the rating they actually gave. Even where you think the score "
+            "is wrong, judge whether the turn supports the claim they made."
+        )
     return f"""## Conversation with {"Model " + sub.model}
 
 {conversation}
 
-## The criteria this model failed, and the turns the contributor cited
+## {heading}
 
 {items or '(none)'}
 
 ## Your task
 
-For each criterion, decide whether each cited turn actually shows the failure.
+{decide}
 
-A turn is correct when it contains the behaviour the criterion is about -- the
-place a reader would look to see the criterion unmet. A turn is incorrect when it
+{correct} A turn is incorrect when it
 is unrelated to the criterion, or when it belongs to the other model's
 conversation.
 
@@ -1069,10 +1220,7 @@ cited turns are all correct gets an empty list.
 {UNVERIFIABLE_GUIDANCE}
 {TURN_ABSTENTION_INSTRUCTION}
 
-Judge citation only. Whether the contributor was right to score the criterion 0
-is a separate check, and these turns are being audited against the rating they
-actually gave. Even where you think the score is wrong, judge whether the turn
-supports the claim they made.
+{judge}
 """
 
 
@@ -1108,6 +1256,15 @@ justification cites a turn as evidence the model ignored a constraint, that turn
 has to be where the constraint was ignored. Mark it incorrect when it does not
 support that specific claim, when it is unrelated to the dimension, or when it
 belongs to the other model's conversation.
+
+Where the claim is about what the model did -- that it repeated itself, ignored
+the question, dropped a constraint -- the support has to be the MODEL text at
+that turn. The user side was written by the contributor whose citation you are
+checking, so a user turn complaining the model repeated itself is not evidence
+that it did. Read the model's own words before you accept the citation. Turn
+numbers here count exchanges, so check the model turn immediately before the
+cited one too, and treat an off-by-one citation of a claim the model text does
+bear out as correct.
 
 List only incorrect turns in `incorrect_turns`, by number, and set `item_id` to
 the dimension name.
@@ -1241,15 +1398,97 @@ factually wrong about the conversation. One is enough to fail, so reserve this
 for the load-bearing claim.
 
 **inaccurate_secondary_claims** — a subordinate observation is factually wrong.
-Two are needed to fail.
 
 **unsupported_claims** — assertions the justification never backs up, with no
 quote, turn reference, or specific detail. Judge support within the justification
-itself, not by whether you could find support in the conversation.
+itself, not by whether you could find support in the conversation. This is the
+category for an assertion that is merely unbacked. If you check it against the
+conversation and find it false, score it as an inaccurate claim instead, primary
+or secondary by the rule below.
 
-**inaccurate_evidence** — a quote or turn reference that is fabricated or
-factually wrong: words that do not appear, a turn that does not say what is
-attributed to it. One is enough to fail.
+**inaccurate_evidence** — a *citation* that does not hold up: a quote whose
+words do not appear in the conversation, or a turn reference that does not
+contain what is attributed to it. One is enough to fail, and that severity is
+why this condition is confined to citation. The defect it names is pointing at
+the record and misreporting what is there, which no reader can catch without
+going back to the turn, and which a contributor should never produce.
+
+Because one instance fails the task, satisfy yourself that the citation is
+actually fabricated before booking it, and rule out the two ways a sound one
+can look broken.
+
+The first is numbering. Turn numbers count exchanges, and a render can group a
+multi-message reply differently from the interface the contributor read, which
+shifts every later number by one or two. Before calling a turn reference wrong,
+read the turns immediately either side of it. If the content described is
+there, the citation is correct and you must not book it — a number that is off
+by one against a claim the surrounding text bears out is a numbering artefact,
+not a misreport. It is a defect only when the claim depends on that specific
+turn being the one, as a claim about ordering or about which turn came first
+does.
+
+A citation past the last turn of this conversation is the same artefact, not a
+worse one. The two models are rated side by side and usually ran to different
+lengths, so a number that overshoots this model's final turn is nearly always
+carried across from the other model's citation list. Book nothing for it on its
+own. Read the model's last turns, and treat the citation as sound if they carry
+what is attributed; only if the claim is found nowhere in the conversation does
+it become a defect, and then it is an inaccurate claim rather than this.
+
+A surplus citation is likewise not a defect. Where a justification cites several
+turns and the remaining ones already carry the claim, an extra number that does
+not is redundant, not fabricated: nothing has been misreported to a reader who
+follows the other citations. Book this only when the unsupported turn is the
+sole support offered for the point being made.
+
+The second is wording. This condition asks whether the support is invented, not
+whether it was transcribed exactly. A contributor who paraphrases, trims, or
+tidies a quote while pointing at the right turn, and whose paraphrase carries
+what that turn actually says, has cited accurately: book nothing. Reserve this
+for a quote whose substance is not in the cited turn at all, words attributed
+to a speaker who never said them, or a reference to a turn that does not
+discuss the matter. If the turn says the thing and the contributor rendered it
+loosely, that is not fabricated evidence.
+
+A bare factual assertion about the conversation that the transcript contradicts
+is false, but it is not this. Score it under `inaccurate_primary_claims` when
+the rating rests on it and `inaccurate_secondary_claims` when it is
+subordinate. The same false statement must not fail a task or pass it according
+to whether the contributor happened to attach a quotation mark or a turn number
+to it; what decides its weight is how much the rating leans on it. So a
+justification whose central argument is sound and which gets one incidental
+detail wrong is not a failing justification, while one whose case collapses
+without the false claim is.
+
+Decide that by deletion, not by tone. Strike the false claim out and read what
+is left: if the rating as written still has its stated support, the claim was
+secondary; if the reason for the score has gone with it, it was primary. Apply
+this even when the claim is one sentence among several, and even when the
+contributor sounds measured — a hedge around a false claim does not demote it.
+Two shapes are primary almost by construction, and both have been filed as
+secondary here: the only substantive claim a justification makes, and the
+claim a justification gives as its reason for departing from full marks. If a
+score of 4 rests on one asserted shortcoming and that shortcoming did not
+happen, nothing supports the 4, and the finding is primary.
+
+`inaccurate_secondary_claims` is for the genuinely incidental — a
+misremembered turn number beside an accurate point, a detail the argument
+never needed. Reaching for it because a claim feels minor, or because scoring
+primary would fail the task, is the error to avoid: the weight of the
+consequence is the gate's business, not yours.
+
+Note what this rule does *not* license. It sharpens which bucket a defect goes
+in; it never licenses leaving one out. Every inaccuracy you find is recorded
+somewhere — primary if the rating rests on it, secondary if not — and a claim
+you are unsure about is a secondary one, not an omitted one. The counts on this
+schema are a record of what you saw, and a finding you decline to write down is
+the one failure mode none of the thresholds below can recover from. Where you
+are torn between two buckets, pick one and say why; do not resolve the tension
+by reporting neither.
+
+Before scoring an inaccuracy of any of these three kinds, find the turn the
+claim would have to rest on and quote it, so the judgement rests on the record
+rather than on your memory of it. Where no such turn exists, say so.
 
 **misconstrued_evidence** — a real, accurately reproduced quote read to mean
 something it does not. Two are needed to fail.
@@ -1260,9 +1499,75 @@ it differently: the spec instructs that a contributor presenting a reasonable
 argument has their interpretation accepted. Count this only where no sound
 reading of the quote supports what is said about it.
 
-The last two are the pair most often confused. Ask whether the evidence itself is
-wrong (inaccurate) or whether the evidence is right and the reading of it is
+The last two are the pair most often confused. Ask whether the citation itself is
+wrong (inaccurate) or whether the citation is right and the reading of it is
 wrong (misconstrued).
+
+Three situations recur in this project and are settled by the record rather than
+by charity. In each, the trap is to notice the shortfall, accept the
+contributor's gloss on it, and score nothing.
+
+*A claim that the rest of the conversation is clean.* Justifications routinely
+carry a sweeping negative: "the model does not make any false claims", "apart
+from a minor slip at turn 20 it was otherwise faithful", "everywhere else it was
+unusually honest". This is a claim about every turn you were shown, and it is
+where a generous rating is usually anchored, so it is almost always primary. It
+is not softened by the concession in front of it — conceding one error is a
+claim that there are no others, and it is false the moment you find a second.
+Do not accept it because it is broad or because checking it is work: read the
+turns and look for a counterexample. One clear instance of the thing the
+contributor says never happened — a fabricated citation elsewhere, a fictional
+figure treated as real, a second unfaithful passage — makes the claim inaccurate,
+primary where the rating rests on it.
+
+Two bounds keep this honest. The counterexample has to be in the transcript in
+front of you and has to be the same kind of defect the claim denies; a different
+weakness does not falsify a claim about faithfulness. And where the sweep is
+decoration rather than support — the rating stands on specifics and would stand
+without the flourish — it is secondary rather than primary. Both bounds move a
+finding down a tier; neither deletes it.
+
+*A deliverable the user asked for and did not get.* Where the user asked for a
+file, document, export, or other artifact and the model returned the material as
+chat text, a description of how to build it, or instructions for producing or
+converting it themselves, the artifact was not delivered. A justification
+asserting that the request was satisfied, that every deliverable was met, or that
+the gap was resolved with a workable alternative is contradicted by the
+transcript: score it an inaccurate claim, primary where the rating rests on it
+and secondary where it does not. That the model was candid about the limitation, and that what
+it returned would let a determined user assemble the artifact, do not make the
+claim accurate. They bear on how serious the miss was, which is the rating's
+business and not yours.
+
+*A re-prompt the user should not have had to send.* Where the user restates,
+narrows, or repeats a request because the previous turn did not do what was
+asked, that is a correction loop, whatever its tone. A justification claiming
+that no turn required a re-prompt, or that no correction was needed, is
+contradicted by such an exchange. A follow-up opening genuinely new ground is not
+a re-prompt; a follow-up asking again for something already requested is one,
+even when the user is polite about it, and even when the earlier turn was useful
+in other respects.
+
+What a user turn establishes is bounded, and the bound matters here more than
+anywhere else in this rubric. **The user side of this conversation was written by
+the same contributor whose justification you are auditing.** So a user turn
+proves that a correction turn was spent, and it proves what the user believed had
+happened. It is never evidence of what the model actually did. A justification
+claiming the model repeated itself, ignored the question, dropped a constraint or
+produced nothing is a claim about the model's text, and only the model's text at
+that turn can confirm or refute it — a user complaining "you just repeated
+yourself" does not make it so, and treating the complaint as proof lets the
+contributor corroborate their own claim.
+
+So before you accept a claim of that shape, read the MODEL text at the turn it
+rests on, and at the model turn immediately before it, since turn numbering here
+counts exchanges and citations land one either side often. Where that text plainly
+does the thing the justification says it failed to do, the claim is false: score
+it primary where the rating leans on it, secondary where it does not. Where the
+model's text is absent from this transcript, that is `unverifiable_claims` and not
+an inaccuracy. And hold the wording charity you would extend anywhere else: a
+model that recycled most of a previous answer, described as having repeated it
+"verbatim", is a real defect loosely worded, not a false claim.
 
 **unverifiable_claims** — the abstention, and mandatory rather than optional. The
 conversation above may be cut short at
@@ -1280,6 +1585,20 @@ contradicted. This costs nothing — a claim counted here is reported and then
 counted neither way — and naming the turn or deliverable you would have needed in
 `why_unverifiable` is what makes it reviewable.
 
+Read the boundary of this abstention as strictly as its licence. It is for
+material the render does not contain, and the render says so in plain markers:
+the truncation line, the omitted-characters note, the deliverable placeholder.
+Absent one of those, the conversation in front of you is the whole conversation,
+and a thing that is not in it is not there. So a claim that the model connected
+a service, ran a test, produced a file or said something, where a complete
+transcript contains no such thing, is **not** unverifiable — it is
+`unsupported_claims`, or inaccurate where the transcript positively shows
+otherwise. "I searched and could not find it" is a finding, not an abstention;
+only "I was not shown the place it would be" is an abstention. This bucket costs
+nothing precisely because it is narrow, and using it for claims you simply could
+not corroborate empties the audit: on the last batch it was reached 395 times
+against 279 justifications flagged with any issue at all.
+
 **unverifiable** — the whole-justification form of the same abstention. Set it
 true when the justification defends a rating of something this transcript does not
 contain at all: the deliverable itself, or a stretch of conversation that sits
@@ -1291,10 +1610,75 @@ recorded as either.
 Two habits to hold to throughout. Where a justification admits more than one
 reading and one of them is coherent, take that one — the spec instructs that a
 contributor presenting a reasonable argument has their interpretation accepted.
-And judge the justification, not the rating or the conversation: a point you
-would have argued differently, or would not have made at all, is not an issue
-under any of these counts.
+That latitude is over what the contributor's words mean, not over what happened:
+where the transcript settles a question of fact, the fact governs, and a
+sympathetic account of why the contributor might have seen it otherwise is not a
+second reading. And judge the justification, not the rating or the conversation:
+a point you would have argued differently, or would not have made at all, is not
+an issue under any of these counts.
 """
+
+
+def _weighted_rubric_block(task: Task, policy: Policy = DEFAULT_POLICY) -> str:
+    """The task's own requirements, with weights, for the justification audits.
+
+    A contributor rates against the rubric, and a judge holding only the
+    conversation cannot tell a claim that quotes a requirement from one that
+    invents a standard. It resolves that the wrong way: on task
+    6a7d3a48a9485b6a031cb312, which human QC scored 5, the contributor faulted a
+    model for returning no Google Drive link -- criterion 811b1f24, weight 4 --
+    and all five draws called it an inaccurate primary claim, which is a severe
+    condition and failed a clean task on its own. The rubric is what makes that
+    claim readable, and it is missing from no other stage's prompts.
+
+    Weights are printed because they are the task's ranking of its own
+    requirements, and a justification that leans on a weight-5 requirement is
+    making a stronger argument than one leaning on a weight-1.
+
+    Over `policy.max_rubric_prompt_chars` the heaviest criteria are kept and the
+    remainder dropped with a count. The cap is a guard and not a routine trim:
+    across the 60-task sheet22 run the 15 tasks carrying a rubric held 18 to 40
+    criteria and rendered at 3.6k to 7.8k characters, none of them near it.
+    """
+    if not task.rubric:
+        return "(no rubric was recorded for this task)"
+
+    lines = [
+        f"  [{c.criterion_id}] (weight "
+        f"{c.weight if c.weight is not None else 'unstated'}) "
+        f"{' '.join(c.text.split())}"
+        for c in task.rubric
+    ]
+    if sum(len(line) + 1 for line in lines) <= policy.max_rubric_prompt_chars:
+        return "\n".join(lines)
+
+    order = sorted(
+        range(len(lines)),
+        key=lambda i: (-(task.rubric[i].weight or 0), i),
+    )
+    keep: set[int] = set()
+    used = 0
+    for i in order:
+        if used + len(lines[i]) + 1 > policy.max_rubric_prompt_chars:
+            continue
+        keep.add(i)
+        used += len(lines[i]) + 1
+    dropped = len(lines) - len(keep)
+    return "\n".join(
+        [lines[i] for i in sorted(keep)]
+        + [f"  ({dropped} further criteria of lower weight omitted for length)"]
+    )
+
+
+RUBRIC_FRAMING = """Each line is a requirement the response was expected to meet, with the weight the
+task placed on it. The contributor rated and ranked against this rubric, so a
+justification that faults a model for missing one of these requirements is
+grounded in the task's own standard -- even where the conversation never mentions
+the requirement and the user never asked for it in so many words. That is not an
+invented standard, and it is not an inaccurate claim.
+
+What the rubric settles is what was required. Whether the model actually did it
+is still a question for the transcript."""
 
 
 def build_dimension_justification_prompt(
@@ -1313,6 +1697,12 @@ def build_dimension_justification_prompt(
 
 {conversation}
 
+## The rubric the contributor graded against
+
+{_weighted_rubric_block(task, policy)}
+
+{RUBRIC_FRAMING}
+{_golden_answer_block(task)}
 ## The contributor's dimension ratings and justifications
 
 {items or '(none)'}
@@ -1338,23 +1728,26 @@ here. Explain your counts in `reasoning`, quoting the contributor.
 """
 
 
-def _likert_scale_note(policy: Policy) -> str:
+def _likert_scale_note(
+    policy: Policy, left: str = "A", right: str = "B"
+) -> str:
     """Spell the preference scale out for the auditor.
 
     Printing a bare number invites the auditor to assume the scale it knows best.
     On the spec's bipolar 1-7 form it read 5 as the top of a 1-5 scale and so as
     "the strongest possible preference", then charged contributors with
     contradicting their verdict for describing a 5 as a slight lean toward Model
-    B -- which is exactly what a 5 is.
+    B -- which is exactly what a 5 is. Anchors must be the pair's own slots:
+    D-vs-A is 1 = D, not 1 = A.
     """
     if policy.preference_encoding == "bipolar_7":
         lo, hi = policy.likert_scale
         centre = (lo + hi) // 2
         return (
             f"a single {lo}-{hi} scale carrying both direction and strength: {lo} is "
-            f"the strongest preference for Model A, {hi} the strongest for Model B, "
-            f"and {centre} is a tie. Values next to the centre are slight "
-            f"preferences, so describing one as slight agrees with it"
+            f"the strongest preference for Model {left}, {hi} the strongest for "
+            f"Model {right}, and {centre} is a tie. Values next to the centre are "
+            f"slight preferences, so describing one as slight agrees with it"
         )
     lo, hi = policy.preference_margin_scale
     return (
@@ -1363,19 +1756,39 @@ def _likert_scale_note(policy: Policy) -> str:
     )
 
 
-def build_ranking_justification_prompt(task: Task, policy: Policy = DEFAULT_POLICY) -> str:
-    comparison = render_comparison(task.model_a, task.model_b, policy)[0]
+def build_ranking_justification_prompt(
+    task: Task, policy: Policy = DEFAULT_POLICY, comparison: Sxs | None = None
+) -> str:
+    """Audit one comparison's ranking justification.
+
+    Defaults to the task's primary comparison. Each pair's justification is
+    audited against that pair's own two conversations -- judging the A-vs-C
+    write-up against A and B would mark accurate claims about C unsupported.
+    """
+    pair = comparison or task.comparison_list()[0]
+    rendered = render_comparison(
+        task.submission(pair.left), task.submission(pair.right), policy
+    )[0]
     return f"""## The two conversations
 
-{comparison}
+{rendered}
+
+## The rubric the contributor graded against
+
+{_weighted_rubric_block(task, policy)}
+
+{RUBRIC_FRAMING}
+{_golden_answer_block(task)}
 
 ## The contributor's comparison
 
-Likert rating: {task.sxs.likert if task.sxs.likert is not None else '(none)'}
-  The Likert is {_likert_scale_note(policy)}.
-Preferred model index: {task.sxs.winner_index if task.sxs.winner_index is not None else '(none)'}
+This is the comparison between Model {pair.left} and Model {pair.right}.
 
-Justification: {' '.join((task.sxs.justification or '(empty)').split())}
+Likert rating: {pair.likert if pair.likert is not None else '(none)'}
+  The Likert is {_likert_scale_note(policy, pair.left, pair.right)}.
+Preferred model: {pair.winner_slot() or '(none)'}
+
+Justification: {' '.join((pair.justification or '(empty)').split())}
 
 ## What to count
 
@@ -1414,14 +1827,19 @@ VERDICT_SCHEMA: dict = {
 }
 
 
-def build_verdict_prompt(task: Task, policy: Policy = DEFAULT_POLICY) -> str:
+def build_verdict_prompt(
+    task: Task, policy: Policy = DEFAULT_POLICY, comparison: Sxs | None = None
+) -> str:
+    pair = comparison or task.comparison_list()[0]
     return f"""## The contributor's model comparison justification
 
-{' '.join((task.sxs.justification or '(empty)').split())}
+This is the comparison between Model {pair.left} and Model {pair.right}.
+
+{' '.join((pair.justification or '(empty)').split())}
 
 ## Your task
 
-One question only: does this justification state a preference between the two
+One question only: does this justification state a preference between these two
 models?
 
 Set `states_preference` to true if it names a winner, says one model is better in

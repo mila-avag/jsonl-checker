@@ -1,5 +1,20 @@
 # HoneyBee_v2 QC audit engine
 
+**Teammates running the laptop eval + fixer:** start at [`TEAM_RUN.md`](TEAM_RUN.md).
+This file is the design rationale, not the how-to.
+
+Rebuild the teammate archive after you change the package:
+
+```bash
+./honeybee_qc/team_pack.sh
+```
+
+`dist/honeybee_qc_team.zip` and `dist/honeybee_qc_team.tar.gz` are the same
+tree (cli, fixer, invariants, `requirements.txt`, `TEAM_RUN.md`). Prefer
+the zip on a Mac (double-click). Do not put `.env`, API keys, or Chrome
+profiles in the archive. Teammates still bring Anthropic auth, Chrome,
+and a Snowflake `taskattempts` CSV.
+
 Audits a contributor's side-by-side evaluation work product against the 21 custom
 dimensions of project `6a70ffe56999de9083413f7d`.
 
@@ -14,18 +29,12 @@ threshold arithmetic for every gate.
 
 323 tests, none of which contact a model, all running in under a second.
 
-**[`PROMPTS.md`](PROMPTS.md) is every prompt the audit sends, rendered byte-exact
-from the code** by `python3 -m honeybee_qc.dump_prompts`. Read that to review the
-prompts; it cannot drift from what the CLI actually sends.
-
 ```bash
 python3 -m pytest honeybee_qc/tests -q
 python3 -m honeybee_qc.cli tasks.jsonl --out report.json
 python3 -m honeybee_qc.cli tasks.jsonl --verify-provenance --snapshot-dir snaps
 python3 -m honeybee_qc.cli tasks.jsonl --rubric-stage --rating-stage --cache-db .cache/qc.db
 python3 -m honeybee_qc.cli tasks.jsonl --rubric-stage --rating-stage --dry-run  # count calls first
-python3 -m honeybee_qc.demo_rubric_stage          # live run on a planted rubric
-python3 -m honeybee_qc.demo_rating_stage          # live blind pass on a real share link
 ```
 
 ## Why this order
@@ -411,7 +420,8 @@ context.py      Conversation rendering, artifact detection, evidence profile
 rating_prompts.py  Blind prompts for 270/300/400 plus the blindness guard
 rating_stages.py   Rating stage: abstention accounting and the judged-ratio floor
 cli.py          Batch runner
-dump_prompts.py Regenerates PROMPTS.md from the real builders
+fixer.py        Field rewrites for QC fails
+fixer_invariants.py  Paste-safety gate
 ```
 
 The fraud decision is pure and heavily tested; every network and file operation

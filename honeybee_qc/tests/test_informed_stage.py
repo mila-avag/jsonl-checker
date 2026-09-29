@@ -31,17 +31,20 @@ from honeybee_qc.gates import (
     evaluate_check_95,
     evaluate_check_110,
     evaluate_check_220,
+    evaluate_check_450,
     evaluate_check_470,
     evaluate_relevant_turns,
 )
 from honeybee_qc.informed_prompts import (
     TARGET_OUTCOME_SCHEMA,
+    build_artifact_confirmation_prompt,
     build_artifact_prompt,
     build_autofail_prompt,
     build_criterion_turns_prompt,
     build_dimension_justification_prompt,
     build_dimension_turns_prompt,
     build_key_turn_justification_prompt,
+    build_ranking_justification_prompt,
     build_target_outcome_prompt,
     build_verdict_prompt,
 )
@@ -51,6 +54,7 @@ from honeybee_qc.informed_stages import (
     build_informed_requests,
     empty_justification_findings,
     estimate_informed_calls,
+    justification_coverage,
     missing_turn_findings,
     parse_artifacts,
     parse_autofails,
@@ -58,10 +62,12 @@ from honeybee_qc.informed_stages import (
     parse_key_turn_justification,
     parse_relevant_turns,
     parse_target_outcome,
+    rendered_evidence_by_group,
     run_informed_stage,
 )
 from honeybee_qc.llm import FakeModelClient, ModelResponse
 from honeybee_qc.models import CriterionRating, KeyTurn, Sxs, Turn
+from honeybee_qc.taxonomies import RATING_DIMENSIONS
 from honeybee_qc.tests.fixtures import make_task
 
 TASK = make_task()
@@ -113,6 +119,144 @@ def test_95_is_clean_when_the_response_produced_no_files_at_all():
     """The spec makes this an explicit 5, so an empty extraction must not fail."""
     finding = ArtifactFinding(model="A", claimed_files=[], uploaded_files=[])
     assert evaluate_check_95(TASK, [finding]).band == "clean"
+
+
+# The named-file comparison cannot reach this. `attachments` is the union of the
+# final-outputs upload and the per-turn uploads, so a task that attached all 24
+# of its files turn by turn and left the final-outcome section empty matched
+# every claim it made and scored "24 claimed, 24 uploaded, 0 missing" -- on a
+# task the customer failed precisely for leaving that section empty.
+
+
+def _delivering(model: str, *, declared: bool, final_uploads: list[str]):
+    from ..models import ModelSubmission, Turn
+
+    return ModelSubmission(
+        model=model,  # type: ignore[arg-type]
+        final_outputs_declared=declared,
+        final_output_uploads=final_uploads,
+        attachments=["s3://turn-upload-1"],
+        conversation=[
+            Turn(index=1, role="user", text="make me the deck"),
+            Turn(index=1, role="assistant", text="Here it is.", artifacts_mentioned=["deck.pdf"]),
+        ],
+    )
+
+
+def test_95_fails_when_the_final_outcome_section_is_empty_though_files_were_delivered():
+    task = make_task()
+    task.model_a = _delivering("A", declared=True, final_uploads=[])
+    task.model_b = _delivering("B", declared=True, final_uploads=["s3://final-1"])
+
+    verdict = evaluate_check_95(task, [ArtifactFinding(model="A", claimed_files=[], uploaded_files=[])])
+
+    assert verdict.band == "fail"
+    gaps = verdict.measurement.counts["empty_final_outputs_section"]
+    assert len(gaps) == 1 and gaps[0].startswith("A:"), "only the empty submission is faulted"
+
+
+def test_95_does_not_fault_a_taxonomy_with_no_final_outcome_section():
+    """Absent is not empty. Failing a contributor for a field they were never
+    shown would invent a rule the customer does not have."""
+    task = make_task()
+    task.model_a = _delivering("A", declared=False, final_uploads=[])
+    task.model_b = _delivering("B", declared=False, final_uploads=[])
+
+    verdict = evaluate_check_95(task, [ArtifactFinding(model="A", claimed_files=[], uploaded_files=[])])
+    assert verdict.band == "clean"
+
+
+def test_95_does_not_fault_an_empty_section_when_nothing_was_delivered():
+    """A conversation that produced no files has nothing to preserve."""
+    from ..models import ModelSubmission, Turn
+
+    task = make_task()
+    for slot in ("A", "B"):
+        sub = ModelSubmission(
+            model=slot,  # type: ignore[arg-type]
+            final_outputs_declared=True,
+            conversation=[Turn(index=1, role="assistant", text="Here is the answer in prose.")],
+        )
+        setattr(task, f"model_{slot.lower()}", sub)
+
+    verdict = evaluate_check_95(task, [ArtifactFinding(model="A", claimed_files=[], uploaded_files=[])])
+    assert verdict.band == "clean"
+
+
+def test_95_does_not_certify_an_extraction_that_read_nothing_against_uploaded_files():
+    """Zero claimed against a non-empty manifest is not a comparison.
+
+    On the sheet22 run 26 of 60 tasks reported no claimed files and the check
+    scored 2 true positives against 8 misses, with the auditors on the missed
+    ones pointing at deliveries visible only in the exported chat PDF. Clean
+    means the subtraction ran and came out even; here it had nothing to subtract.
+    """
+    finding = ArtifactFinding(
+        model="A", claimed_files=[], uploaded_files=["deck.pdf", "notes.md"]
+    )
+    verdict = evaluate_check_95(make_task(), [finding])
+
+    assert verdict.band == "not_evaluated"
+    assert "nothing was compared" in verdict.measurement.notes
+
+
+def test_95_does_not_certify_a_submission_whose_replies_were_never_fetched():
+    """An empty extraction over the user's half of a conversation is a fact about
+    the fetch. The PDF fallback is the exception: it puts the model's words in
+    front of the extraction even though they never become numbered turns."""
+    from ..models import ModelSubmission, Turn
+
+    task = make_task()
+    task.model_a = ModelSubmission(
+        model="A",  # type: ignore[arg-type]
+        conversation=[Turn(index=1, role="user", text="make me the deck")],
+    )
+    finding = ArtifactFinding(model="A", claimed_files=[], uploaded_files=[])
+
+    assert evaluate_check_95(task, [finding]).band == "not_evaluated"
+
+    task.model_a = dataclasses.replace(task.model_a, transcript_pdf="s3://chat.pdf")
+    policy = dataclasses.replace(DEFAULT_POLICY, fetch_attachment_text=True)
+    assert evaluate_check_95(task, [finding], policy).band == "clean"
+
+
+def test_95_still_fails_a_missing_file_when_another_submission_was_uncomparable():
+    """A finding made on evidence outranks an abstention made for want of it."""
+    findings = [
+        ArtifactFinding(
+            model="A",
+            claimed_files=["deck.pdf"],
+            uploaded_files=[],
+            missing_files=["deck.pdf"],
+        ),
+        ArtifactFinding(model="B", claimed_files=[], uploaded_files=["notes.md"]),
+    ]
+    assert evaluate_check_95(make_task(), findings).band == "fail"
+
+
+def test_the_artifact_extraction_is_not_shown_the_upload_manifest():
+    """It is asked to read delivered filenames out of the conversation and is then
+    compared against that manifest. Showing it the answer made the comparison
+    self-confirming on turns rendering as bare `[image]`: the judge named the
+    file from the manifest, and the manifest then matched it."""
+    from ..context import render_conversation
+    from ..informed_prompts import build_artifact_prompt
+    from ..models import ModelSubmission, Turn
+
+    name = "Gemini_Generated_Image_648jpb.jpeg"
+    sub = ModelSubmission(
+        model="A",  # type: ignore[arg-type]
+        attachments=["s3://x"],
+        attachment_names={"s3://x": name},
+        conversation=[Turn(index=1, role="assistant", text="[image] [image]")],
+    )
+    task = make_task()
+    task.model_a = sub
+
+    assert name not in build_artifact_prompt(task, sub)
+    # Every other consumer still gets it: the name is real evidence for them.
+    assert name in render_conversation(sub)[0]
+    assert name not in render_conversation(sub, list_attachment_names=False)[0]
 
 
 def test_95_ignores_files_the_model_only_described():
@@ -181,7 +325,17 @@ def test_95_does_not_name_files_when_the_manifest_has_no_filenames():
     assert evaluate_check_95(TASK, [finding]).band == "clean"
 
 
-def test_95_still_catches_a_shortfall_when_it_cannot_name_the_missing_file():
+def test_95_reports_a_nameless_shortfall_as_not_evaluated_rather_than_failing_it():
+    """The bare count basis cannot reach the safeguard this check depends on.
+
+    On the filename basis every missing name goes to a confirming call that can
+    clear it, and it does the work: on one live task confirmation cleared 10 of 12
+    names. On the count basis there is no name to put to it, so the confirming pass
+    never runs -- and the check was publishing a task-level fail anyway. Six of
+    twelve live 95 escalations came this way, four on tasks human QC passed, three
+    of them the sole cause of the task's fail. The arithmetic is still published;
+    what is withheld is the claim that a file was established missing.
+    """
     sub = dataclasses.replace(
         TASK.model_a,
         attachments=["https://scale-cds-public-us-west-2.s3.amazonaws.com/6463e58/ZQjy98e"],
@@ -201,10 +355,41 @@ def test_95_still_catches_a_shortfall_when_it_cannot_name_the_missing_file():
     )
     assert finding.shortfall == 2
     verdict = evaluate_check_95(TASK, [finding])
-    assert verdict.band == "fail"
-    assert verdict.measurement.numerator == 2
+    assert verdict.band == "not_evaluated"
+    assert verdict.confidence == "low"
+    # The shortfall is real arithmetic and is not suppressed -- it is just not
+    # counted as a missing file.
+    assert verdict.measurement.counts["unconfirmable_count_shortfall"] == 2
+    assert verdict.measurement.counts["unconfirmable_count_by_model"] == {"A": 2}
+    assert verdict.measurement.counts["files_missing"] == 0
+    assert verdict.measurement.counts["files_missing_before_confirmation"] == 2
+    assert verdict.measurement.numerator == 0
+    assert "nothing the confirming pass could be asked about" in verdict.measurement.notes
     # Nothing is named, because nothing can be.
     assert all("a.txt" not in item for item in verdict.contributing_items)
+
+
+def test_95_still_fails_a_named_file_the_confirming_pass_agreed_was_absent():
+    """The counterpart: the filename basis is untouched, because there the
+    safeguard runs and a name that survives it is evidence."""
+    sub = dataclasses.replace(TASK.model_a, attachments=["b.txt"])
+    finding = parse_artifacts(
+        _response(
+            {
+                "claimed_files": [
+                    {"filename": "a.txt", "turn": 3, "quote": "q", "produced": True},
+                    {"filename": "b.txt", "turn": 4, "quote": "q", "produced": True},
+                ],
+                "confidence": "high",
+            }
+        ),
+        sub,
+    )
+    assert finding.basis == "filename"
+    assert finding.missing_files == ["a.txt"]
+    verdict = evaluate_check_95(TASK, [finding])
+    assert verdict.band == "fail"
+    assert verdict.measurement.counts["unconfirmable_count_shortfall"] == 0
 
 
 def test_95_treats_a_duplicate_upload_suffix_as_the_same_file():
@@ -328,6 +513,77 @@ def test_95_decides_on_the_upload_manifest_not_on_what_the_model_claims():
     assert evaluate_check_95(TASK, [finding]).band == "fail"
 
 
+def test_95_reports_rather_than_fails_a_wholly_unpreserved_set_of_deliveries():
+    """The strongest case for the count basis, and it is still reported rather than
+    counted. This is a deliberate trade and the reasoning belongs next to it.
+
+    A model delivered an image in seventeen of twenty turns and preserved none of
+    them. Image-generation turns carry no filename, so every delivery is marked
+    unverifiable and left out of the name comparison, and eighteen deliveries
+    against zero uploads is arithmetically eighteen files short. Nothing needs a
+    name to see that.
+
+    What has no name is what the confirming pass would be asked about, and this
+    check's rule is that a missing file is one a confirming pass agreed was absent.
+    The empirical record decides the tie: every live escalation of this exact shape
+    -- `16 missing of 0 claimed`, `15 of 0`, `2 of 0`, `1 of 0` -- was on a task
+    human QC passed, and three were the sole cause of the fail. The shape does not
+    distinguish "delivered eighteen images and kept none" from "our extraction read
+    no filenames out of a page that had them".
+
+    So the finding is published in full and the band withheld. Recovering the
+    recall needs a confirming pass that can be asked about a delivery it cannot
+    name -- new model calls, and out of scope for a band change.
+    """
+    sub = dataclasses.replace(TASK.model_a, attachments=[])
+    finding = parse_artifacts(
+        _response(
+            {
+                "claimed_files": [
+                    {"filename": f"[unnamed image - revision {i}]", "turn": i,
+                     "quote": "here is the image", "produced": True,
+                     "unverifiable": True,
+                     "why_unverifiable": "image turns carry no filename"}
+                    for i in range(1, 19)
+                ],
+                "confidence": "high",
+            }
+        ),
+        sub,
+    )
+    assert finding.basis == "count"
+    assert finding.shortfall == 18
+    # Still no name: the shortfall is a quantity, so nothing was guessed at.
+    assert finding.missing_files == []
+
+    verdict = evaluate_check_95(TASK, [finding])
+    assert verdict.band == "not_evaluated"
+    assert verdict.measurement.counts["unconfirmable_count_shortfall"] == 18
+    assert verdict.measurement.numerator == 0
+    # The evidence is not suppressed: the detail line carries the numbers and says
+    # in words why they are not counted.
+    detail = verdict.measurement.counts["unconfirmable_count_detail"]
+    assert detail == [
+        "A: 18 of 18 files not accounted for, on a manifest carrying no readable "
+        "filename -- nothing to put to a confirming call, so this is reported and "
+        "not counted"
+    ]
+    assert all(
+        "unnamed image" not in item for item in verdict.contributing_items
+    )
+
+
+def test_95_stays_clean_when_a_response_with_no_uploads_produced_nothing():
+    """The explicit 5 the spec grants a response that produced no files. Firing
+    the count fallback at zero uploads must not turn that into a shortfall."""
+    sub = dataclasses.replace(TASK.model_a, attachments=[])
+    finding = parse_artifacts(
+        _response({"claimed_files": [], "confidence": "high"}), sub
+    )
+    assert finding.shortfall == 0
+    assert evaluate_check_95(TASK, [finding]).band == "clean"
+
+
 # ---------------------------------------------------------------------------
 # 220 -- autofail and its second opinion
 # ---------------------------------------------------------------------------
@@ -448,21 +704,44 @@ def test_a_score_zero_criterion_citing_no_turn_is_recorded_separately():
     assert lenient.band == "clean"
 
 
+def test_simplified_score_zero_empty_turns_are_not_missing_citations():
+    """S has no turn-attribution field. Empty score-0 lists there are not 280."""
+    from honeybee_qc.tests.fixtures import make_submission
+
+    task = dataclasses.replace(
+        TASK,
+        simplified=make_submission("S", exchanges=1, per_turn_links=False),
+        criterion_ratings=[
+            CriterionRating(criterion_id="C1", model="S", score=0, relevant_turns=[]),
+            CriterionRating(criterion_id="C1", model="A", score=0, relevant_turns=[]),
+        ],
+    )
+    findings = missing_turn_findings(task, 280)
+    assert [f.model for f in findings] == ["A"]
+    assert findings[0].item_id == "C1"
+
+
 # ---------------------------------------------------------------------------
 # 450 -- justifications
 # ---------------------------------------------------------------------------
 
 
 def test_450_thresholds_are_counted_within_one_justification_not_pooled():
-    """Two justifications with one unsupported claim each are an issue but not a
-    fail; one justification with two is a fail."""
+    """One justification with two unsupported claims meets the floor on its own
+    counts. Split across two justifications the floor is not met by either, and
+    each is credited only because the other repeats it -- so both are counted
+    failing, but through the share rather than the severity escape."""
+    from honeybee_qc.gates import evaluate_check_450
+
     split = [
         JustificationFinding(item_id="A::Outcome quality", unsupported_claims=1),
         JustificationFinding(item_id="A::Trust & grounding", unsupported_claims=1),
     ]
-    from honeybee_qc.gates import evaluate_check_450
-
-    assert evaluate_check_450(TASK, split).band == "non_fail"
+    v = evaluate_check_450(TASK, split)
+    assert v.measurement.counts["severe_conditions_by_item"] == {}
+    assert sorted(v.measurement.counts["aggregated_conditions_by_item"]) == [
+        "A::Outcome quality"
+    ]
 
     together = [JustificationFinding(item_id="A::Outcome quality", unsupported_claims=2)]
     assert evaluate_check_450(TASK, together).band == "fail"
@@ -551,6 +830,47 @@ def test_450_prompt_asks_for_specifics_before_the_generic_call():
     assert "specifics_quoted" in prompt
     assert "2-3 sentences" in prompt
     assert "unverifiable_claims" in prompt
+
+
+def test_both_450_prompts_carry_the_task_s_weighted_rubric():
+    """A contributor rates against the rubric, and a judge that cannot see it
+    reads a claim quoting a requirement as a claim inventing a standard. On
+    `6a7d3a48a9485b6a031cb312`, which QC scored 5, the contributor faulted a model
+    for returning no Google Drive link -- a weight-4 criterion -- and all five
+    draws called it an inaccurate primary claim, which fails the task on its own."""
+    criterion = TASK.rubric[0]
+    for prompt in (
+        build_dimension_justification_prompt(TASK, TASK.model_a),
+        build_ranking_justification_prompt(TASK),
+    ):
+        assert criterion.text in prompt
+        assert f"weight {criterion.weight}" in prompt
+        assert "invented standard, and it is not an inaccurate claim" in prompt
+
+
+def test_an_oversized_rubric_keeps_its_heaviest_criteria():
+    """The cap is a guard, not a routine trim -- the sheet22 rubrics rendered at
+    3.6k to 7.8k characters against it -- but weight is the task's own statement
+    of which requirements matter, so it is what survives the cut."""
+    from ..models import RubricCriterion
+
+    task = dataclasses.replace(
+        TASK,
+        rubric=[
+            RubricCriterion(
+                criterion_id=f"C{i}",
+                text=f"Requirement {i}. " + "x" * 200,
+                weight=5 if i == 0 else 1,
+            )
+            for i in range(40)
+        ],
+    )
+    policy = dataclasses.replace(DEFAULT_POLICY, max_rubric_prompt_chars=2000)
+
+    prompt = build_dimension_justification_prompt(task, task.model_a, policy)
+
+    assert "Requirement 0." in prompt
+    assert "criteria of lower weight omitted" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1383,71 @@ def test_an_abstained_justification_leaves_450s_denominator_and_is_still_reporte
     ]
 
 
+def test_450_will_not_certify_a_task_whose_second_model_never_came_back():
+    """End to end: model B's batched call returns nothing, so the check reports
+    over model A's seven and has no basis for saying the task did not fail."""
+
+    def respond(request):
+        if request.metadata.get("check_id") != 450:
+            return {"confidence": "high"}
+        if request.metadata.get("model") == "B":
+            return {"justifications": [], "confidence": "high"}
+        return {
+            "justifications": [
+                {"item_id": f"A::{d}"} for d in RATING_DIMENSIONS
+            ],
+            "confidence": "high",
+        }
+
+    result = run_informed_stage(TASK, FakeModelClient(respond), workers=1)
+
+    verdict = next(v for v in result.verdicts if v.check_id == 450)
+    assert verdict.band == "not_evaluated"
+    assert result.to_dict()["justification_coverage"]["audited"]["B"] == 0
+
+
+def test_the_450_population_is_derived_from_the_task_s_own_ratings():
+    """Not from the ~15 a full task carries. A task with two dimensions marked
+    N/A holds 13 justifications, and an expectation of 15 would report it short
+    when every justification it has was read."""
+    task = dataclasses.replace(
+        TASK,
+        dimension_ratings=[
+            dataclasses.replace(d, not_applicable=d.dimension == "Memory & personalization")
+            for d in TASK.dimension_ratings
+        ],
+    )
+    audited = [
+        JustificationFinding(item_id=f"{d.model}::{d.dimension}")
+        for d in task.dimension_ratings
+        if not d.not_applicable
+    ] + [JustificationFinding(item_id="ranking")]
+
+    coverage = justification_coverage(task, audited, [])
+
+    assert coverage.expected["A"] == [f"A::{d}" for d in RATING_DIMENSIONS[:5]]
+    assert coverage.missing == []
+    assert coverage.undercovered(DEFAULT_POLICY.min_judged_ratio) == {}
+
+
+def test_an_abstained_justification_does_not_count_as_one_that_was_read():
+    """An abstention is a judgment and leaves the gate's numerator and
+    denominator by design, but it is not evidence the contributor's argument
+    holds, so it cannot certify the population either."""
+    audited = [
+        JustificationFinding(item_id=f"A::{d}") for d in RATING_DIMENSIONS
+    ] + [JustificationFinding(item_id="ranking")]
+    abstained = [
+        JustificationFinding(item_id=f"B::{d}", unverifiable=True)
+        for d in RATING_DIMENSIONS
+    ]
+
+    coverage = justification_coverage(TASK, audited, abstained)
+
+    assert coverage.missing == []
+    assert coverage.undercovered(DEFAULT_POLICY.min_judged_ratio) == {"B": 0.0}
+
+
 def test_one_abstention_does_not_take_the_other_justifications_out_of_450():
     def respond(request):
         if request.metadata.get("check_id") != 450:
@@ -1089,6 +1474,123 @@ def test_one_abstention_does_not_take_the_other_justifications_out_of_450():
     verdict = next(v for v in result.verdicts if v.check_id == 450)
     assert verdict.measurement.denominator == 1
     assert verdict.band == "fail"
+
+
+# ---------------------------------------------------------------------------
+# 450's second coverage question: was there anything to judge the
+# justifications against?
+# ---------------------------------------------------------------------------
+
+
+def _blind(sub):
+    """A submission whose conversation could not be retrieved at all."""
+    return dataclasses.replace(sub, conversation=[], attachments=[], transcript_pdf="")
+
+
+def test_rendered_evidence_is_read_from_the_profile_not_the_rendered_string():
+    """The trap this guards is specific. Since the absent-conversation marker
+    landed, a submission with no transcript renders a non-empty block -- the marker
+    itself -- so testing the string for content reports exactly the submissions the
+    marker exists to flag as fully evidenced.
+    """
+    from honeybee_qc.context import render_conversation
+
+    task = dataclasses.replace(TASK, model_b=_blind(TASK.model_b))
+    rendered, _ = render_conversation(task.model_b)
+    assert rendered.strip(), "the marker is there, which is the point"
+
+    evidence = rendered_evidence_by_group(task)
+    assert evidence["A"] is True
+    assert evidence["B"] is False
+
+
+def test_a_450_fail_resting_only_on_a_model_with_no_transcript_is_not_evaluated():
+    """The hole `justification_coverage` cannot see.
+
+    Coverage counts how many justifications came back. A judge handed a blank
+    conversation and asked to audit fifteen arguments about it has always abstained
+    in practice -- every observed instance, all counters zero -- and coverage catches
+    that. Nothing in the code requires it. A judge that reports a defect instead
+    makes its items audited, leaves coverage complete, and carries a fail on evidence
+    that was never rendered.
+    """
+    findings = [
+        JustificationFinding(item_id="B::Outcome quality", inaccurate_primary_claims=1)
+    ]
+    task = dataclasses.replace(TASK, model_b=_blind(TASK.model_b))
+
+    # Without the evidence map, the fail stands -- which is the behaviour every
+    # replay of stored findings against a bare `Task` keeps.
+    assert evaluate_check_450(task, findings).band == "fail"
+
+    verdict = evaluate_check_450(
+        task, findings, DEFAULT_POLICY, None, rendered_evidence_by_group(task)
+    )
+    assert verdict.band == "not_evaluated"
+    assert verdict.measurement.counts["unevidenced_groups"] == ["B"]
+    assert verdict.measurement.counts["evidence_by_group"] == {"A": True, "B": False}
+    assert "no turn of it reached the judge" in verdict.measurement.notes
+
+
+def test_a_450_fail_with_one_triggering_item_from_a_rendered_model_still_fails():
+    """Deliberately narrow. A defect read from evidence stands on the evidence it
+    was read from, and ten of the twelve failed hydrations across three corpora
+    still reached the judge with 9.5k to 114k characters -- so this must guard the
+    two that did not, not hydration trouble in general."""
+    findings = [
+        JustificationFinding(item_id="A::Outcome quality", inaccurate_primary_claims=1),
+        JustificationFinding(item_id="B::Outcome quality", inaccurate_primary_claims=1),
+    ]
+    task = dataclasses.replace(TASK, model_b=_blind(TASK.model_b))
+
+    verdict = evaluate_check_450(
+        task, findings, DEFAULT_POLICY, None, rendered_evidence_by_group(task)
+    )
+    assert verdict.band == "fail"
+    # The shape is still published, so a reader can see the fail rests on A.
+    assert verdict.measurement.counts["unevidenced_groups"] == ["B"]
+    assert "Reported despite missing evidence for model B" in verdict.measurement.notes
+
+
+def test_the_ranking_justification_needs_only_one_conversation_to_be_judgeable():
+    """It is judged against both, so it is unattributable only when neither was
+    rendered. Keying it off a model slot it does not have would abstain the check
+    every time either side failed to hydrate."""
+    findings = [JustificationFinding(item_id="ranking", inaccurate_primary_claims=1)]
+
+    one_side = dataclasses.replace(TASK, model_b=_blind(TASK.model_b))
+    verdict = evaluate_check_450(
+        one_side, findings, DEFAULT_POLICY, None, rendered_evidence_by_group(one_side)
+    )
+    assert verdict.band == "fail"
+
+    neither = dataclasses.replace(
+        TASK, model_a=_blind(TASK.model_a), model_b=_blind(TASK.model_b)
+    )
+    verdict = evaluate_check_450(
+        neither, findings, DEFAULT_POLICY, None, rendered_evidence_by_group(neither)
+    )
+    assert verdict.band == "not_evaluated"
+    assert verdict.measurement.counts["unevidenced_groups"] == ["ranking"]
+
+
+def test_the_evidence_guard_never_manufactures_a_fail_or_moves_a_clean():
+    """It only ever takes a fail off the table. A blank conversation must not turn a
+    clean task into anything, and must not turn a non-fail into a fail."""
+    task = dataclasses.replace(TASK, model_b=_blind(TASK.model_b))
+    evidence = rendered_evidence_by_group(task)
+
+    clean = [JustificationFinding(item_id="B::Outcome quality")]
+    assert (
+        evaluate_check_450(task, clean, DEFAULT_POLICY, None, evidence).band == "clean"
+    )
+
+    # An issue below every condition floor: non-fail with or without the map.
+    minor = [JustificationFinding(item_id="B::Outcome quality", unsupported_claims=1)]
+    assert (
+        evaluate_check_450(task, minor, DEFAULT_POLICY, None, evidence).band
+        == "non_fail"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1724,67 @@ def test_95_confirmation_clears_content_the_model_printed_inline():
     assert evaluate_check_95(TASK, [finding]).band == "clean"
 
 
+def test_95_supersession_cannot_clear_a_draft_of_a_final_that_was_never_uploaded():
+    """The unguarded clearance, and the task it cost.
+
+    Three documents were handed over and none of them reached the manifest; the
+    confirming pass read all three as intermediate drafts and the check came out
+    clean. `superseded` says a later version survived, so it is only ever
+    available when something this model delivered actually did survive -- with an
+    empty manifest every missing file can be called a draft of the next one.
+    """
+    finding = _artifact_finding(
+        ["draft_v1.docx", "draft_v2.docx", "draft_v3.docx"], ["unrelated_notes.txt"]
+    )
+    assert finding.missing_files == ["draft_v1.docx", "draft_v2.docx", "draft_v3.docx"]
+
+    apply_artifact_confirmation(
+        finding,
+        {
+            "files": [
+                {"claimed_filename": name, "assessment": "superseded",
+                 "matched_upload": "",
+                 "why": "an intermediate draft of the final digest"}
+                for name in ("draft_v1.docx", "draft_v2.docx", "draft_v3.docx")
+            ],
+            "confidence": "high",
+        },
+    )
+
+    assert finding.confirmed_missing == [
+        "draft_v1.docx", "draft_v2.docx", "draft_v3.docx"
+    ]
+    assert "no final state" in finding.confirmation_reasons["draft_v1.docx"]
+    assert evaluate_check_95(TASK, [finding]).band == "fail"
+
+
+def test_95_a_rename_establishes_the_final_a_later_supersession_needs():
+    """The clearance is guarded, not withdrawn. Once one delivery is shown to be
+    in the manifest -- here by a rename the arithmetic accepted -- the drafts
+    behind it have a final state to have been carried into."""
+    finding = _artifact_finding(
+        ["digest_draft.docx", "digest_final.docx"], ["Digest FINAL v3 (1).docx"]
+    )
+    assert finding.missing_files == ["digest_draft.docx", "digest_final.docx"]
+
+    apply_artifact_confirmation(
+        finding,
+        {
+            "files": [
+                {"claimed_filename": "digest_final.docx", "assessment": "renamed",
+                 "matched_upload": "Digest FINAL v3 (1).docx",
+                 "why": "the same document under the upload widget's suffix"},
+                {"claimed_filename": "digest_draft.docx", "assessment": "superseded",
+                 "matched_upload": "",
+                 "why": "turn 3's draft, revised into the final in turn 8"},
+            ],
+            "confidence": "high",
+        },
+    )
+    assert finding.confirmed_missing == []
+    assert evaluate_check_95(TASK, [finding]).band == "clean"
+
+
 def test_95_confirmation_still_fails_a_genuinely_absent_file():
     """The pass must be able to say no, or it is just a way of never failing."""
     finding = _artifact_finding(["report.pdf"], ["summary.pdf"])
@@ -1297,6 +1860,186 @@ def test_95_an_unreadable_assessment_leaves_the_file_counted():
     # Conservative direction: an answer we cannot read is not a clearance.
     assert finding.confirmed_missing == ["report.pdf"]
     assert evaluate_check_95(TASK, [finding]).band == "fail"
+
+
+def test_95_a_described_file_with_no_readable_name_is_not_counted_missing():
+    """A bracketed description is not a filename and cannot be looked up as one.
+
+    Image-generation turns carry no filenames, so the extraction writes down what it
+    saw: `[unnamed image - cardiac workflow, initial version]`. One task put six of
+    those in its missing list and failed on them. They can never match a manifest
+    entry, so counting them is the invented-filename failure the unverifiable
+    channel already exists to prevent.
+    """
+    finding = _artifact_finding(
+        [
+            "[unnamed image - cardiac workflow, initial version]",
+            "(unnamed diagram, second attempt)",
+            "deck.pptx",
+        ],
+        ["deck.pptx"],
+    )
+
+    assert finding.claimed_files == ["deck.pptx"]
+    assert finding.missing_files == []
+    assert len(finding.unverifiable_files) == 2
+    assert evaluate_check_95(TASK, [finding]).band == "clean"
+
+
+def test_95_one_upload_cannot_account_for_four_claimed_deliverables():
+    """The false pass this arithmetic exists to stop.
+
+    A live task delivered a digest and three revisions of it, uploaded one file, and
+    came out clean: three of the four claims fuzzy-matched the same
+    `... V3 (1).docx`, and the fourth was cleared as a rename of it. Whatever the
+    names read like, four deliverables are not one file, and the check has to be
+    able to say so before any judge is asked anything.
+    """
+    finding = _artifact_finding(
+        [
+            "Daily Digest.docx",
+            "Daily Digest V2.docx",
+            "Daily Digest V3.docx",
+            "Daily Digest Final Master.docx",
+        ],
+        ["Daily Digest V3 (1).docx"],
+    )
+
+    # Exactly one claim is accounted for; the other three are unresolved rather
+    # than silently matched to a file already spoken for.
+    assert len(finding.fuzzy_matched_files) == 1
+    assert len(finding.missing_files) == 3
+    assert finding.unmatched_uploads == []
+
+
+def test_95_a_rename_cannot_point_at_an_upload_another_file_already_claimed():
+    finding = _artifact_finding(
+        ["digest (1).docx", "digest-final.docx"], ["digest (1).docx"]
+    )
+    # The first claim matches the only upload exactly; the second has nothing left
+    # to be, however well its content lines up.
+    assert finding.missing_files == ["digest-final.docx"]
+    assert finding.unmatched_uploads == []
+
+    apply_artifact_confirmation(
+        finding,
+        {
+            "files": [
+                {
+                    "claimed_filename": "digest-final.docx",
+                    "assessment": "renamed",
+                    "matched_upload": "digest (1).docx",
+                    "why": "the turn 22 final has the same content as the uploaded copy",
+                }
+            ],
+            "confidence": "high",
+        },
+    )
+
+    assert finding.confirmations["digest-final.docx"] == "missing"
+    assert finding.confirmed_missing == ["digest-final.docx"]
+    assert evaluate_check_95(TASK, [finding]).band == "fail"
+    # The judge's own reading is kept, under the verdict the manifest supports.
+    assert "no upload is unaccounted for" in finding.confirmation_reasons[
+        "digest-final.docx"
+    ]
+
+
+def test_95_a_rename_against_an_unclaimed_upload_still_clears():
+    """The loosening must not become a blanket refusal of renames."""
+    finding = _artifact_finding(["chart.png"], ["Screenshot 2026-08-02.png", "notes.md"])
+    assert finding.unmatched_uploads
+
+    apply_artifact_confirmation(
+        finding,
+        {
+            "files": [
+                {
+                    "claimed_filename": "chart.png",
+                    "assessment": "renamed",
+                    "matched_upload": "Screenshot 2026-08-02.png",
+                    "why": "turn 4 delivers the chart and this is the only image uploaded",
+                }
+            ],
+            "confidence": "high",
+        },
+    )
+
+    assert finding.confirmed_missing == []
+    assert evaluate_check_95(TASK, [finding]).band == "clean"
+
+
+def test_95_two_renames_cannot_both_claim_the_same_upload():
+    finding = _artifact_finding(["a.png", "b.png"], ["Screenshot 1.png"])
+    assert finding.missing_files == ["a.png", "b.png"]
+
+    apply_artifact_confirmation(
+        finding,
+        {
+            "files": [
+                {"claimed_filename": "a.png", "assessment": "renamed",
+                 "matched_upload": "Screenshot 1.png", "why": "same image"},
+                {"claimed_filename": "b.png", "assessment": "renamed",
+                 "matched_upload": "Screenshot 1.png", "why": "also the same image"},
+            ],
+            "confidence": "high",
+        },
+    )
+
+    assert finding.confirmations["a.png"] == "renamed"
+    assert finding.confirmations["b.png"] == "missing"
+    assert finding.confirmed_missing == ["b.png"]
+
+
+def test_95_an_intermediate_revision_whose_final_state_was_uploaded_is_cleared():
+    """What the check asks is whether the work product survived, not every draft.
+
+    A twelve-round image-editing session hands the user a download link on every
+    round. Counting each of those as a deliverable the contributor failed to
+    preserve made three tasks fail for uploading exactly the thing that was asked
+    for: the finished image.
+    """
+    finding = _artifact_finding(
+        ["diagram-draft1.png", "diagram-final.png"], ["diagram-final.png"]
+    )
+    assert finding.missing_files == ["diagram-draft1.png"]
+
+    apply_artifact_confirmation(
+        finding,
+        {
+            "files": [
+                {
+                    "claimed_filename": "diagram-draft1.png",
+                    "assessment": "superseded",
+                    "matched_upload": "",
+                    "why": "turn 3's first pass, revised in place by turn 9's final, which is uploaded",
+                }
+            ],
+            "confidence": "high",
+        },
+    )
+
+    assert finding.confirmed_missing == []
+    verdict = evaluate_check_95(TASK, [finding])
+    assert verdict.band == "clean"
+    assert verdict.measurement.counts["cleared_by_confirmation"] == [
+        "A:diagram-draft1.png (superseded)"
+    ]
+
+
+def test_95_the_confirmation_prompt_says_which_uploads_are_already_spoken_for():
+    """A judge told only "here are the uploads" reasons as though all were free."""
+    prompt = build_artifact_confirmation_prompt(
+        TASK,
+        TASK.model_a,
+        ["digest-final.docx"],
+        ["digest (1).docx"],
+        DEFAULT_POLICY,
+        unmatched_uploads=[],
+    )
+    assert "every upload is already accounted for" in prompt
+    assert "already been matched to a different file" in prompt
+    assert "superseded" in prompt
 
 
 def test_95_a_finding_with_no_confirmation_behaves_exactly_as_before():

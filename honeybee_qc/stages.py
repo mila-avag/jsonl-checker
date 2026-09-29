@@ -37,6 +37,7 @@ from .prompts import (
     build_coverage_prompt,
     build_criterion_prompt,
 )
+from .projects import drop_disabled
 from .scoring import CheckVerdict, Measurement, build_verdict
 from .taxonomies import (
     L1_LABELS,
@@ -523,6 +524,18 @@ def run_rubric_stage(
     findings = [a.finding for a in result.audits if a.finding is not None]
     audited = set(result.audited_ids)
 
+    # Zero surviving audits is not a clean rubric: it is a failed stage.
+    # Scoring empty findings as 0% defects published L1/quality/weights as
+    # clean on a run where every criterion call 401'd.
+    if task.rubric and not audited:
+        result.verdicts = not_evaluated_rubric_verdicts(
+            task,
+            "every rubric criterion call failed; nothing was audited",
+            policy,
+        )
+        result.verdicts = drop_disabled(result.verdicts, task.project_id)
+        return result
+
     # A criterion whose call failed was not audited. Leaving it in the denominator
     # would dilute the rate with criteria nobody looked at, so it is excluded and
     # reported.
@@ -564,6 +577,7 @@ def run_rubric_stage(
             )
             verdict.confidence = "low"
 
+    result.verdicts = drop_disabled(result.verdicts, task.project_id)
     return result
 
 

@@ -8,7 +8,7 @@ import pytest
 
 from honeybee_qc.config import Policy
 from honeybee_qc.links import build_link_report, classify_link, evaluate_check_90
-from honeybee_qc.models import DimensionRating, Sxs
+from honeybee_qc.models import DimensionRating, KeyTurn, Sxs
 from honeybee_qc.preflight import load_tasks, parse_task, validate_batch, validate_task
 from honeybee_qc.tests.fixtures import CLAUDE, GEMINI, GPT, make_submission, make_task
 
@@ -26,6 +26,10 @@ from honeybee_qc.tests.fixtures import CLAUDE, GEMINI, GPT, make_submission, mak
         ("https://share.gemini.google/fpM8qqHSz7XG", "gemini"),
         ("https://chatgpt.com/share/8f2c1d4e9a0b", "gpt"),
         ("https://chat.openai.com/share/8f2c1d4e9a0b", "gpt"),
+        # ChatGPT's newer short share path. These are live public pages -- rejecting
+        # them failed check 90 for a link that opens perfectly well.
+        ("https://chatgpt.com/s/t_6a7f3244b17c8191a76fee9689ecb35d", "gpt"),
+        ("https://chat.openai.com/s/t_6a7f3244b17c8191a76fee9689ecb35d", "gpt"),
         ("https://claude.ai/share/1a2b3c4d5e6f", "claude"),
         ("https://www.claude.ai/share/1a2b3c4d5e6f", "claude"),
     ],
@@ -55,6 +59,18 @@ def test_invalid_links_are_rejected_with_a_reason(url, reason_fragment):
     result = classify_link(url)
     assert not result.valid
     assert reason_fragment in result.reason
+
+
+def test_chatgpts_short_share_path_is_not_confused_with_a_private_url():
+    """`/s/<id>` is a share link; `/c/<id>` is the author's own private chat.
+
+    Both are short paths off the same host, and only one of them opens for a
+    reviewer, so the distinction has to survive.
+    """
+    share = classify_link("https://chatgpt.com/s/t_6a7f3244b17c8191a76fee9689ecb35d")
+    private = classify_link("https://chatgpt.com/c/6a7f3244b17c8191a76fee9689ecb35d")
+    assert share.valid and share.share_id == "t_6a7f3244b17c8191a76fee9689ecb35d"
+    assert not private.valid
 
 
 def test_query_string_does_not_affect_validity():
@@ -301,6 +317,26 @@ def test_a_conversation_cut_off_before_the_reply_warns_instead_of_failing():
     res = validate_task(task)
     assert res.ok
     assert any("cut off mid-exchange" in w for w in res.warnings)
+
+
+def test_user_prompt_only_conversations_do_not_make_the_task_unauditable():
+    """Snowflake ingest stores user prompts before hydration. No assistant turns."""
+    task = make_task(key_turn=5)
+    task.model_a.conversation = [t for t in task.model_a.conversation if t.role == "user"]
+    task.model_b.conversation = [t for t in task.model_b.conversation if t.role == "user"]
+    res = validate_task(task)
+    assert not any("does not resolve to an assistant turn" in f for f in res.hard_failures)
+    assert any("no assistant turns" in w for w in res.warnings)
+
+
+def test_per_slot_key_turns_are_not_checked_against_the_other_models():
+    """Aspirational: A=17, B=13. Checking 17 on B was a false 1000."""
+    task = make_task(key_turn=17, exchanges=20)
+    task.model_a.key_turn = KeyTurn(turn_index=17, justification="A freeze")
+    task.model_b.key_turn = KeyTurn(turn_index=13, justification="B freeze")
+    res = validate_task(task)
+    assert not any("key_turn 17" in f and "model B" in f for f in res.hard_failures)
+    assert res.ok or not any("does not resolve" in f for f in res.hard_failures)
 
 
 def test_l2_label_without_a_configured_enum_warns_only():

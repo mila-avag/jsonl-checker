@@ -21,7 +21,13 @@ from honeybee_qc.cli import DETERMINISTIC_NOW, run_deterministic
 from honeybee_qc.config import DEFAULT_POLICY, Policy
 from honeybee_qc.errors import ERROR_CODES
 from honeybee_qc.gates import cited_turns, evaluate_check_96
-from honeybee_qc.models import CriterionRating, DimensionRating, KeyTurn, Turn
+from honeybee_qc.models import (
+    CriterionRating,
+    DimensionRating,
+    KeyTurn,
+    TurnManifestEntry,
+    Turn,
+)
 from honeybee_qc.preflight import MIN_EXPECTED_EXCHANGES, validate_task
 from honeybee_qc.registry import BLOCKS, REGISTRY
 from honeybee_qc.tests.fixtures import make_conversation, make_task
@@ -251,6 +257,99 @@ def test_citations_are_read_from_both_rating_surfaces():
     task.key_turn = KeyTurn(turn_index=None)
     assert cited_turns(task, "A") == {4, 11}
     assert cited_turns(task, "B") == set()
+
+
+# ---------------------------------------------------------------------------
+# Which record the count comes from
+# ---------------------------------------------------------------------------
+
+
+def _manifest(turns: int) -> list[TurnManifestEntry]:
+    return [
+        TurnManifestEntry(turn_number=i, prompt_text=f"turn {i}")
+        for i in range(1, turns + 1)
+    ]
+
+
+def test_a_short_fetch_cannot_overwrite_a_long_manifest():
+    """The latent false fail this guards, in the shape it would arrive in.
+
+    `sub.conversation` starts as the contributor's per-turn manifest and hydration
+    replaces it on any fetch that parsed one user turn, so a submission recording 22
+    turns whose share page renders 3 was failed on 3. Nothing reconciled the two.
+    """
+    task = make_task(exchanges=20)
+    task.model_a.conversation = make_conversation(3)
+    task.model_a.turn_manifest = _manifest(22)
+
+    verdict = evaluate_check_96(task)
+    assert verdict.band == "clean"
+    counts = verdict.measurement.counts
+    assert counts["turns_by_model"]["A"] == 22
+    assert counts["fetched_turns_by_model"]["A"] == 3
+    assert counts["manifest_turns_by_model"]["A"] == 22
+    assert counts["counted_from_manifest"] == ["A"]
+    assert "manifest is the longer record" in verdict.measurement.notes
+
+
+def test_the_fetch_still_carries_the_count_when_it_is_the_longer_record():
+    """The disagreement runs both ways, which is why neither record can be trusted
+    alone: `6a800beb4c1c25ccc73e4a91` slot A has a manifest of 1 and hydrated to 21.
+    """
+    task = make_task(exchanges=21)
+    task.model_a.turn_manifest = _manifest(1)
+
+    verdict = evaluate_check_96(task)
+    assert verdict.band == "clean"
+    assert verdict.measurement.counts["turns_by_model"]["A"] == 21
+    assert verdict.measurement.counts["counted_from_manifest"] == []
+
+
+def test_a_genuinely_short_submission_still_fails_on_both_records():
+    """Taking the greater of the two can only raise a count, and this check only
+    ever fails a submission for being low -- so the fix cannot manufacture a fail,
+    and it must not silence one either."""
+    task = make_task(exchanges=20)
+    task.model_a.conversation = make_conversation(3)
+    task.model_a.turn_manifest = _manifest(3)
+    _cite(task, "A", [1, 2, 3])
+    task.key_turn = KeyTurn(turn_index=3)
+
+    verdict = evaluate_check_96(task)
+    assert verdict.band == "fail"
+    assert verdict.contributing_items == ["model A: 3 turns"]
+
+
+def test_the_citation_ceiling_is_not_raised_by_a_contributor_manifest():
+    """The ceiling bounds a citation against something the audit retrieved itself.
+    Raising it with the manifest would let one contributor-authored document both
+    make a citation and corroborate it.
+    """
+    task = make_task(exchanges=6, key_turn=6)
+    task.model_a.turn_manifest = _manifest(40)
+    task.model_b.turn_manifest = _manifest(40)
+    _cite(task, "A", [1, 35])
+    _cite(task, "B", [1, 35])
+
+    verdict = evaluate_check_96(task)
+    assert verdict.measurement.counts["longest_fetched"] == 6
+    # A=40 from its manifest clears the bar; B is the same, so nothing is short.
+    assert verdict.measurement.counts["unverifiable_by_model"] == {}
+    assert verdict.band == "clean"
+
+
+def test_a_manifest_alone_is_enough_to_stop_the_submission_being_set_aside():
+    """A submission with a manifest is not a submission with no record of its
+    length, so it must not be reported as never fetched while its count is
+    published."""
+    task = make_task(exchanges=20)
+    task.model_b.conversation = []
+    task.model_b.turn_manifest = _manifest(9)
+
+    verdict = evaluate_check_96(task)
+    assert verdict.band == "clean"
+    assert verdict.measurement.counts["unverifiable_by_model"] == {}
+    assert verdict.measurement.counts["verified_by_model"] == {"A": 20, "B": 9}
 
 
 # ---------------------------------------------------------------------------

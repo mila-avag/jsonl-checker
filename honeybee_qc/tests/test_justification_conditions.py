@@ -9,6 +9,8 @@ and so treating "a slight preference for Product B" as contradicting a 5.
 
 from __future__ import annotations
 
+import dataclasses
+
 from honeybee_qc.config import Policy
 from honeybee_qc.findings import JustificationFinding
 from honeybee_qc.informed_prompts import (
@@ -115,6 +117,15 @@ def test_ranking_prompt_states_the_likert_scale():
     assert "4 is a tie" in prompt
 
 
+def test_d_vs_a_scale_note_puts_d_on_1():
+    """A DA pair that still says 1 = Model A is the polarity bug."""
+    from honeybee_qc.informed_prompts import _likert_scale_note
+
+    note = _likert_scale_note(Policy(), "D", "A")
+    assert "1 is the strongest preference for Model D" in note
+    assert "the strongest for Model A" in note
+
+
 def test_margin_encoding_describes_the_other_form():
     task = make_task()
     prompt = build_ranking_justification_prompt(
@@ -127,15 +138,16 @@ def test_margin_encoding_describes_the_other_form():
 def test_the_specs_per_condition_floors_are_unchanged_by_the_task_level_share():
     """The proportional task-level gate must not have leaked into the conditions.
 
-    Each floor here is the spec's own and is a statement about one argument: one
-    inaccurate load-bearing claim or one fabricated quote is enough, a
-    subordinate error or a misread of a real quote needs two. The share of
-    justifications that must trip is a separate, and separately invented,
-    question.
+    Every floor here is the spec's own except the subordinate-inaccuracy one, and
+    each is a statement about one argument: one inaccurate load-bearing claim or
+    one fabricated quote is enough, a misread of a real quote needs two. The
+    share of justifications that must trip is a separate, and separately
+    invented, question.
+
+    The exception is deliberate and is pinned in its own test below, so a floor
+    drifting from the spec by accident still fails here.
     """
     assert _finding(inaccurate_primary_claims=1).triggered_conditions() == ["is_inaccurate"]
-    assert _finding(inaccurate_secondary_claims=1).triggered_conditions() == []
-    assert _finding(inaccurate_secondary_claims=2).triggered_conditions() == ["is_inaccurate"]
     assert _finding(unsupported_claims=1).triggered_conditions() == []
     assert _finding(unsupported_claims=2).triggered_conditions() == ["lacks_evidence"]
     assert _finding(inaccurate_evidence=1).triggered_conditions() == [
@@ -147,11 +159,144 @@ def test_the_specs_per_condition_floors_are_unchanged_by_the_task_level_share():
     ]
 
 
-def test_the_task_level_share_is_declared_as_ours():
+def test_one_wrong_subordinate_claim_is_inaccurate_and_that_departs_from_the_spec():
+    """The one floor in this check that is ours rather than the customer's.
+
+    The auditor instructions say two subordinate errors, on the equivalence that
+    two of them are worth one load-bearing error. We fail on one. The reason is
+    in `findings.SECONDARY_INACCURACY_FLOOR`, and the consequence is that the
+    severe escape in `justification_severe_conditions` is reachable from a single
+    subordinate inaccuracy, so this is a wider door than the measurements quoted
+    around that field were taken through.
+
+    Pinned separately from the spec-conformance floors so that restoring the
+    spec's reading is a one-line change with one failing test, rather than
+    something that has to be rediscovered from the gate's behaviour.
+    """
+    from honeybee_qc.findings import SECONDARY_INACCURACY_FLOOR
+
+    assert SECONDARY_INACCURACY_FLOOR == 1
+    assert _finding(inaccurate_secondary_claims=1).triggered_conditions() == [
+        "is_inaccurate"
+    ]
+    assert _finding(inaccurate_secondary_claims=2).triggered_conditions() == [
+        "is_inaccurate"
+    ]
+
+
+def test_the_secondary_floor_is_not_advertised_to_the_judge():
+    """The judge buckets by what the rating leans on, not by what it costs.
+
+    `inaccurate_primary_claims` and `inaccurate_evidence` carry "One is enough to
+    fail" in their own descriptions because the spec puts it there. The
+    subordinate count must not acquire the same sentence just because its floor
+    now matches: the prompt tells the judge outright that the weight of the
+    consequence is the gate's business, and warns that a judge who knows the
+    price of a bucket will stop writing findings down. That failure mode is the
+    one no threshold downstream can recover from.
+    """
+    from honeybee_qc.informed_prompts import JUSTIFICATION_RUBRIC
+
+    secondary = JUSTIFICATION_RUBRIC.split("**inaccurate_secondary_claims**", 1)[1]
+    secondary = secondary.split("**unsupported_claims**", 1)[0]
+    assert "needed to fail" not in secondary
+    assert "One is enough" not in secondary
+
+    # The two the spec does stamp keep their wording, so this is a statement
+    # about the subordinate count and not a blanket ban on the phrase.
+    assert "One is enough to fail" in JUSTIFICATION_RUBRIC
+
+
+def test_the_task_level_share_travels_with_the_draw_agreement_bar():
     """`justification_fail_rate` has no counterpart in the spec, unlike every
     other threshold `test_spec_conformance` pins. If it ever acquires one, this
-    test is the place that should stop being true."""
+    test is the place that should stop being true.
+
+    It went 0.30 -> 0.20 on its own evidence, and 0.20 -> 0.10 as one half of a
+    pair. The other half is `justification_draw_agreement`: a defect now has to be
+    reported by all five draws instead of three, which cuts the surviving population
+    hard, and a share calibrated against a bare majority does not survive being
+    applied to what is left of it. Neither number should be read, or moved, alone --
+    swept jointly, the pair gives 38 task-level false fails against 42 published at
+    unchanged recall, while the share alone at the old majority gives 43.
+    """
     from honeybee_qc.config import DEFAULT_POLICY
 
-    assert DEFAULT_POLICY.justification_fail_rate == 0.30
+    assert DEFAULT_POLICY.justification_fail_rate == 0.10
+    assert DEFAULT_POLICY.justification_draw_agreement == 5
+    assert DEFAULT_POLICY.samples_by_check[450] == 5, (
+        "the bar is stated against the nominal draw count; if 450 stops drawing "
+        "five samples, 5 becomes unanimity over however many it does draw"
+    )
     assert DEFAULT_POLICY.justification_scope == "per_justification"
+
+
+def test_the_severe_conditions_are_the_ones_the_spec_calls_one_is_enough():
+    """The exemptions from that share, unlike the share itself, are the spec's.
+
+    The auditor's instructions say "One is enough to fail" for exactly two
+    counts -- the fabricated or misattributed citation and the false claim the
+    rating rests on -- and nothing else in the condition list carries that
+    wording, so nothing else escapes the share.
+
+    `is_inaccurate` no longer names only those two, because its subordinate
+    branch now has a floor of 1 as well. That widening is ours; what this test
+    still holds is the membership of the tuple, which did not change with it.
+    """
+    from honeybee_qc.config import DEFAULT_POLICY
+
+    assert DEFAULT_POLICY.justification_severe_conditions == (
+        "is_inaccurate",
+        "cites_incorrect_evidence",
+    )
+    assert _finding(inaccurate_primary_claims=1).triggered_conditions() == ["is_inaccurate"]
+    assert _finding(inaccurate_evidence=1).triggered_conditions() == [
+        "cites_incorrect_evidence"
+    ]
+    softer = (
+        _finding(unsupported_claims=2),
+        _finding(misconstrued_evidence=2),
+        _finding(is_skewed=True),
+        _finding(is_generic=True),
+    )
+    for finding in softer:
+        assert not set(finding.triggered_conditions()) & set(
+            DEFAULT_POLICY.justification_severe_conditions
+        )
+
+
+def test_cites_incorrect_evidence_is_reachable_and_must_not_be_treated_as_dead():
+    """A correction to an earlier analysis, pinned so it cannot be re-derived wrong.
+
+    That analysis observed severe=("cites_incorrect_evidence",) giving results
+    byte-identical to severe=() on 151 tasks and concluded the condition never
+    fires. It fires -- 7 items on 3 sheet-22 tasks and 12 items on 7 of 60
+    `priority_batch` tasks. The identity proved only that it was never *decisive*,
+    because every task carrying it also carried `is_inaccurate` or cleared the
+    share honestly. Under `justification_draw_agreement = 5` one escalation of 60
+    rests on it alone.
+
+    So a single fabricated citation must reach the fail band with nothing beside
+    it, at the share's own denominator, and with no help from `is_inaccurate`.
+    """
+    from honeybee_qc.config import DEFAULT_POLICY
+    from honeybee_qc.gates import evaluate_check_450
+    from honeybee_qc.tests.fixtures import make_task
+
+    one_fabricated = _finding(inaccurate_evidence=1)
+    assert one_fabricated.triggered_conditions() == ["cites_incorrect_evidence"]
+    assert "is_inaccurate" not in one_fabricated.triggered_conditions()
+
+    task = make_task()
+    findings = [
+        dataclasses.replace(one_fabricated, item_id="j0"),
+        *(JustificationFinding(item_id=f"j{i}") for i in range(1, 15)),
+    ]
+    verdict = evaluate_check_450(task, findings)
+    assert verdict.band == "fail", "1 of 15 is 6.7%, so only the severe route can hold"
+    assert verdict.measurement.counts["severe_conditions_by_item"] == {
+        "j0": ["cites_incorrect_evidence"]
+    }
+    # And it is the escape that carries it, not the share.
+    assert verdict.measurement.rate is not None and verdict.measurement.rate < 0.10
+    assert verdict.measurement.counts["failed_on_severity"] is True

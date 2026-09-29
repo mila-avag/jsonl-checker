@@ -184,7 +184,11 @@ def _validate_turn_sequence(turns: list[Turn], label: str, res: PreflightResult)
         res.hard_failures.append(f"{label}: first turn must be a user turn")
 
 
-def validate_task(task: Task, policy: Policy = DEFAULT_POLICY) -> PreflightResult:
+def validate_task(
+    task: Task,
+    policy: Policy = DEFAULT_POLICY,
+    required_checks: tuple[int, ...] | None = None,
+) -> PreflightResult:
     res = PreflightResult(task_id=task.task_id)
 
     if not task.task_id:
@@ -307,8 +311,16 @@ def validate_task(task: Task, policy: Policy = DEFAULT_POLICY) -> PreflightResul
                 )
 
     lo, hi = policy.likert_scale
+    ranking_in_scope = required_checks is None or bool(
+        {400, 460} & set(required_checks)
+    )
     if task.sxs.likert is None:
-        res.hard_failures.append("sxs.likert is missing")
+        if ranking_in_scope:
+            res.hard_failures.append("sxs.likert is missing")
+        else:
+            res.warnings.append(
+                "sxs.likert is missing; ranking checks are out of scope for this run"
+            )
     elif task.sxs.likert < lo or task.sxs.likert > hi:
         res.hard_failures.append(
             f"sxs.likert {task.sxs.likert} is outside the {lo}-{hi} scale"
@@ -327,46 +339,71 @@ def validate_task(task: Task, policy: Policy = DEFAULT_POLICY) -> PreflightResul
         if not sub.transcript_pdf:
             res.warnings.append(f"model {sub.model}: no transcript PDF supplied")
 
-    if task.key_turn.turn_index is not None:
-        for sub in task.submissions():
-            if not sub.conversation:
+    # Aspirational records a key turn per model. Applying task.key_turn (A's
+    # index, copied for legacy readers) onto B and C is how we marked real
+    # submissions unauditable. Per-slot key_turn wins when present; otherwise
+    # the single task-level index is checked on every slot (L1).
+    per_slot = [
+        s
+        for s in task.submissions()
+        if s.key_turn.turn_index is not None
+    ]
+    for sub in task.submissions():
+        if not sub.conversation:
+            continue
+        if per_slot:
+            if sub.key_turn.turn_index is None:
                 continue
-            indices = sub.turn_indices()
-            # A key turn past the last turn we retrieved says nothing about the
-            # contributor: share pages routinely render only part of a long
-            # conversation, and the fetch stops there. Failing the task hard on
-            # that discards good work over our own shortfall, and the spec
-            # reserves unauditable for genuinely unusable submissions. A gap in
-            # the middle is different -- nothing legitimate produces one -- so
-            # that stays a hard failure.
-            if task.key_turn.turn_index > max(indices, default=0):
+            key_index = sub.key_turn.turn_index
+        elif task.key_turn.turn_index is not None:
+            key_index = task.key_turn.turn_index
+        else:
+            continue
+        # Snowflake ingest stores user prompts on the submission before the
+        # share page is fetched. Those rows have no assistant turns, which
+        # looks identical to "key turn is a user turn" and must not 1000.
+        if not any(t.role == "assistant" for t in sub.conversation):
+            res.warnings.append(
+                f"model {sub.model}: conversation has no assistant turns; "
+                "key turn cannot be validated until the share page is fetched"
+            )
+            continue
+        indices = sub.turn_indices()
+        # A key turn past the last turn we retrieved says nothing about the
+        # contributor: share pages routinely render only part of a long
+        # conversation, and the fetch stops there. Failing the task hard on
+        # that discards good work over our own shortfall, and the spec
+        # reserves unauditable for genuinely unusable submissions. A gap in
+        # the middle is different -- nothing legitimate produces one -- so
+        # that stays a hard failure.
+        if key_index > max(indices, default=0):
+            res.warnings.append(
+                f"key_turn {key_index} is beyond the "
+                f"{max(indices, default=0)} turns fetched for model "
+                f"{sub.model}; the conversation is incomplete, so checks "
+                f"reading that turn cannot be evaluated"
+            )
+        elif key_index not in indices:
+            res.hard_failures.append(
+                f"key_turn {key_index} does not exist in model "
+                f"{sub.model}'s conversation"
+            )
+        elif not sub.has_assistant_at(key_index):
+            # Same reasoning one turn in: a fetch that stopped after the user
+            # message leaves the final exchange with no reply, which looks
+            # identical to selecting a user turn. Only the second is the
+            # contributor's mistake.
+            if key_index == max(indices, default=0):
                 res.warnings.append(
-                    f"key_turn {task.key_turn.turn_index} is beyond the "
-                    f"{max(indices, default=0)} turns fetched for model "
-                    f"{sub.model}; the conversation is incomplete, so checks "
-                    f"reading that turn cannot be evaluated"
+                    f"key_turn {key_index} is the last turn "
+                    f"fetched for model {sub.model} and has no reply; the "
+                    f"conversation is cut off mid-exchange"
                 )
-            elif task.key_turn.turn_index not in indices:
+            else:
                 res.hard_failures.append(
-                    f"key_turn {task.key_turn.turn_index} does not exist in model "
-                    f"{sub.model}'s conversation"
+                    f"key_turn {key_index} does not resolve to an "
+                    f"assistant turn in model {sub.model}'s conversation"
                 )
-            elif not sub.has_assistant_at(task.key_turn.turn_index):
-                # Same reasoning one turn in: a fetch that stopped after the user
-                # message leaves the final exchange with no reply, which looks
-                # identical to selecting a user turn. Only the second is the
-                # contributor's mistake.
-                if task.key_turn.turn_index == max(indices, default=0):
-                    res.warnings.append(
-                        f"key_turn {task.key_turn.turn_index} is the last turn "
-                        f"fetched for model {sub.model} and has no reply; the "
-                        f"conversation is cut off mid-exchange"
-                    )
-                else:
-                    res.hard_failures.append(
-                        f"key_turn {task.key_turn.turn_index} does not resolve to an "
-                        f"assistant turn in model {sub.model}'s conversation"
-                    )
 
     if not task.target_deliverables:
         res.warnings.append(
@@ -389,8 +426,12 @@ def _l1_of_l2() -> dict[str, str]:
     return L1_OF_L2
 
 
-def validate_batch(tasks: list[Task], policy: Policy = DEFAULT_POLICY) -> list[PreflightResult]:
-    results = [validate_task(t, policy) for t in tasks]
+def validate_batch(
+    tasks: list[Task],
+    policy: Policy = DEFAULT_POLICY,
+    required_checks: tuple[int, ...] | None = None,
+) -> list[PreflightResult]:
+    results = [validate_task(t, policy, required_checks=required_checks) for t in tasks]
     counts: dict[str, int] = {}
     for t in tasks:
         counts[t.task_id] = counts.get(t.task_id, 0) + 1
