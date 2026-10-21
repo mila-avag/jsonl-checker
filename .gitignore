@@ -3,6 +3,12 @@
 !index.html
 !jsonl_checker.html
 
+# Shared Cursor skills (no secrets).
+!.cursor/
+!.cursor/skills/
+!.cursor/skills/system-prompt-writing/
+!.cursor/skills/system-prompt-writing/*.md
+
 # honeybee_qc: allowlist source + tests only. The leading `*` above means git
 # will not descend into a directory unless the directory itself is re-included,
 # so each path component is listed before its contents. This is an allowlist by
